@@ -1,0 +1,48 @@
+# Changelog
+
+## [Unreleased]
+
+## [0.3.0] - 2026-04-15
+
+### Added
+- `hive pool` — node pool management subcommand
+  - `add [preset] [--count N]` — submit hold jobs via user-configured presets
+  - `release JOBID / --idle` — scancel specific or all idle hold jobs
+  - `init` — create `~/.hive/pool_config.json` from example template
+  - `config` — inspect presets and verify script paths
+- `pool_config.example.json` — template for cluster-specific sbatch scripts
+- `.gitignore` rule for `pool_config.json` (never committed)
+
+### Changed
+- Removed cluster-specific details from `docs/hive.md` (node names, QOS, partitions)
+
+---
+
+## [0.2.0] - 2026-04-15
+
+### Added
+- `hive queue` — SLURM-inspired task queue system
+  - `submit "cmd"` or `submit job.hive` — two submission formats
+  - `.hive` script format with `#HIVE` directives (workdir, priority, name)
+  - `list [--state]` — queue table with state, node, elapsed, command
+  - `cancel`, `logs [-f]`, `rm` — task lifecycle management
+  - `daemon start|stop|status|logs` — manage `hive-sched`
+- `hive-sched` — scheduler daemon (30s loop, flock-protected dispatch)
+  - Reads `node_monitor.json` for idle nodes, dispatches via `srun --overlap`
+  - Heartbeat monitoring: detects crashed tasks (5 min timeout → FAILED)
+  - Cross-node daemon status via `sched.heartbeat` on shared filesystem
+- Task logs at `~/.hive/logs/task-<id>.log` with header/footer and srun stderr capture
+
+---
+
+## [0.1.0] - 2026-04-15
+
+### Added
+- `hive` — unified dispatcher replacing scattered `myjob` / `mynode` / `jobtop` scripts
+- `hive jobs [-a/-r/-w/-p]` — enhanced SLURM queue dashboard
+- `hive nodes` — one-shot node status table (auto-starts daemon)
+- `hive top` — interactive htop-style TUI with expandable process details
+- `hive daemon start|stop|restart|status|logs` — background node poller (120s cycle)
+- `hive poll` — immediate on-demand node probe (SIGUSR1)
+- `~/.hive/node_monitor.json` — shared node state DB (readable from all nodes)
+- Backward-compat symlinks: `myjob`, `mynode`, `jobtop` → `hive`
