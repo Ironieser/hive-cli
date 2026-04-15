@@ -451,6 +451,68 @@ def cmd_logs(args):
         subprocess.run(["cat", log_file])
 
 
+
+# ── Wait ──────────────────────────────────────────────────────────────────────
+
+TERMINAL_STATES = {"done", "failed", "cancelled"}
+
+def cmd_wait(args):
+    """Block until task reaches a terminal state, then print log and exit with task's exit code.
+
+    Intended for agent workflows:
+        TASK_ID=$(hive queue submit "cmd" | grep -oP '#\\K\\d+')
+        hive queue wait $TASK_ID   # blocks, then exit $?
+    """
+    task_id   = str(args.id)
+    poll_secs = args.interval
+    no_log    = args.no_log
+
+    print(f"Waiting for task #{task_id}...", flush=True)
+
+    prev_state = None
+    while True:
+        queue = load_queue()
+        task  = queue["tasks"].get(task_id)
+        if not task:
+            print(f"Task #{task_id} not found.", file=sys.stderr)
+            sys.exit(2)
+
+        state = task["state"]
+        if state != prev_state:
+            node    = task.get("node") or "—"
+            elapsed = task_elapsed(task)
+            color   = STATE_COLORS.get(state, "")
+            print(f"  [{elapsed}] {color}{state.upper()}{C_RESET}"
+                  + (f"  on {node}" if node != "—" else ""),
+                  flush=True)
+            prev_state = state
+
+        if state in TERMINAL_STATES:
+            break
+
+        time.sleep(poll_secs)
+
+    # Print log
+    if not no_log:
+        log_file = task.get("log", os.path.join(LOG_DIR, f"task-{task_id}.log"))
+        if os.path.exists(log_file):
+            print()
+            print(f"{C_DIM}{'─'*60}{C_RESET}")
+            subprocess.run(["cat", log_file])
+            print(f"{C_DIM}{'─'*60}{C_RESET}")
+        else:
+            print("(no log file found)")
+
+    # Exit with task's exit code so callers can check $?
+    ec = task.get("exit_code")
+    if state == "cancelled":
+        sys.exit(130)
+    elif ec is not None:
+        sys.exit(ec if ec >= 0 else 1)
+    else:
+        sys.exit(0 if state == "done" else 1)
+
+
 # ── Remove ────────────────────────────────────────────────────────────────────
 
 def cmd_rm(args):
@@ -510,6 +572,14 @@ def build_parser():
     pr = sub.add_parser("rm", help="Remove a finished/cancelled task from queue")
     pr.add_argument("id", type=int, metavar="ID")
 
+    # wait
+    pw = sub.add_parser("wait", help="Block until task finishes, print log, exit with task's exit code")
+    pw.add_argument("id", type=int, metavar="ID")
+    pw.add_argument("--interval", "-i", type=float, default=5.0, metavar="SEC",
+                    help="Poll interval in seconds (default: 5)")
+    pw.add_argument("--no-log", action="store_true",
+                    help="Don't print log on completion")
+
     # daemon
     pd = sub.add_parser("daemon", help="Manage hive-sched daemon")
     pd.add_argument("subcmd", nargs="?", default="status",
@@ -536,6 +606,8 @@ def main():
         cmd_logs(args)
     elif cmd == "rm":
         cmd_rm(args)
+    elif cmd == "wait":
+        cmd_wait(args)
     elif cmd == "daemon":
         cmd_daemon(args)
 
