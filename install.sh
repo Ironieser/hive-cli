@@ -39,11 +39,19 @@ else
     fi
 fi
 
-# ── 2. Make executables ───────────────────────────────────────────────────────
+# ── 2. Make executables + ensure data files present ──────────────────────────
 title "2. Setting permissions"
 chmod +x "${INSTALL_DIR}/hive"
 chmod +x "${INSTALL_DIR}/libexec"/hive-*
 info "All binaries are executable"
+
+# Copy data files that git reset/clone might miss if repo was installed via cp
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${SCRIPT_DIR}" != "${INSTALL_DIR}" && -f "${SCRIPT_DIR}/pool_config.example.json" ]]; then
+    cp "${SCRIPT_DIR}/pool_config.example.json" "${INSTALL_DIR}/pool_config.example.json"
+    info "Synced pool_config.example.json"
+fi
+
 
 # ── 3. Ensure ~/bin exists ────────────────────────────────────────────────────
 title "3. Linking to ~/bin"
