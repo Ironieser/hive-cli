@@ -21,7 +21,9 @@ title() { echo -e "\n${BOLD}$*${NC}"; }
 title "1. Installing hive-cli"
 if [[ -d "${INSTALL_DIR}/.git" ]]; then
     info "Updating existing installation at ${INSTALL_DIR}..."
-    git -C "$INSTALL_DIR" pull --ff-only
+    # Reset any untracked/modified files that would block pull, then update
+    git -C "$INSTALL_DIR" fetch origin
+    git -C "$INSTALL_DIR" reset --hard origin/main
 else
     # If running from a local checkout, copy instead of clone
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
