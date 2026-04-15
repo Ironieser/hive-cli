@@ -23,11 +23,12 @@ NODE_DB      = os.path.join(HIVE_DIR, "node_monitor.json")
 LIBEXEC_DIR  = os.path.dirname(os.path.realpath(__file__))
 EXAMPLE_FILE = os.path.join(os.path.dirname(LIBEXEC_DIR), "pool_config.example.json")
 
-C_GREEN = "\033[32m"
+C_GREEN  = "\033[32m"
 C_YELLOW = "\033[33m"
-C_RED = "\033[31m"
-C_BOLD = "\033[1m"
-C_RESET = "\033[0m"
+C_RED    = "\033[31m"
+C_BOLD   = "\033[1m"
+C_DIM    = "\033[2m"
+C_RESET  = "\033[0m"
 
 
 # ── Config helpers ────────────────────────────────────────────────────────────
@@ -90,11 +91,18 @@ def cmd_add(args):
         sys.exit(1)
 
     count = args.count
+    time_arg = args.time
     desc = preset.get("description", "")
-    print(f"Submitting {count}× hold job  [{preset_name}]  {desc}")
+
+    time_str = f"  time={time_arg}" if time_arg else ""
+    print(f"Submitting {count}× hold job  [{preset_name}]  {desc}{time_str}")
 
     for _ in range(count):
-        result = subprocess.run(["sbatch", script], capture_output=True, text=True)
+        cmd = ["sbatch"]
+        if time_arg:
+            cmd += ["--time", time_arg]
+        cmd.append(script)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             print(f"  {C_GREEN}✓{C_RESET} {result.stdout.strip()}")
         else:
@@ -168,6 +176,17 @@ def cmd_config(args):
         print(f"    script: {script}  {status}")
         if desc:
             print(f"    desc:   {desc}")
+        # Show --time from script if readable
+        if exists:
+            try:
+                with open(script) as f:
+                    for line in f:
+                        if line.strip().startswith("#SBATCH") and "--time" in line:
+                            t = line.split("--time")[1].split()[0].lstrip("=")
+                            print(f"    time:   {t}  {C_DIM}(override with --time){C_RESET}")
+                            break
+            except OSError:
+                pass
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -186,6 +205,8 @@ def build_parser():
                     metavar="PRESET", help="Preset name (default: from config)")
     pa.add_argument("--count", "-n", type=int, default=1, metavar="N",
                     help="Number of hold jobs to submit (default: 1)")
+    pa.add_argument("--time", "-t", default=None, metavar="TIME",
+                    help="Override --time in the sbatch script, e.g. 1-00:00:00, 12:00:00, 3d")
 
     # release
     pr = sub.add_parser("release", help="Cancel a hold job (scancel)")
