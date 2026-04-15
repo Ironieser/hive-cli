@@ -4,6 +4,21 @@
 
 [中文文档](README_zh.md)
 
+## ⚠️ Responsible Use on Shared Clusters
+
+**hive-cli is for active, short-term debug sessions — not permanent resource reservation.**
+
+Pre-allocating nodes on a shared HPC cluster affects everyone in the queue. Please follow these norms:
+
+- **Release idle nodes promptly.** If `hive nodes` shows `IDLE` for 30–60 min and you're not actively iterating, run `hive pool release --idle` and return them.
+- **Keep sessions short.** Hold jobs should last hours, not days.
+- **Don't hoard during peak hours.** If the queue is long, reduce your pool size. One or two nodes is enough for most debug workflows.
+- **Be transparent.** Your hold jobs are visible in `squeue` to all users.
+
+> The goal is flow, not ownership. If you're not actively iterating, let the nodes go.
+
+---
+
 ## Why
 
 AI coding agents (Claude Code, Cursor, etc.) need tight iterate-debug-rerun loops. SLURM's queue latency (seconds to hours) breaks this. hive-cli pre-allocates GPU nodes as persistent sessions and provides a lightweight interface to schedule, monitor, and manage experiments — no queue wait between runs.
