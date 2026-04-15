@@ -68,6 +68,10 @@ case "$subcommand" in
     poll)
         exec "${HIVE_LIBEXEC}/hive-poll" "$@"
         ;;
+    queue)
+        py="$(_resolve_python)"
+        exec "$py" "${HIVE_LIBEXEC}/hive-queue" "$@"
+        ;;
     daemon)
         sub="${1:-status}"; shift 2>/dev/null || true
         case "$sub" in
@@ -94,19 +98,22 @@ case "$subcommand" in
     top                       Interactive TUI monitor (curses)
     daemon   start|stop|restart|status|logs
     poll                      Trigger immediate node poll
+    queue    submit|list|cancel|logs|rm|daemon
+                              Task queue (auto-schedules to idle nodes)
 
   Examples:
     hive jobs -a              Show all users' jobs
-    hive jobs -r              Show running jobs only
     hive nodes                Show node status once (auto-starts daemon)
     hive top                  Open interactive monitor (continuous)
-    hive daemon start         Start background poller
-    hive daemon stop          Stop background poller
     hive poll                 Poll now + update DB
+    hive queue submit "python train.py --config exp/v1.yaml"
+    hive queue submit job.hive
+    hive queue list
+    hive queue logs 3 -f
 
   Config dir:  ~/.hive/
   DB file:     ~/.hive/node_monitor.json
-  Daemon log:  ~/.hive/node_monitor.log
+  Queue file:  ~/.hive/queue.json
 
 EOF
         ;;

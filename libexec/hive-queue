@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""hive-queue — hive task queue CLI
+
+Usage:
+  hive queue submit [--workdir DIR] [--priority N] [--name NAME] "CMD"|job.hive
+  hive queue list [--state STATE]
+  hive queue cancel <id>
+  hive queue logs <id> [-f]
+  hive queue rm <id>
+  hive queue daemon start|stop|status|logs
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+HIVE_DIR      = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
+QUEUE_FILE    = os.path.join(HIVE_DIR, "queue.json")
+QUEUE_LOCK    = os.path.join(HIVE_DIR, "queue.lock")
+SCHED_PID     = os.path.join(HIVE_DIR, "sched.pid")
+SCHED_LOG     = os.path.join(HIVE_DIR, "sched.log")
+SCHED_HB      = os.path.join(HIVE_DIR, "sched.heartbeat")
+LOG_DIR       = os.path.join(HIVE_DIR, "logs")
+
+LIBEXEC_DIR = os.path.dirname(os.path.realpath(__file__))
+SCHED_BIN   = os.path.join(LIBEXEC_DIR, "hive-sched")
+PYTHON      = sys.executable  # same interpreter (vlm conda env)
+
+HEARTBEAT_DAEMON_TIMEOUT = 90   # 3× poll interval → daemon considered dead
+
+
+# ── ANSI colors ───────────────────────────────────────────────────────────────
+C_RESET  = "\033[0m"
+C_BOLD   = "\033[1m"
+C_GREEN  = "\033[32m"
+C_YELLOW = "\033[33m"
+C_RED    = "\033[31m"
+C_CYAN   = "\033[36m"
+C_DIM    = "\033[2m"
+
+STATE_COLORS = {
+    "running":   C_GREEN,
+    "pending":   C_YELLOW,
+    "done":      C_DIM,
+    "failed":    C_RED,
+    "cancelled": C_DIM,
+}
+
+
+# ── Queue file helpers (all under flock) ──────────────────────────────────────
+
+class QueueLock:
+    def __init__(self):
+        self._fd = None
+
+    def __enter__(self):
+        os.makedirs(HIVE_DIR, exist_ok=True)
+        self._fd = open(QUEUE_LOCK, 'w')
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self._fd
+
+    def __exit__(self, *_):
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fd.close()
+
+
+def load_queue(lfd=None):
+    if not os.path.exists(QUEUE_FILE):
+        return {"version": 1, "next_id": 1, "tasks": {}}
+    try:
+        with open(QUEUE_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"version": 1, "next_id": 1, "tasks": {}}
+
+
+def save_queue(data, lfd):
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, QUEUE_FILE)
+
+
+# ── Time helpers ──────────────────────────────────────────────────────────────
+
+def now_iso():
+    return datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, '%Y-%m-%dT%H:%M:%S')
+    except ValueError:
+        return None
+
+
+def fmt_elapsed(seconds):
+    if seconds is None:
+        return "—"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h"
+
+
+def task_elapsed(task):
+    now = datetime.now()
+    state = task["state"]
+    if state == "running":
+        t = parse_iso(task.get("started_at"))
+        return fmt_elapsed((now - t).total_seconds() if t else None)
+    elif state in ("done", "failed"):
+        t0 = parse_iso(task.get("started_at"))
+        t1 = parse_iso(task.get("finished_at"))
+        if t0 and t1:
+            return fmt_elapsed((t1 - t0).total_seconds())
+    elif state == "pending":
+        t = parse_iso(task.get("submitted_at"))
+        if t:
+            return f"wait:{fmt_elapsed((now - t).total_seconds())}"
+    return "—"
+
+
+# ── .hive file parser ─────────────────────────────────────────────────────────
+
+def parse_hive_file(path):
+    """
+    Parse a .hive script file.
+    Lines starting with #HIVE key=value set metadata.
+    Remaining non-comment lines form the command.
+
+    Returns dict with keys: cmd, workdir, priority, name
+    """
+    meta = {}
+    cmd_lines = []
+
+    with open(path) as f:
+        for line in f:
+            stripped = line.rstrip('\n')
+            m = re.match(r'^#HIVE\s+(\w+)\s*=\s*(.+)$', stripped)
+            if m:
+                meta[m.group(1).lower()] = m.group(2).strip()
+            elif stripped.startswith('#!') or stripped.startswith('#'):
+                continue   # shebang / comment
+            else:
+                cmd_lines.append(stripped)
+
+    # Join non-empty command lines
+    cmd = '\n'.join(l for l in cmd_lines if l.strip()).strip()
+    if not cmd:
+        raise ValueError(f"No commands found in {path}")
+
+    result = {"cmd": cmd}
+    if "workdir" in meta:
+        result["workdir"] = os.path.expanduser(meta["workdir"])
+    if "priority" in meta:
+        try:
+            result["priority"] = int(meta["priority"])
+        except ValueError:
+            pass
+    if "name" in meta:
+        result["name"] = meta["name"]
+
+    return result
+
+
+# ── Daemon management ─────────────────────────────────────────────────────────
+
+def read_sched_pid():
+    if not os.path.exists(SCHED_PID):
+        return None, None
+    try:
+        with open(SCHED_PID) as f:
+            lines = f.read().strip().split('\n')
+        pid = int(lines[0])
+        host = lines[1] if len(lines) > 1 else None
+        return pid, host
+    except (ValueError, IndexError, OSError):
+        return None, None
+
+
+def is_sched_running():
+    pid, host = read_sched_pid()
+    if pid is None:
+        return False
+
+    # Check heartbeat file — works cross-node since it's on shared FS
+    if os.path.exists(SCHED_HB):
+        age = time.time() - os.path.getmtime(SCHED_HB)
+        if age < HEARTBEAT_DAEMON_TIMEOUT:
+            return True
+
+    # On same host: check PID directly
+    if host and host == socket.gethostname():
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    return False
+
+
+def cmd_daemon(args):
+    sub = args.subcmd if hasattr(args, 'subcmd') else "status"
+
+    if sub == "start":
+        if is_sched_running():
+            pid, _ = read_sched_pid()
+            print(f"hive-sched is already running (PID {pid})")
+            return
+        os.makedirs(HIVE_DIR, exist_ok=True)
+        proc = subprocess.Popen(
+            [PYTHON, SCHED_BIN],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(0.6)
+        print(f"hive-sched started (PID {proc.pid})")
+
+    elif sub == "stop":
+        pid, _ = read_sched_pid()
+        if pid is None or not is_sched_running():
+            print("hive-sched is not running")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"hive-sched stopped (PID {pid})")
+        except ProcessLookupError:
+            print("hive-sched: process not found (stale PID file)")
+
+    elif sub == "restart":
+        cmd_daemon(argparse.Namespace(subcmd="stop"))
+        time.sleep(1)
+        cmd_daemon(argparse.Namespace(subcmd="start"))
+
+    elif sub == "status":
+        if is_sched_running():
+            pid, host = read_sched_pid()
+            hb_age = None
+            if os.path.exists(SCHED_HB):
+                hb_age = int(time.time() - os.path.getmtime(SCHED_HB))
+            print(f"hive-sched: {C_GREEN}running{C_RESET}  PID {pid}  host {host}  "
+                  f"last heartbeat {hb_age}s ago")
+        else:
+            print(f"hive-sched: {C_RED}stopped{C_RESET}")
+
+    elif sub == "logs":
+        if not os.path.exists(SCHED_LOG):
+            print("No scheduler log found.")
+            return
+        subprocess.run(["tail", "-n", "40", SCHED_LOG])
+
+    else:
+        print(f"hive queue daemon: unknown subcommand '{sub}'", file=sys.stderr)
+        sys.exit(1)
+
+
+# ── Submit ────────────────────────────────────────────────────────────────────
+
+def cmd_submit(args):
+    target = args.cmd_or_file
+
+    # Detect .hive file vs plain command string
+    if os.path.isfile(target):
+        spec = parse_hive_file(target)
+    else:
+        spec = {"cmd": target}
+
+    # CLI flags override .hive directives
+    if args.workdir:
+        spec["workdir"] = os.path.abspath(args.workdir)
+    elif "workdir" not in spec:
+        spec["workdir"] = os.getcwd()
+
+    if args.priority is not None:
+        spec["priority"] = args.priority
+    elif "priority" not in spec:
+        spec["priority"] = 0
+
+    if args.name:
+        spec["name"] = args.name
+
+    with QueueLock() as lfd:
+        queue = load_queue(lfd)
+        task_id = queue["next_id"]
+        queue["next_id"] += 1
+
+        task = {
+            "id":           task_id,
+            "cmd":          spec["cmd"],
+            "workdir":      spec.get("workdir", os.getcwd()),
+            "name":         spec.get("name", ""),
+            "state":        "pending",
+            "priority":     spec.get("priority", 0),
+            "submitted_at": now_iso(),
+            "started_at":   None,
+            "finished_at":  None,
+            "slurm_jobid":  None,
+            "node":         None,
+            "srun_pid":     None,
+            "exit_code":    None,
+            "log":          os.path.join(LOG_DIR, f"task-{task_id}.log"),
+        }
+        queue["tasks"][str(task_id)] = task
+        save_queue(queue, lfd)
+
+    print(f"Submitted task #{task_id}")
+
+    # Auto-start scheduler daemon if not running
+    if not is_sched_running():
+        print("Starting hive-sched...")
+        cmd_daemon(argparse.Namespace(subcmd="start"))
+
+
+# ── List ──────────────────────────────────────────────────────────────────────
+
+STATE_ORDER = {"running": 0, "pending": 1, "done": 2, "failed": 3, "cancelled": 4}
+
+
+def cmd_list(args):
+    queue = load_queue()
+    tasks = list(queue.get("tasks", {}).values())
+
+    filter_state = args.state.lower() if args.state else None
+    if filter_state:
+        tasks = [t for t in tasks if t["state"] == filter_state]
+
+    if not tasks:
+        print("No tasks found.")
+        return
+
+    # Sort: running first, then pending, then by id desc
+    tasks.sort(key=lambda t: (STATE_ORDER.get(t["state"], 9), -t["id"]))
+
+    # Column widths
+    id_w    = max(len(str(t["id"])) for t in tasks)
+    name_w  = max(len(t.get("name") or "—") for t in tasks)
+    name_w  = max(name_w, 6)
+    state_w = 9
+    node_w  = max((len(t.get("node") or "—") for t in tasks), default=4)
+    node_w  = max(node_w, 4)
+    elap_w  = 10
+    cmd_avail = max(40, 80 - id_w - name_w - state_w - node_w - elap_w - 12)
+
+    def truncate(s, n):
+        if len(s) <= n:
+            return s
+        return s[:n-1] + "…"
+
+    header = (f"  {'ID':>{id_w}}  {'NAME':<{name_w}}  {'STATE':<{state_w}}  "
+              f"{'NODE':<{node_w}}  {'ELAPSED':<{elap_w}}  CMD")
+    sep = "  " + "─" * (len(header) - 2)
+    print(f"{C_BOLD}{header}{C_RESET}")
+    print(sep)
+
+    for t in tasks:
+        tid     = str(t["id"])
+        name    = t.get("name") or "—"
+        state   = t["state"]
+        node    = t.get("node") or "—"
+        elapsed = task_elapsed(t)
+        cmd     = truncate(t["cmd"].replace('\n', ' '), cmd_avail)
+
+        color = STATE_COLORS.get(state, "")
+        state_str = f"{color}{state.upper():<{state_w}}{C_RESET}"
+        row = (f"  {tid:>{id_w}}  {name:<{name_w}}  {state_str}  "
+               f"{node:<{node_w}}  {elapsed:<{elap_w}}  {cmd}")
+        print(row)
+
+    print()
+    running_n = sum(1 for t in tasks if t["state"] == "running")
+    pending_n = sum(1 for t in tasks if t["state"] == "pending")
+    sched_status = f"{C_GREEN}running{C_RESET}" if is_sched_running() else f"{C_RED}stopped{C_RESET}"
+    print(f"  {C_DIM}scheduler: {sched_status}  "
+          f"{running_n} running  {pending_n} pending{C_RESET}")
+
+
+# ── Cancel ────────────────────────────────────────────────────────────────────
+
+def cmd_cancel(args):
+    task_id = str(args.id)
+    with QueueLock() as lfd:
+        queue = load_queue(lfd)
+        task = queue["tasks"].get(task_id)
+        if not task:
+            print(f"Task #{task_id} not found.", file=sys.stderr)
+            sys.exit(1)
+        if task["state"] not in ("pending", "running"):
+            print(f"Task #{task_id} is already {task['state']} — cannot cancel.")
+            return
+
+        if task["state"] == "running":
+            srun_pid = task.get("srun_pid")
+            if srun_pid:
+                try:
+                    os.kill(srun_pid, signal.SIGTERM)
+                    print(f"Sent SIGTERM to srun PID {srun_pid}")
+                except (ProcessLookupError, PermissionError):
+                    print(f"srun process {srun_pid} already gone")
+
+        task["state"]       = "cancelled"
+        task["finished_at"] = now_iso()
+        save_queue(queue, lfd)
+    print(f"Task #{task_id} cancelled.")
+
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+
+def cmd_logs(args):
+    task_id = str(args.id)
+    queue = load_queue()
+    task = queue["tasks"].get(task_id)
+    if not task:
+        print(f"Task #{task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    log_file = task.get("log", os.path.join(LOG_DIR, f"task-{task_id}.log"))
+    if not os.path.exists(log_file):
+        print(f"No log file yet for task #{task_id}.")
+        if task["state"] == "pending":
+            print("(Task is still pending — it hasn't started yet.)")
+        return
+
+    if args.follow:
+        try:
+            subprocess.run(["tail", "-f", log_file])
+        except KeyboardInterrupt:
+            pass
+    else:
+        subprocess.run(["cat", log_file])
+
+
+# ── Remove ────────────────────────────────────────────────────────────────────
+
+def cmd_rm(args):
+    task_id = str(args.id)
+    with QueueLock() as lfd:
+        queue = load_queue(lfd)
+        task = queue["tasks"].get(task_id)
+        if not task:
+            print(f"Task #{task_id} not found.", file=sys.stderr)
+            sys.exit(1)
+        if task["state"] in ("running", "pending"):
+            print(f"Task #{task_id} is still {task['state']}. Use 'cancel' first.")
+            sys.exit(1)
+
+        del queue["tasks"][task_id]
+        save_queue(queue, lfd)
+    print(f"Task #{task_id} removed.")
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="hive queue",
+        description="hive task queue — submit and manage experiments on pre-allocated nodes",
+    )
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+
+    # submit
+    ps = sub.add_parser("submit", help="Submit a task (command string or .hive file)")
+    ps.add_argument("cmd_or_file", metavar="CMD|FILE",
+                    help='Command string or path to a .hive script file')
+    ps.add_argument("--workdir", "-w", metavar="DIR",
+                    help="Working directory (default: current directory)")
+    ps.add_argument("--priority", "-p", type=int, metavar="N",
+                    help="Priority (higher = runs first, default: 0)")
+    ps.add_argument("--name", "-n", metavar="NAME",
+                    help="Display name for this task")
+
+    # list
+    pl = sub.add_parser("list", aliases=["ls"], help="List tasks")
+    pl.add_argument("--state", "-s", metavar="STATE",
+                    help="Filter by state: pending|running|done|failed|cancelled")
+
+    # cancel
+    pc = sub.add_parser("cancel", help="Cancel a pending or running task")
+    pc.add_argument("id", type=int, metavar="ID")
+
+    # logs
+    pg = sub.add_parser("logs", help="Show task log")
+    pg.add_argument("id", type=int, metavar="ID")
+    pg.add_argument("-f", "--follow", action="store_true",
+                    help="Follow log output (tail -f)")
+
+    # rm
+    pr = sub.add_parser("rm", help="Remove a finished/cancelled task from queue")
+    pr.add_argument("id", type=int, metavar="ID")
+
+    # daemon
+    pd = sub.add_parser("daemon", help="Manage hive-sched daemon")
+    pd.add_argument("subcmd", nargs="?", default="status",
+                    choices=["start", "stop", "restart", "status", "logs"],
+                    metavar="start|stop|restart|status|logs")
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    os.makedirs(HIVE_DIR, exist_ok=True)
+
+    cmd = args.command
+    if cmd in ("list", "ls"):
+        cmd_list(args)
+    elif cmd == "submit":
+        cmd_submit(args)
+    elif cmd == "cancel":
+        cmd_cancel(args)
+    elif cmd == "logs":
+        cmd_logs(args)
+    elif cmd == "rm":
+        cmd_rm(args)
+    elif cmd == "daemon":
+        cmd_daemon(args)
+
+
+if __name__ == "__main__":
+    main()

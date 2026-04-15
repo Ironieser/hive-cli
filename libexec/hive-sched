@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""hive-sched — hive task queue scheduler daemon
+
+Reads ~/.hive/queue.json + ~/.hive/node_monitor.json every 30s.
+Dispatches pending tasks to idle nodes via srun --overlap.
+Monitors running tasks via heartbeat files under ~/.hive/heartbeat/.
+"""
+
+import fcntl
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+HIVE_DIR      = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
+QUEUE_FILE    = os.path.join(HIVE_DIR, "queue.json")
+QUEUE_LOCK    = os.path.join(HIVE_DIR, "queue.lock")
+NODE_DB       = os.path.join(HIVE_DIR, "node_monitor.json")
+SCHED_PID     = os.path.join(HIVE_DIR, "sched.pid")
+SCHED_LOG     = os.path.join(HIVE_DIR, "sched.log")
+SCHED_HB      = os.path.join(HIVE_DIR, "sched.heartbeat")
+HEARTBEAT_DIR = os.path.join(HIVE_DIR, "heartbeat")
+LOG_DIR       = os.path.join(HIVE_DIR, "logs")
+
+POLL_INTERVAL     = 30    # seconds between scheduler loops
+HEARTBEAT_TIMEOUT = 300   # 5 min → task considered dead
+LOG_ROLL_LINES    = 500
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def now_iso():
+    return datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def roll_log():
+    if not os.path.exists(SCHED_LOG):
+        return
+    try:
+        with open(SCHED_LOG) as f:
+            lines = f.readlines()
+        if len(lines) > LOG_ROLL_LINES + 50:
+            with open(SCHED_LOG, 'w') as f:
+                f.writelines(lines[-LOG_ROLL_LINES:])
+    except OSError:
+        pass
+
+
+def write_heartbeat():
+    try:
+        with open(SCHED_HB, 'w') as f:
+            f.write(now_iso())
+    except OSError:
+        pass
+
+
+# ── Queue file operations (all under flock) ───────────────────────────────────
+
+class QueueLock:
+    def __init__(self):
+        self._fd = None
+
+    def __enter__(self):
+        self._fd = open(QUEUE_LOCK, 'w')
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self._fd
+
+    def __exit__(self, *_):
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fd.close()
+
+
+def load_queue(lfd):
+    if not os.path.exists(QUEUE_FILE):
+        return {"version": 1, "next_id": 1, "tasks": {}}
+    try:
+        with open(QUEUE_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"version": 1, "next_id": 1, "tasks": {}}
+
+
+def save_queue(data, lfd):
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, QUEUE_FILE)
+
+
+# ── Node DB (read-only; owned by hive-daemon) ─────────────────────────────────
+
+def load_node_db():
+    if not os.path.exists(NODE_DB):
+        return {}
+    try:
+        with open(NODE_DB) as f:
+            return json.load(f).get("jobs", {})
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def get_idle_nodes(jobs_db, used_jobids):
+    """Return [(jobid, node_info)] for idle nodes not already claimed."""
+    return [
+        (jid, info)
+        for jid, info in jobs_db.items()
+        if info.get("status") == "idle" and jid not in used_jobids
+    ]
+
+
+# ── Task dispatch ─────────────────────────────────────────────────────────────
+
+def dispatch_task(task, slurm_jobid, node_name):
+    """Launch task on compute node via srun --overlap. Returns srun PID."""
+    task_id  = task["id"]
+    log_file = task["log"]
+    workdir  = task.get("workdir") or os.path.expanduser("~")
+    cmd      = task["cmd"]
+
+    os.makedirs(HEARTBEAT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    hb_file   = os.path.join(HEARTBEAT_DIR, str(task_id))
+    exit_file = os.path.join(HEARTBEAT_DIR, f"{task_id}.exit")
+
+    # Remove stale files from a previous run
+    for fpath in (hb_file, exit_file):
+        try:
+            os.remove(fpath)
+        except FileNotFoundError:
+            pass
+
+    # Shell wrapper that runs on the compute node
+    wrapper = (
+        f"cd {workdir}\n"
+        f"( while true; do date -Iseconds > {hb_file}; sleep 30; done ) &\n"
+        f"_HB_PID=$!\n"
+        f"{cmd} >> {log_file} 2>&1\n"
+        f"_EC=$?\n"
+        f"kill $_HB_PID 2>/dev/null\n"
+        f"rm -f {hb_file}\n"
+        f"echo $_EC > {exit_file}\n"
+    )
+
+    proc = subprocess.Popen(
+        ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
+         "bash", "-c", wrapper],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return proc.pid
+
+
+# ── Heartbeat monitoring ──────────────────────────────────────────────────────
+
+def check_task_status(task_id, srun_pid):
+    """
+    Returns:
+      'alive'         — heartbeat recent, still running
+      'done:<ec>'     — exit file found
+      'dead'          — heartbeat stale + srun gone
+    """
+    hb_file   = os.path.join(HEARTBEAT_DIR, str(task_id))
+    exit_file = os.path.join(HEARTBEAT_DIR, f"{task_id}.exit")
+
+    if os.path.exists(exit_file):
+        try:
+            with open(exit_file) as f:
+                ec = int(f.read().strip())
+        except (ValueError, OSError):
+            ec = 0
+        return f"done:{ec}"
+
+    if os.path.exists(hb_file):
+        age = time.time() - os.path.getmtime(hb_file)
+        if age < HEARTBEAT_TIMEOUT:
+            return "alive"
+
+    # No heartbeat (or stale) — check if srun is still alive
+    if srun_pid:
+        try:
+            os.kill(srun_pid, 0)
+            return "alive"   # process exists, maybe just starting
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    return "dead"
+
+
+# ── Main scheduler loop ───────────────────────────────────────────────────────
+
+def run_one_cycle():
+    jobs_db = load_node_db()
+    changed = False
+
+    with QueueLock() as lfd:
+        queue = load_queue(lfd)
+        tasks = queue.get("tasks", {})
+
+        # ── (1) Check running tasks ──────────────────────────────────────────
+        running_jobids = set()
+        for task in tasks.values():
+            if task["state"] != "running":
+                continue
+            jid = task.get("slurm_jobid")
+            if jid:
+                running_jobids.add(jid)
+
+            status = check_task_status(task["id"], task.get("srun_pid"))
+
+            if status.startswith("done:"):
+                ec = int(status.split(":")[1])
+                task["state"]       = "done" if ec == 0 else "failed"
+                task["exit_code"]   = ec
+                task["finished_at"] = now_iso()
+                running_jobids.discard(jid)
+                changed = True
+                logging.info("Task %d finished: state=%s exit=%d node=%s",
+                             task["id"], task["state"], ec, task.get("node", "?"))
+
+            elif status == "dead":
+                task["state"]       = "failed"
+                task["exit_code"]   = -1
+                task["finished_at"] = now_iso()
+                running_jobids.discard(jid)
+                changed = True
+                logging.warning("Task %d declared dead (heartbeat timeout)", task["id"])
+
+        # ── (2) Dispatch pending tasks to idle nodes ─────────────────────────
+        idle_nodes = get_idle_nodes(jobs_db, running_jobids)
+        pending = sorted(
+            [t for t in tasks.values() if t["state"] == "pending"],
+            key=lambda t: (-t.get("priority", 0), t["submitted_at"]),
+        )
+
+        for (slurm_jobid, node_info), task in zip(idle_nodes, pending):
+            node_name = node_info.get("node", "?")
+            logging.info("Dispatching task %d → %s (slurm jobid %s)",
+                         task["id"], node_name, slurm_jobid)
+            try:
+                srun_pid = dispatch_task(task, slurm_jobid, node_name)
+            except Exception as e:
+                logging.error("Failed to dispatch task %d: %s", task["id"], e)
+                continue
+
+            task["state"]       = "running"
+            task["slurm_jobid"] = slurm_jobid
+            task["node"]        = node_name
+            task["srun_pid"]    = srun_pid
+            task["started_at"]  = now_iso()
+            running_jobids.add(slurm_jobid)
+            changed = True
+
+        if changed:
+            save_queue(queue, lfd)
+
+
+def scheduler_loop():
+    logging.info("hive-sched started (PID %d, host %s)", os.getpid(), socket.gethostname())
+    while True:
+        try:
+            write_heartbeat()
+            run_one_cycle()
+        except Exception as e:
+            logging.error("Cycle error: %s", e, exc_info=True)
+        roll_log()
+        time.sleep(POLL_INTERVAL)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def handle_signal(signum, frame):
+    logging.info("hive-sched stopping (signal %d)", signum)
+    try:
+        os.remove(SCHED_PID)
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(SCHED_HB)
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    for d in (HIVE_DIR, HEARTBEAT_DIR, LOG_DIR):
+        os.makedirs(d, exist_ok=True)
+
+    # Logging to file
+    logging.basicConfig(
+        filename=SCHED_LOG,
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
+    )
+
+    # Write PID + hostname so status checks work across nodes
+    with open(SCHED_PID, 'w') as f:
+        f.write(f"{os.getpid()}\n{socket.gethostname()}\n")
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT,  handle_signal)
+
+    scheduler_loop()
