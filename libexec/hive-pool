@@ -78,21 +78,30 @@ def load_idle_jobids():
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_add(args):
-    config = load_config()
-    preset_name, preset = get_preset(config, args.preset)
-    script = os.path.expanduser(preset.get("script", ""))
+    target = args.preset  # may be a preset name or a script path
 
-    if not script:
-        print(f"Preset '{preset_name}' has no 'script' field.", file=sys.stderr)
-        sys.exit(1)
+    # Detect: if it looks like a file path (contains / or ~, or ends in .slurm/.sh), treat as script
+    if target and (target.startswith(("~", "/", "./")) or
+                   target.endswith((".slurm", ".sh")) or
+                   os.path.exists(os.path.expanduser(target))):
+        script = os.path.expanduser(target)
+        preset_name = os.path.basename(script)
+        desc = ""
+    else:
+        config = load_config()
+        preset_name, preset = get_preset(config, target)
+        script = os.path.expanduser(preset.get("script", ""))
+        desc = preset.get("description", "")
+        if not script:
+            print(f"Preset '{preset_name}' has no 'script' field.", file=sys.stderr)
+            sys.exit(1)
+
     if not os.path.exists(script):
         print(f"{C_RED}Script not found:{C_RESET} {script}", file=sys.stderr)
-        print(f"Check the 'script' path in {CONFIG_FILE}", file=sys.stderr)
         sys.exit(1)
 
     count = args.count
     time_arg = args.time
-    desc = preset.get("description", "")
 
     time_str = f"  time={time_arg}" if time_arg else ""
     print(f"Submitting {count}× hold job  [{preset_name}]  {desc}{time_str}")
@@ -202,7 +211,8 @@ def build_parser():
     # add
     pa = sub.add_parser("add", help="Submit new hold job(s) to expand pool")
     pa.add_argument("preset", nargs="?", default=None,
-                    metavar="PRESET", help="Preset name (default: from config)")
+                    metavar="PRESET|SCRIPT",
+                    help="Preset name, or path to a .slurm script (default: from config)")
     pa.add_argument("--count", "-n", type=int, default=1, metavar="N",
                     help="Number of hold jobs to submit (default: 1)")
     pa.add_argument("--time", "-t", default=None, metavar="TIME",
