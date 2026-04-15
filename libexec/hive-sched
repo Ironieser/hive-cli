@@ -153,15 +153,16 @@ def dispatch_task(task, slurm_jobid, node_name):
         f"  echo 1 > {exit_file}\n"
         f"  exit 1\n"
         f"fi\n"
-        # ── Heartbeat process ────────────────────────────────────────────────
+        # ── Heartbeat process (disowned to suppress bash "Terminated" noise) ───
         f"( while true; do date -Iseconds > {hb_file}; sleep 30; done ) &\n"
         f"_HB_PID=$!\n"
+        f"disown $_HB_PID\n"
         # ── Run the actual command ───────────────────────────────────────────
         f"{cmd} >> {log_file} 2>&1\n"
         f"_EC=$?\n"
-        # ── Footer ──────────────────────────────────────────────────────────
-        f"echo '' >> {log_file}\n"
-        f"echo '=== hive task #{task_id} finished at $(date -Iseconds)  exit_code=$_EC ===' >> {log_file}\n"
+        # ── Footer (double-quotes so $(date) and $_EC are expanded by bash) ──
+        f'echo "" >> {log_file}\n'
+        f'echo "=== hive task #{task_id} finished at $(date -Iseconds)  exit_code=$_EC ===" >> {log_file}\n'
         f"kill $_HB_PID 2>/dev/null\n"
         f"rm -f {hb_file}\n"
         f"echo $_EC > {exit_file}\n"
