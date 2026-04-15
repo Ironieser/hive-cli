@@ -27,6 +27,31 @@ SLURM cluster
 
 Agents use `hive nodes` to find a free slot, run their experiment via `srun --jobid=<id>`, and check status via `hive top` — all without touching the SLURM queue.
 
+## ⚠️ Responsible Use on Shared Clusters
+
+hive-cli is designed for **short-term interactive debugging and iterative development** — the kind of workflow where you're actively modifying code and re-running every few minutes. It is **not** intended for long-term resource reservation.
+
+Pre-allocating nodes on a shared HPC cluster is a privilege that affects everyone in the queue. Please follow these norms:
+
+**Keep sessions short and active.**
+Hold jobs should last hours, not days. If your debug session is over, release the nodes. A node sitting idle overnight while others are queued is poor cluster citizenship.
+
+**Release idle nodes promptly.**
+If `hive nodes` shows a slot as `IDLE` (GPU 0%, no active processes) for more than 30–60 minutes, you're probably done. Run `scancel <jobid>` to return it to the pool.
+
+**Don't hoard during peak hours.**
+If `hive jobs -a` shows a long pending queue or QOS quota pressure, reduce your pool size. One or two nodes is enough for most debug workflows.
+
+**Be transparent.**
+Your hold jobs are visible in `squeue` to all users. Use descriptive job names so others understand what the session is for.
+
+**The point is flow, not ownership.**
+The goal of hive-cli is to eliminate the queue-wait friction that breaks an agent's reasoning loop — not to claim permanent GPU access. If you're not actively iterating, let the nodes go.
+
+> Clusters work best when everyone treats shared resources as borrowed, not owned.
+
+---
+
 ## Installation
 
 ```bash
