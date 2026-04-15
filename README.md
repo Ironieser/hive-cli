@@ -142,10 +142,6 @@ Currently configured for clusters with:
 
 Tested on evc cluster with H100 SXM/PCIe nodes.
 
-## Author
-
-[Ironieser](https://github.com/Ironieser) — ironieser@gmail.com
-
 ## License
 
 MIT
