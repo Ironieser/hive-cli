@@ -176,9 +176,34 @@ cd hive-cli && bash install.sh
 Installs to `~/.local/share/hive-cli/`, symlinks `hive` to `~/bin/hive`.
 Backward-compat symlinks: `myjob` → `hive jobs`, `mynode` → `hive nodes`, `jobtop` → `hive top`.
 
-## Cluster-specific notes (evc cluster)
+## `hive pool` — node pool management
 
-- **highgpu** partition: evc101-104, H100 SXM 80GB, requires `--qos=chenchen`
-- **normal** partition: evc2-49, H100 PCIe 80GB
-- Bad nodes to exclude: evc31, evc33, evc44 (CUDA faults)
-- Hold job submission: use `~/1_gpu.slurm` (highgpu) or `~/1_normal_gpu.slurm` (normal) with `--time=10-00:00:00`
+```bash
+hive pool init              # create ~/.hive/pool_config.json (first-time setup)
+hive pool config            # show presets and verify script paths
+hive pool add               # sbatch one hold job (default preset)
+hive pool add highgpu       # use a named preset
+hive pool add --count 3     # submit 3 hold jobs at once
+hive pool release 584954    # scancel a specific hold job
+hive pool release --idle    # scancel all currently IDLE hold jobs
+```
+
+### First-time setup
+
+```bash
+hive pool init
+# then edit ~/.hive/pool_config.json:
+```
+
+```json
+{
+  "default": "normal",
+  "presets": {
+    "normal":  { "script": "~/1_normal_gpu.slurm", "description": "..." },
+    "highgpu": { "script": "~/1_gpu.slurm",        "description": "..." }
+  }
+}
+```
+
+`~/.hive/pool_config.json` is **local only** — never committed to git.
+The repo ships `pool_config.example.json` as a template.

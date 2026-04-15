@@ -72,6 +72,10 @@ case "$subcommand" in
         py="$(_resolve_python)"
         exec "$py" "${HIVE_LIBEXEC}/hive-queue" "$@"
         ;;
+    pool)
+        py="$(_resolve_python)"
+        exec "$py" "${HIVE_LIBEXEC}/hive-pool" "$@"
+        ;;
     daemon)
         sub="${1:-status}"; shift 2>/dev/null || true
         case "$sub" in
@@ -100,6 +104,8 @@ case "$subcommand" in
     poll                      Trigger immediate node poll
     queue    submit|list|cancel|logs|rm|daemon
                               Task queue (auto-schedules to idle nodes)
+    pool     add|release|init|config
+                              Manage node pool (sbatch hold jobs / scancel)
 
   Examples:
     hive jobs -a              Show all users' jobs

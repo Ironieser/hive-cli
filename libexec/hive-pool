@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""hive-pool — manage the pre-allocated SLURM node pool
+
+Commands:
+  hive pool add [PRESET] [--count N]   Submit new hold job(s)
+  hive pool release JOBID              Cancel a hold job (scancel)
+  hive pool release --idle             Cancel all currently IDLE hold jobs
+  hive pool init                       Create ~/.hive/pool_config.json from example
+  hive pool config                     Show current preset config
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+HIVE_DIR     = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
+CONFIG_FILE  = os.path.join(HIVE_DIR, "pool_config.json")
+NODE_DB      = os.path.join(HIVE_DIR, "node_monitor.json")
+
+LIBEXEC_DIR  = os.path.dirname(os.path.realpath(__file__))
+EXAMPLE_FILE = os.path.join(os.path.dirname(LIBEXEC_DIR), "pool_config.example.json")
+
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_RED = "\033[31m"
+C_BOLD = "\033[1m"
+C_RESET = "\033[0m"
+
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"{C_YELLOW}No pool config found.{C_RESET}", file=sys.stderr)
+        print(f"Run  {C_BOLD}hive pool init{C_RESET}  to create one, or:", file=sys.stderr)
+        print(f"  cp {EXAMPLE_FILE} {CONFIG_FILE}", file=sys.stderr)
+        print(f"  # then edit {CONFIG_FILE} for your cluster", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Error reading {CONFIG_FILE}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_preset(config, name=None):
+    presets = config.get("presets", {})
+    if not presets:
+        print("No presets defined in pool_config.json.", file=sys.stderr)
+        sys.exit(1)
+
+    preset_name = name or config.get("default") or next(iter(presets))
+    if preset_name not in presets:
+        print(f"Preset '{preset_name}' not found. Available: {', '.join(presets)}", file=sys.stderr)
+        sys.exit(1)
+
+    return preset_name, presets[preset_name]
+
+
+# ── Node DB ───────────────────────────────────────────────────────────────────
+
+def load_idle_jobids():
+    if not os.path.exists(NODE_DB):
+        return []
+    try:
+        with open(NODE_DB) as f:
+            jobs = json.load(f).get("jobs", {})
+        return [jid for jid, info in jobs.items() if info.get("status") == "idle"]
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_add(args):
+    config = load_config()
+    preset_name, preset = get_preset(config, args.preset)
+    script = os.path.expanduser(preset.get("script", ""))
+
+    if not script:
+        print(f"Preset '{preset_name}' has no 'script' field.", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(script):
+        print(f"{C_RED}Script not found:{C_RESET} {script}", file=sys.stderr)
+        print(f"Check the 'script' path in {CONFIG_FILE}", file=sys.stderr)
+        sys.exit(1)
+
+    count = args.count
+    desc = preset.get("description", "")
+    print(f"Submitting {count}× hold job  [{preset_name}]  {desc}")
+
+    for _ in range(count):
+        result = subprocess.run(["sbatch", script], capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"  {C_GREEN}✓{C_RESET} {result.stdout.strip()}")
+        else:
+            print(f"  {C_RED}✗{C_RESET} {result.stderr.strip()}", file=sys.stderr)
+
+
+def cmd_release(args):
+    if args.idle:
+        idle_ids = load_idle_jobids()
+        if not idle_ids:
+            print("No IDLE nodes found in node_monitor.json.")
+            print("Run 'hive poll' first to refresh node status.")
+            return
+        print(f"Cancelling {len(idle_ids)} IDLE hold job(s): {', '.join(idle_ids)}")
+        for jid in idle_ids:
+            result = subprocess.run(["scancel", jid], capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"  {C_GREEN}✓{C_RESET} scancel {jid}")
+            else:
+                print(f"  {C_RED}✗{C_RESET} scancel {jid}: {result.stderr.strip()}")
+    else:
+        jid = str(args.jobid)
+        result = subprocess.run(["scancel", jid], capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"{C_GREEN}✓{C_RESET} Cancelled job {jid}")
+        else:
+            print(f"{C_RED}✗{C_RESET} {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+
+
+def cmd_init(args):
+    if os.path.exists(CONFIG_FILE):
+        print(f"Config already exists: {CONFIG_FILE}")
+        print("Delete it first if you want to reinitialise.")
+        return
+
+    if not os.path.exists(EXAMPLE_FILE):
+        print(f"Example file not found: {EXAMPLE_FILE}", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(HIVE_DIR, exist_ok=True)
+    with open(EXAMPLE_FILE) as f:
+        example = f.read()
+    with open(CONFIG_FILE, 'w') as f:
+        f.write(example)
+
+    print(f"{C_GREEN}✓{C_RESET} Created {CONFIG_FILE}")
+    print()
+    print(f"Edit it to point to your cluster's sbatch scripts:")
+    print(f"  {CONFIG_FILE}")
+    print()
+    print("Then test with:")
+    print(f"  hive pool config    # verify presets look correct")
+    print(f"  hive pool add       # submit one hold job")
+
+
+def cmd_config(args):
+    config = load_config()
+    presets = config.get("presets", {})
+    default = config.get("default", "")
+
+    print(f"{C_BOLD}Pool config:{C_RESET}  {CONFIG_FILE}")
+    print()
+    for name, preset in presets.items():
+        marker = f" {C_GREEN}(default){C_RESET}" if name == default else ""
+        script = os.path.expanduser(preset.get("script", "(no script)"))
+        desc   = preset.get("description", "")
+        exists = os.path.exists(script)
+        status = f"{C_GREEN}✓{C_RESET}" if exists else f"{C_RED}✗ not found{C_RESET}"
+        print(f"  {C_BOLD}{name}{C_RESET}{marker}")
+        print(f"    script: {script}  {status}")
+        if desc:
+            print(f"    desc:   {desc}")
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="hive pool",
+        description="Manage the pre-allocated SLURM node pool",
+    )
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+
+    # add
+    pa = sub.add_parser("add", help="Submit new hold job(s) to expand pool")
+    pa.add_argument("preset", nargs="?", default=None,
+                    metavar="PRESET", help="Preset name (default: from config)")
+    pa.add_argument("--count", "-n", type=int, default=1, metavar="N",
+                    help="Number of hold jobs to submit (default: 1)")
+
+    # release
+    pr = sub.add_parser("release", help="Cancel a hold job (scancel)")
+    grp = pr.add_mutually_exclusive_group(required=True)
+    grp.add_argument("jobid", nargs="?", type=int, metavar="JOBID",
+                     help="SLURM job ID to cancel")
+    grp.add_argument("--idle", action="store_true",
+                     help="Cancel all currently IDLE hold jobs")
+
+    # init
+    sub.add_parser("init", help=f"Create {CONFIG_FILE} from example")
+
+    # config
+    sub.add_parser("config", help="Show current preset configuration")
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "add":
+        cmd_add(args)
+    elif args.command == "release":
+        cmd_release(args)
+    elif args.command == "init":
+        cmd_init(args)
+    elif args.command == "config":
+        cmd_config(args)
+
+
+if __name__ == "__main__":
+    main()

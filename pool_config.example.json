@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy this file to ~/.hive/pool_config.json and edit for your cluster. Never commit pool_config.json to git.",
+  "default": "normal",
+  "presets": {
+    "normal": {
+      "script": "~/1_normal_gpu.slurm",
+      "description": "Standard GPU partition"
+    },
+    "highgpu": {
+      "script": "~/1_gpu.slurm",
+      "description": "High-end GPU partition"
+    }
+  }
+}
