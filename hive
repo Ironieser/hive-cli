@@ -98,9 +98,8 @@ case "$subcommand" in
   Examples:
     hive jobs -a              Show all users' jobs
     hive jobs -r              Show running jobs only
-    hive nodes                Show node status (auto-starts daemon)
-    hive nodes -w             Watch mode (refresh every 60s)
-    hive top                  Open interactive monitor
+    hive nodes                Show node status once (auto-starts daemon)
+    hive top                  Open interactive monitor (continuous)
     hive daemon start         Start background poller
     hive daemon stop          Stop background poller
     hive poll                 Poll now + update DB

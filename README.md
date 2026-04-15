@@ -61,8 +61,7 @@ Enhanced `squeue` view with computed time remaining, idle H100 node detection, a
 ### `hive nodes` — node pool status
 
 ```bash
-hive nodes          # show node table (auto-starts daemon)
-hive nodes -w       # watch mode, refresh every 60s
+hive nodes          # show node table once (auto-starts daemon)
 ```
 
 Shows each pre-allocated node's real-time status: GPU utilization, memory usage, running processes, and elapsed time — by actively probing each node via `srun --overlap`.

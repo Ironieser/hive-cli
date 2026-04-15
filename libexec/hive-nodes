@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # hive-nodes — node status table + daemon manager (hive nodes subcommand)
 # Usage:
-#   hive nodes              show table (auto-starts daemon if not running)
+#   hive nodes              show table once (auto-starts daemon if not running)
 #   hive nodes start        start daemon
 #   hive nodes stop         stop daemon
 #   hive nodes restart      restart daemon
 #   hive nodes status       show daemon status
 #   hive nodes logs         tail daemon log
 #   hive nodes poll         run one immediate poll
-#   hive nodes -w/--watch   watch mode (refresh every 60s)
 #   hive nodes -h/--help    show help
+#
+#   For continuous monitoring use: hive top
 
 HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
 DB_FILE="${DB_FILE:-${HIVE_DIR}/node_monitor.json}"
@@ -379,14 +380,13 @@ Commands:
   poll         Run one immediate poll now
 
 Options:
-  -w, --watch  Clear screen, show table every 60s
   -h, --help   Show this help
+
+For continuous interactive monitoring use: hive top
 EOF
 }
 
 # ── entry point ───────────────────────────────────────────────────────────────
-WATCH_MODE=0
-
 case "${1:-}" in
     start)
         daemon_start
@@ -422,15 +422,12 @@ case "${1:-}" in
         show_daemon_footer
         exit 0
         ;;
-    -w|--watch)
-        WATCH_MODE=1
-        ;;
     -h|--help)
         usage
         exit 0
         ;;
     "")
-        # default: handled below
+        # default: show once
         ;;
     *)
         echo "Unknown command: $1"
@@ -439,25 +436,10 @@ case "${1:-}" in
         ;;
 esac
 
-# ── default / watch mode ──────────────────────────────────────────────────────
-show_once() {
-    # Auto-start daemon if not running
-    if ! daemon_running; then
-        daemon_start
-        # Brief pause to let daemon write its PID
-        sleep 1
-    fi
-    show_table
-    show_daemon_footer
-}
-
-if (( WATCH_MODE )); then
-    while true; do
-        clear
-        printf "${BOLD}${CYAN}hive nodes${NC} ${DIM}— node monitor  (Ctrl+C to quit, refresh every 60s)${NC}\n"
-        show_once
-        sleep 60
-    done
-else
-    show_once
+# ── default: show once ────────────────────────────────────────────────────────
+if ! daemon_running; then
+    daemon_start
+    sleep 1
 fi
+show_table
+show_daemon_footer
