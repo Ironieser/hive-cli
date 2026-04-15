@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# hive-jobs — SLURM queue dashboard (hive jobs subcommand)
+
+USER="${USER:-$(whoami)}"
+MODE="mine"
+PARTITION=""
+STATE=""
+
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+usage() {
+    cat << 'EOF'
+用法: hive jobs [选项]
+  无参数            只显示当前用户的作业
+  -a, --all         显示整个队列（所有用户）
+  -p NAME           只显示指定分区（normal / highgpu）
+  -w, --wait        只显示排队中的作业
+  -r, --run         只显示运行中的作业
+  -h, --help        显示此帮助
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--all)       MODE="all"; shift ;;
+        -p)             PARTITION="$2"; shift 2 ;;
+        -w|--wait)      STATE="P"; shift ;;
+        -r|--run)       STATE="R"; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              echo "未知选项: $1"; usage; exit 1 ;;
+    esac
+done
+
+SQUEUE_ARGS=()
+[[ -n "$PARTITION" ]] && SQUEUE_ARGS+=( -p "$PARTITION" )
+[[ "$MODE" == "mine" ]] && SQUEUE_ARGS+=( -u "$USER" )
+[[ -n "$STATE" ]] && SQUEUE_ARGS+=( -t "$STATE" )
+
+RAW=$(squeue "${SQUEUE_ARGS[@]}" --noheader \
+    -o "%i|%P|%j|%t|%C|%m|%M|%l|%R|%N|%u" 2>/dev/null)
+
+[[ -z "$RAW" ]] && { echo "无作业。"; exit 0; }
+
+to_mins() {
+    local t="$1"
+    if [[ "$t" == *-* ]]; then
+        local d="${t%%-*}" hms="${t#*-}"
+        local h="${hms%%:*}" rest="${hms#*:}" m="${rest%%:*}"
+        echo $(( 10#$d*24*60 + 10#$h*60 + 10#$m ))
+    else
+        local h="${t%%:*}" rest="${t#*:}" m="${rest%%:*}"
+        echo $(( 10#$h*60 + 10#$m ))
+    fi
+}
+
+fmt_left() {
+    local left_m=$1
+    (( left_m < 0 )) && left_m=0
+    local d=$(( left_m / 1440 ))
+    local h=$(( (left_m % 1440) / 60 ))
+    local m=$(( left_m % 60 ))
+    if (( d > 0 )); then echo "${d}d${h}h${m}m"
+    else echo "${h}h${m}m"; fi
+}
+
+n_run=0; n_pd=0
+
+# 表头
+echo ""
+printf "${BOLD}%-10s  %-9s  %-10s  %-22s  %-3s  %-4s  %-5s  %-11s  %-11s  %s${NC}\n" \
+    "JOBID" "PARTITION" "USER" "NAME" "ST" "CPU" "MEM" "ELAPSED" "TIME_LEFT" "NODE/REASON"
+printf '%0.s-' {1..110}; echo
+
+while IFS='|' read -r jobid part name st cpu mem elapsed timelimit reason node uname; do
+    jobid="${jobid// /}"; part="${part// /}"; name="${name// /}"
+    st="${st// /}"; cpu="${cpu// /}"; mem="${mem// /}"
+    elapsed="${elapsed// /}"; timelimit="${timelimit// /}"
+    reason="${reason// /}"; node="${node// /}"; uname="${uname// /}"
+
+    # 剩余时间
+    if [[ "$st" == "R" && "$elapsed" != "N/A" && "$elapsed" != "-" && "$elapsed" != "" && "$timelimit" != "N/A" && "$timelimit" != "-" ]]; then
+        left_m=$(( $(to_mins "$timelimit") - $(to_mins "$elapsed") ))
+        time_left=$(fmt_left $left_m)
+    else
+        time_left="-"
+        elapsed="-"
+    fi
+
+    # node/reason 显示
+    if [[ "$st" == "R" ]]; then
+        display="${node}"
+        n_run=$(( n_run+1 ))
+    else
+        display="${reason}"
+        n_pd=$(( n_pd+1 ))
+    fi
+
+    # 先打印无色内容（保证对齐），再用 tput 着色覆盖不行，改用行内方式：
+    # 对齐靠固定宽度字符串，颜色只包裹内容不影响宽度
+    if [[ "$st" == "R" ]]; then st_col="${GREEN}${st}${NC}"; else st_col="${YELLOW}${st}${NC}"; fi
+    if [[ "$part" == "highgpu" ]]; then part_col="${CYAN}${part}${NC}"; else part_col="${part}"; fi
+
+    # 用 printf 先格式化纯文本，再替换颜色字段
+    line=$(printf "%-10s  %-9s  %-10s  %-22s  %-3s  %-4s  %-5s  %-11s  %-11s  %s" \
+        "$jobid" "$part" "$uname" "$name" "$st" "$cpu" "$mem" "$elapsed" "$time_left" "$display")
+
+    # 替换字段颜色（基于已知位置替换固定字符串）
+    line="${line/$part/${part_col}}"
+    line="${line/  $st   /  ${st_col}  }"
+
+    echo -e "  ${line}"
+
+done <<< "$RAW"
+
+printf '%0.s-' {1..110}; echo
+printf "  ${BOLD}运行中: ${GREEN}%d${NC}${BOLD}  排队中: ${YELLOW}%d${NC}${BOLD}  合计: %d${NC}\n" \
+    "$n_run" "$n_pd" "$(( n_run + n_pd ))"
+
+# 闲置节点 & 排队概况（仅 mine 模式）
+if [[ "$MODE" == "mine" ]]; then
+    echo ""
+    printf '%0.s-' {1..110}; echo
+
+    # 闲置 H100 节点（展开节点范围，排除已知坏节点）
+    BAD_NODES="evc31,evc33,evc44"
+    IDLE_H100=$(sinfo -p normal,highgpu --noheader -o "%N %G %t" 2>/dev/null \
+        | grep "idle" | grep -i "h100" | grep -v "mix-\|drain\|down" \
+        | while read -r nodes gpu state; do
+            # 展开节点范围 evc[40,44,46] -> 逐行
+            scontrol show hostnames "$nodes" 2>/dev/null | while read -r n; do
+                # 排除坏节点
+                bad=0
+                IFS=',' read -ra blist <<< "$BAD_NODES"
+                for b in "${blist[@]}"; do [[ "$n" == "$b" ]] && bad=1 && break; done
+                (( bad )) && continue
+                echo "$n $gpu $state"
+            done
+        done)
+    if [[ -n "$IDLE_H100" ]]; then
+        n_idle=$(wc -l <<< "$IDLE_H100")
+        printf "  ${BOLD}${GREEN}闲置 H100 节点 (%d):${NC}\n" "$n_idle"
+        while read -r node gpu state; do
+            part="normal"
+            [[ "$gpu" == *"hbm3"* || "$gpu" == *"80gb"* ]] && part="highgpu"
+            printf "    %-15s  %s  (%s)\n" "$node" "$gpu" "$part"
+        done <<< "$IDLE_H100"
+    else
+        printf "  ${BOLD}${GREEN}闲置 H100 节点 (0):${NC} 暂无\n"
+    fi
+
+    # chenchen group 排队阻塞情况
+    BLOCKED=$(squeue -p normal,highgpu --noheader \
+        -o "%u|%i|%j|%R" 2>/dev/null | grep "QOSGrpCPUMinutesLimit")
+    if [[ -n "$BLOCKED" ]]; then
+        echo ""
+        printf "  ${BOLD}${RED}QOS CPU 配额阻塞:${NC}\n"
+        while IFS='|' read -r u jid jname reason; do
+            u="${u// /}"; jid="${jid// /}"; jname="${jname// /}"
+            printf "    %-12s  %-10s  %s\n" "$u" "$jid" "$jname"
+        done <<< "$BLOCKED"
+    fi
+
+    # 我自己的 PENDING 排队原因汇总
+    MY_PD=$(squeue -u "$USER" --noheader -o "%i|%j|%R" -t PD 2>/dev/null | grep -v cursor)
+    if [[ -n "$MY_PD" ]]; then
+        echo ""
+        printf "  ${BOLD}${YELLOW}我的排队 job 原因:${NC}\n"
+        while IFS='|' read -r jid jname reason; do
+            jid="${jid// /}"; jname="${jname// /}"; reason="${reason// /}"
+            printf "    %-10s  %-22s  %s\n" "$jid" "$jname" "$reason"
+        done <<< "$MY_PD"
+    fi
+
+    printf '%0.s-' {1..110}; echo
+fi
+echo ""

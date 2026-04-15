@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""hive top — SLURM Node Monitor (htop-style TUI)
+
+Reads ~/.hive/node_monitor.json written by mynode-daemon every 120s.
+"""
+
+import curses
+import json
+import os
+import re
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+HIVE_DIR = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
+DB_PATH  = os.path.join(HIVE_DIR, "node_monitor.json")
+PID_PATH = os.path.join(HIVE_DIR, "node_monitor.pid")
+
+# ── Constants ────────────────────────────────────────────────────────────────
+DAEMON_POLL_INTERVAL = 120   # seconds between daemon polls
+AUTO_REFRESH         = 30    # seconds between UI file reloads
+STALE_THRESHOLD      = 600   # 10 min → red warning
+
+
+# ── Color pair IDs ───────────────────────────────────────────────────────────
+C_HEADER  = 1
+C_BUSY    = 2
+C_IDLE    = 3
+C_DIM     = 4
+C_GPU_HI  = 5
+C_GPU_MID = 6
+C_GPU_LO  = 7
+C_SEL     = 8
+C_STALE   = 9
+C_BORDER  = 10
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_HEADER,  curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_BUSY,    curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_IDLE,    curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_DIM,     curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_GPU_HI,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_GPU_MID, curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_GPU_LO,  curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_SEL,     curses.COLOR_BLACK,   curses.COLOR_CYAN)
+    curses.init_pair(C_STALE,   curses.COLOR_RED,     -1)
+    curses.init_pair(C_BORDER,  curses.COLOR_CYAN,    -1)
+
+
+def load_db():
+    """Return (data_dict, error_str).  data_dict may be None on error."""
+    try:
+        with open(DB_PATH) as f:
+            return json.load(f), None
+    except FileNotFoundError:
+        return None, f"DB not found: {DB_PATH}"
+    except json.JSONDecodeError as e:
+        return None, f"JSON parse error: {e}"
+    except Exception as e:
+        return None, str(e)
+
+
+def daemon_status():
+    """Return (is_running: bool, pid: int|None)."""
+    try:
+        with open(PID_PATH) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True, pid
+    except (FileNotFoundError, ValueError):
+        return False, None
+    except OSError:
+        return False, None
+
+
+def send_sigusr1():
+    """Send SIGUSR1 to daemon to trigger immediate poll."""
+    running, pid = daemon_status()
+    if running and pid:
+        try:
+            os.kill(pid, signal.SIGUSR1)
+            return True
+        except OSError:
+            pass
+    return False
+
+
+def parse_updated(data):
+    """Return datetime or None."""
+    if data and "updated" in data:
+        try:
+            return datetime.fromisoformat(data["updated"])
+        except ValueError:
+            pass
+    return None
+
+
+def seconds_since(dt):
+    if dt is None:
+        return None
+    now = datetime.now()
+    return (now - dt).total_seconds()
+
+
+def next_poll_countdown(updated_dt):
+    """Seconds until next daemon poll (based on updated + 120s)."""
+    if updated_dt is None:
+        return None
+    elapsed = seconds_since(updated_dt)
+    remaining = DAEMON_POLL_INTERVAL - elapsed
+    return max(0, remaining)
+
+
+def fmt_countdown(secs):
+    if secs is None:
+        return "?"
+    secs = int(secs)
+    m, s = divmod(secs, 60)
+    if m > 0:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def fmt_mem(mem_used_mib, mem_total_mib):
+    """Format e.g. '42G/80G'."""
+    def mib_to_g(v):
+        g = v / 1024
+        return f"{g:.0f}G"
+    return f"{mib_to_g(mem_used_mib)}/{mib_to_g(mem_total_mib)}"
+
+
+def gpu_util_str(job):
+    gpus = job.get("gpu", [])
+    if not gpus:
+        return "  ?"
+    util = gpus[0].get("util", 0)
+    return f"{util:3d}%"
+
+
+def gpu_mem_str(job):
+    gpus = job.get("gpu", [])
+    if not gpus:
+        return "?"
+    g = gpus[0]
+    return fmt_mem(g.get("mem_used", 0), g.get("mem_total", 0))
+
+
+def short_cmd(cmd, maxlen):
+    """Shorten a command to maxlen chars."""
+    # Strip full python path
+    cmd = re.sub(r"/[^\s]+/envs/[^/]+/bin/python\S*", "python3", cmd)
+    if len(cmd) <= maxlen:
+        return cmd
+    return cmd[:maxlen - 1] + "…"
+
+
+def sort_jobs(jobs_dict):
+    """Return sorted list of (job_id, job_data)."""
+    def key(item):
+        jid, jdata = item
+        status = jdata.get("status", "unknown")
+        # busy first, then by job_id numeric descending
+        order = 0 if status == "busy" else 1
+        try:
+            jnum = -int(jid)
+        except ValueError:
+            jnum = 0
+        return (order, jnum)
+    return sorted(jobs_dict.items(), key=key)
+
+
+def wrap_cmd(cmd, width, indent=4):
+    """Word-wrap a command to width, returning list of strings with continuation."""
+    cmd = re.sub(r"/[^\s]+/envs/[^/]+/bin/python\S*", "python3", cmd)
+    lines = []
+    # Split on spaces but keep args together
+    words = cmd.split(" ")
+    current = ""
+    cont_indent = " " * indent
+    for w in words:
+        candidate = (current + " " + w).lstrip() if current else w
+        if len(candidate) <= width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current + " \\")
+            current = cont_indent + w
+    if current:
+        lines.append(current)
+    return lines
+
+
+# ── Main TUI ──────────────────────────────────────────────────────────────────
+
+class NodeTop:
+    def __init__(self, stdscr):
+        self.stdscr  = stdscr
+        self.data    = None
+        self.err     = None
+        self.cursor  = 0          # selected row index
+        self.expanded = None      # job_id of expanded row, or None
+        self.paused  = False
+        self.last_refresh = 0.0   # time.monotonic of last file read
+        self.rows    = []         # sorted [(job_id, job_data), ...]
+
+        init_colors()
+        curses.curs_set(0)
+        self.stdscr.nodelay(True)
+        self.stdscr.timeout(500)  # ms input timeout → allows countdown updates
+
+        self._load()
+
+    # ── Data loading ─────────────────────────────────────────────────────────
+
+    def _load(self):
+        self.data, self.err = load_db()
+        self.last_refresh = time.monotonic()
+        if self.data:
+            self.rows = sort_jobs(self.data.get("jobs", {}))
+            # Clamp cursor
+            if self.cursor >= len(self.rows):
+                self.cursor = max(0, len(self.rows) - 1)
+
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
+    def draw(self):
+        scr = self.stdscr
+        try:
+            H, W = scr.getmaxyx()
+        except Exception:
+            return
+        scr.erase()
+
+        row = 0
+        row = self._draw_header(row, H, W)
+        row = self._draw_separator(row, W)
+        row = self._draw_column_headers(row, W)
+        row = self._draw_separator(row, W, thin=True)
+        row = self._draw_table(row, H, W)
+        self._draw_footer(H, W)
+
+        scr.refresh()
+
+    def _safe_addstr(self, y, x, text, attr=0):
+        H, W = self.stdscr.getmaxyx()
+        if y < 0 or y >= H:
+            return
+        if x >= W:
+            return
+        # Clamp text length
+        avail = W - x - 1
+        if avail <= 0:
+            return
+        text = text[:avail]
+        try:
+            self.stdscr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+    def _draw_header(self, row, H, W):
+        running, pid = daemon_status()
+        daemon_str = "● RUNNING" if running else "○ STOPPED"
+        daemon_attr = (curses.color_pair(C_BUSY) | curses.A_BOLD) if running else (curses.color_pair(C_STALE) | curses.A_BOLD)
+
+        updated_dt = parse_updated(self.data)
+        age = seconds_since(updated_dt)
+
+        if updated_dt:
+            poll_time = updated_dt.strftime("%H:%M:%S")
+        else:
+            poll_time = "N/A"
+
+        countdown = next_poll_countdown(updated_dt)
+        next_str = fmt_countdown(countdown)
+
+        stale = age is not None and age > STALE_THRESHOLD
+        stale_warn = "  ⚠ STALE DATA" if stale else ""
+
+        title = "hive top — SLURM Node Monitor"
+        if self.paused:
+            title += "  [PAUSED]"
+
+        # Build right side
+        right = f"last poll: {poll_time}  next: {next_str}  daemon: "
+        right_x = W - len(right) - len(daemon_str) - 1
+
+        # Title on left
+        self._safe_addstr(row, 0, title, curses.color_pair(C_HEADER) | curses.A_BOLD)
+        if stale_warn:
+            self._safe_addstr(row, len(title), stale_warn, curses.color_pair(C_STALE) | curses.A_BOLD)
+
+        self._safe_addstr(row, max(len(title) + 2, right_x), right, curses.color_pair(C_HEADER))
+        x_daemon = max(len(title) + 2, right_x) + len(right)
+        self._safe_addstr(row, x_daemon, daemon_str, daemon_attr)
+
+        if self.err:
+            self._safe_addstr(row + 1, 0, f"  Error: {self.err}", curses.color_pair(C_STALE))
+            return row + 2
+
+        return row + 1
+
+    def _draw_separator(self, row, W, thin=False):
+        char = "─" if thin else "━"
+        self._safe_addstr(row, 0, char * (W - 1), curses.color_pair(C_BORDER))
+        return row + 1
+
+    def _draw_column_headers(self, row, W):
+        header = f"  {'JOBID':<10} {'NODE':<8} {'PART':<10} {'ELAPSED':<10} {'STATUS':<8} {'GPU%':<5} {'MEM':<12} TASK"
+        self._safe_addstr(row, 0, header[:W - 1], curses.color_pair(C_HEADER) | curses.A_BOLD)
+        return row + 1
+
+    def _draw_table(self, row, H, W):
+        # Reserve footer lines
+        footer_lines = 3
+        # Separator + status line at bottom
+        max_row = H - footer_lines - 1
+
+        # Column widths (fixed prefix = 2+10+1+8+1+10+1+10+1+8+1+5+1+12+1 = ~71 chars)
+        PREFIX_W = 2 + 10 + 1 + 8 + 1 + 10 + 1 + 10 + 1 + 8 + 1 + 5 + 1 + 12 + 1
+        task_w = max(W - PREFIX_W - 2, 10)
+
+        for i, (jid, jdata) in enumerate(self.rows):
+            if row >= max_row:
+                break
+
+            is_selected = (i == self.cursor)
+            is_expanded = (jid == self.expanded)
+
+            status = jdata.get("status", "unknown").upper()
+            node   = jdata.get("node", "?")
+            part   = jdata.get("partition", "?")
+            elapsed = jdata.get("job_elapsed", "?")
+            gpus   = jdata.get("gpu", [])
+            procs  = jdata.get("processes", [])
+
+            # GPU util / mem
+            util = gpus[0].get("util", 0) if gpus else 0
+            mem_used  = gpus[0].get("mem_used", 0) if gpus else 0
+            mem_total = gpus[0].get("mem_total", 0) if gpus else 0
+            mem_str   = fmt_mem(mem_used, mem_total) if gpus else "?"
+
+            # Main task command (first process with python or any)
+            task_cmd = "—"
+            for p in procs:
+                cmd = p.get("cmd", "")
+                if "python" in cmd or "python3" in cmd:
+                    task_cmd = cmd
+                    break
+            if task_cmd == "—" and procs:
+                task_cmd = procs[0].get("cmd", "—")
+            task_cmd_short = short_cmd(task_cmd, task_w)
+
+            # Build line
+            marker = "▶" if is_selected else " "
+            gpu_str = f"{util:3d}%" if gpus else "  ?%"
+            line = (
+                f"{marker} {jid:<10} {node:<8} {part:<10} {elapsed:<10} "
+                f"{status:<8} {gpu_str:<5} {mem_str:<12} {task_cmd_short}"
+            )
+
+            # Attributes
+            if is_selected:
+                base_attr = curses.color_pair(C_SEL) | curses.A_BOLD
+            else:
+                base_attr = 0
+
+            # Draw the full line with base attr
+            self._safe_addstr(row, 0, line[:W - 1], base_attr)
+
+            # Colorize status word in-place (only when not selected)
+            if not is_selected:
+                # Status column starts at: 2+10+1+8+1+10+1+10+1 = 44
+                status_x = 2 + 10 + 1 + 8 + 1 + 10 + 1 + 10 + 1
+                if status == "BUSY":
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY) | curses.A_BOLD)
+                elif status == "IDLE":
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_IDLE))
+                else:
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_DIM) | curses.A_DIM)
+
+                # GPU% color
+                gpu_x = status_x + 8 + 1  # after STATUS col (8) + space
+                if util > 50:
+                    gpu_attr = curses.color_pair(C_GPU_HI) | curses.A_BOLD
+                elif util > 0:
+                    gpu_attr = curses.color_pair(C_GPU_MID)
+                else:
+                    gpu_attr = curses.color_pair(C_GPU_LO) | curses.A_DIM
+                self._safe_addstr(row, gpu_x, gpu_str, gpu_attr)
+
+            row += 1
+
+            # Expanded detail panel
+            if is_expanded and row < max_row:
+                row = self._draw_detail(row, max_row, W, jid, jdata)
+
+        # Separator + summary
+        if row < max_row:
+            self._draw_separator(row, W, thin=True)
+            row += 1
+
+        if row < max_row:
+            busy_count = sum(1 for _, j in self.rows if j.get("status") == "busy")
+            idle_count = sum(1 for _, j in self.rows if j.get("status") == "idle")
+            total = len(self.rows)
+            summary = f"  busy: {busy_count}   idle: {idle_count}   total: {total}"
+            self._safe_addstr(row, 0, summary, curses.color_pair(C_HEADER))
+            row += 1
+
+        return row
+
+    def _draw_detail(self, row, max_row, W, jid, jdata):
+        """Draw expanded detail panel for a job."""
+        node = jdata.get("node", "?")
+        part = jdata.get("partition", "?")
+
+        # Top border
+        title = f" {jid}  {node}  {part} "
+        border = f"  ─── {title}" + "─" * max(0, W - 10 - len(title))
+        self._safe_addstr(row, 0, border[:W - 1], curses.color_pair(C_BORDER))
+        row += 1
+
+        # GPU lines
+        for g in jdata.get("gpu", []):
+            if row >= max_row:
+                break
+            gline = f"  GPU {g['index']}  util: {g['util']}%   mem: {g['mem_used']}/{g['mem_total']} MiB"
+            self._safe_addstr(row, 0, gline, curses.color_pair(C_GPU_HI) if g['util'] > 0 else curses.color_pair(C_DIM))
+            row += 1
+
+        procs = jdata.get("processes", [])
+        if procs and row < max_row:
+            self._safe_addstr(row, 0, "", 0)
+            row += 1
+            if row < max_row:
+                hdr = f"  {'PID':<10} {'CPU%':<7} {'MEM%':<7} {'ELAPSED':<10} COMMAND"
+                self._safe_addstr(row, 0, hdr, curses.color_pair(C_HEADER) | curses.A_BOLD)
+                row += 1
+
+            cmd_width = max(W - 42, 20)
+
+            for p in procs:
+                if row >= max_row:
+                    break
+                pid     = p.get("pid", "?")
+                cpu     = p.get("cpu", 0)
+                mem     = p.get("mem", 0)
+                elapsed = p.get("elapsed", "?")
+                cmd     = p.get("cmd", "")
+
+                cmd_lines = wrap_cmd(cmd, cmd_width, indent=42)
+
+                first_line = f"  {str(pid):<10} {cpu:<7} {mem:<7} {elapsed:<10} {cmd_lines[0] if cmd_lines else ''}"
+                self._safe_addstr(row, 0, first_line[:W - 1], 0)
+                row += 1
+
+                for cl in cmd_lines[1:]:
+                    if row >= max_row:
+                        break
+                    self._safe_addstr(row, 0, (" " * 42 + cl)[:W - 1], curses.color_pair(C_DIM) | curses.A_DIM)
+                    row += 1
+
+        # Bottom border
+        if row < max_row:
+            self._safe_addstr(row, 0, ("  " + "─" * (W - 3))[:W - 1], curses.color_pair(C_BORDER))
+            row += 1
+
+        return row
+
+    def _draw_footer(self, H, W):
+        keys = "[↑↓/jk] navigate  [Enter/Space] expand  [r] refresh  [p] pause  [q] quit"
+        self._safe_addstr(H - 1, 0, keys[:W - 1], curses.color_pair(C_HEADER))
+
+    # ── Input handling ────────────────────────────────────────────────────────
+
+    def handle_key(self, key):
+        n = len(self.rows)
+
+        if key in (ord('q'), ord('Q')):
+            return False  # signal quit
+
+        elif key == curses.KEY_UP or key == ord('k'):
+            self.cursor = max(0, self.cursor - 1)
+
+        elif key == curses.KEY_DOWN or key == ord('j'):
+            self.cursor = min(n - 1, self.cursor + 1) if n > 0 else 0
+
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord(' ')):
+            if n > 0:
+                jid = self.rows[self.cursor][0]
+                if self.expanded == jid:
+                    self.expanded = None
+                else:
+                    self.expanded = jid
+
+        elif key == 27:  # ESC
+            self.expanded = None
+
+        elif key == ord('r'):
+            send_sigusr1()
+            self._load()
+
+        elif key == ord('p'):
+            self.paused = not self.paused
+
+        elif key == curses.KEY_RESIZE:
+            self.stdscr.clear()
+
+        return True
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    def run(self):
+        while True:
+            self.draw()
+
+            key = self.stdscr.getch()
+            if key != -1:
+                if not self.handle_key(key):
+                    break
+
+            # Auto-refresh
+            if not self.paused:
+                elapsed = time.monotonic() - self.last_refresh
+                if elapsed >= AUTO_REFRESH:
+                    self._load()
+
+
+def main(stdscr):
+    app = NodeTop(stdscr)
+    app.run()
+
+
+def run():
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        # Restore terminal and show error
+        sys.exit(f"jobtop error: {e}")
+
+
+if __name__ == "__main__":
+    run()

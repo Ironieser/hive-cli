@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# hive-nodes — node status table + daemon manager (hive nodes subcommand)
+# Usage:
+#   hive nodes              show table (auto-starts daemon if not running)
+#   hive nodes start        start daemon
+#   hive nodes stop         stop daemon
+#   hive nodes restart      restart daemon
+#   hive nodes status       show daemon status
+#   hive nodes logs         tail daemon log
+#   hive nodes poll         run one immediate poll
+#   hive nodes -w/--watch   watch mode (refresh every 60s)
+#   hive nodes -h/--help    show help
+
+HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
+DB_FILE="${DB_FILE:-${HIVE_DIR}/node_monitor.json}"
+PID_FILE="${PID_FILE:-${HIVE_DIR}/node_monitor.pid}"
+LOG_FILE="${LOG_FILE:-${HIVE_DIR}/node_monitor.log}"
+# DAEMON_BIN and POLL_BIN may be exported by the hive dispatcher;
+# fall back to sibling in libexec relative to this script
+_LIBEXEC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DAEMON_BIN="${DAEMON_BIN:-${_LIBEXEC}/hive-daemon}"
+POLL_BIN="${POLL_BIN:-${_LIBEXEC}/hive-poll}"
+
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+# ── daemon helpers ────────────────────────────────────────────────────────────
+
+daemon_pid() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null)
+    [[ -z "$pid" ]] && return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+daemon_running() {
+    daemon_pid > /dev/null 2>&1
+}
+
+daemon_start() {
+    # 先清理多余的 daemon 实例（防止重复）
+    local running_pids
+    running_pids=$(pgrep -f "hive-daemon" 2>/dev/null | tr '\n' ' ')
+    local count; count=$(echo "$running_pids" | wc -w)
+    if (( count > 1 )); then
+        echo -e "  ${YELLOW}检测到 ${count} 个 daemon 实例，清理中...${NC}"
+        pgrep -f "hive-daemon" | xargs -r kill -9 2>/dev/null
+        rm -f "$PID_FILE"
+    elif daemon_running; then
+        local pid; pid=$(daemon_pid)
+        echo -e "  ${DIM}Daemon already running (PID $pid).${NC}"
+        return 0
+    fi
+    mkdir -p "$(dirname "$PID_FILE")"
+    nohup "$DAEMON_BIN" >> "$LOG_FILE" 2>&1 &
+    local newpid=$!
+    echo "$newpid" > "$PID_FILE"
+    echo -e "  ${GREEN}Starting monitor daemon (PID $newpid)...${NC}"
+}
+
+daemon_stop() {
+    local pid; pid=$(daemon_pid 2>/dev/null)
+    if [[ -z "$pid" ]]; then
+        echo -e "  ${DIM}Daemon not running.${NC}"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    kill -TERM "$pid" 2>/dev/null
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && (( waited < 10 )); do
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        echo -e "  ${RED}Daemon (PID $pid) force-killed after ${waited}s.${NC}"
+    else
+        echo -e "  ${GREEN}Daemon (PID $pid) stopped.${NC}"
+    fi
+    rm -f "$PID_FILE"
+}
+
+# ── daemon status footer ──────────────────────────────────────────────────────
+show_daemon_footer() {
+    local SEP
+    SEP=$(printf '%0.s─' {1..83})
+    printf "  %s\n" "$SEP"
+
+    if daemon_running; then
+        local pid; pid=$(daemon_pid)
+        # Try to get next poll time from last log entry
+        local last_poll_epoch=""
+        if [[ -f "$LOG_FILE" ]]; then
+            local last_ts
+            last_ts=$(grep "Poll cycle starting\|DB written" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oP '^\[\K[^\]]+')
+            if [[ -n "$last_ts" ]]; then
+                last_poll_epoch=$(date -d "$last_ts" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$last_ts" +%s 2>/dev/null)
+            fi
+        fi
+
+        local next_str=""
+        if [[ -n "$last_poll_epoch" ]]; then
+            local now_epoch; now_epoch=$(date +%s)
+            local elapsed_since=$(( now_epoch - last_poll_epoch ))
+            local remaining=$(( 120 - elapsed_since ))
+            if (( remaining < 0 )); then remaining=0; fi
+            local nm=$(( remaining / 60 )) ns=$(( remaining % 60 ))
+            next_str="~${nm}m ${ns}s"
+        else
+            next_str="unknown"
+        fi
+
+        printf "  ${DIM}daemon: ${GREEN}${BOLD}RUNNING${NC}${DIM} (PID $pid)${NC}  ${DIM}│  next poll: %s  │  log: %s${NC}\n" \
+            "$next_str" "$LOG_FILE"
+    else
+        printf "  ${DIM}daemon: ${RED}${BOLD}STOPPED${NC}${DIM}  │  run ${BOLD}hive daemon start${NC}${DIM} to start  │  log: %s${NC}\n" \
+            "$LOG_FILE"
+    fi
+    echo ""
+}
+
+# ── Python helper: parse DB, emit tab-separated rows ─────────────────────────
+read -r -d '' PYTHON_PARSE << 'PYEOF'
+import sys, json, re
+from datetime import datetime, timezone
+
+db_path = sys.argv[1]
+try:
+    with open(db_path) as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"ERROR\t{e}")
+    sys.exit(1)
+
+updated = data.get("updated", "")
+print(f"UPDATED\t{updated}")
+
+try:
+    ts = datetime.fromisoformat(updated)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    diff = int((now - ts).total_seconds())
+    if diff > 600:
+        print(f"STALE\t{diff}")
+except Exception:
+    pass
+
+def mem_gb(mib):
+    return f"{round(int(mib) / 1024)}G"
+
+def is_job_stale(polled_at):
+    try:
+        pts = datetime.fromisoformat(polled_at)
+        if pts.tzinfo is None:
+            pts = pts.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (now - pts).total_seconds() > 600
+    except Exception:
+        return False
+
+jobs = data.get("jobs", {})
+for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+    j = jobs[jobid]
+    node     = j.get("node", "")
+    part     = j.get("partition", "")
+    elapsed  = j.get("job_elapsed", "")
+    status   = j.get("status", "idle")
+    polled_at= j.get("polled_at", "")
+
+    gpus = j.get("gpu", [])
+    if gpus:
+        g = gpus[0]
+        gpu_util  = int(g.get("util",  0))
+        mem_used  = int(g.get("mem_used",  0))
+        mem_total = int(g.get("mem_total", 0))
+    else:
+        gpu_util = mem_used = mem_total = 0
+
+    mem_str = f"{mem_gb(mem_used)}/{mem_gb(mem_total)}"
+
+    procs = j.get("processes", [])
+    task_cmd = ""
+    if procs:
+        best = max(procs, key=lambda p: float(p.get("cpu", 0)))
+        raw_cmd = best.get("cmd", "")
+        m = re.search(r"(python\S*\s.+|bash\s.+)", raw_cmd)
+        task_cmd = m.group(1).strip() if m else raw_cmd.strip()
+        if len(task_cmd) > 55:
+            task_cmd = task_cmd[:54] + "…"
+
+    stale_flag = "1" if is_job_stale(polled_at) else "0"
+
+    fields = "\t".join([jobid, node, part, elapsed, status,
+                        str(gpu_util), mem_str, task_cmd, stale_flag])
+    print(f"JOB\t{fields}")
+PYEOF
+
+# ── display helpers ───────────────────────────────────────────────────────────
+print_col() {
+    local color="$1" text="$2" width="$3" sep="${4:-  }"
+    local len="${#text}"
+    local pad=$(( width - len ))
+    (( pad < 0 )) && pad=0
+    printf "${color}%s${NC}%*s%s" "$text" "$pad" "" "$sep"
+}
+
+show_table() {
+    if [[ ! -f "$DB_FILE" ]]; then
+        echo ""
+        printf "  ${RED}DB not found: %s${NC}\n" "$DB_FILE"
+        printf "  Run  ${BOLD}hive nodes poll${NC}  to poll once, or  ${BOLD}hive daemon start${NC}  to start the daemon.\n\n"
+        return 1
+    fi
+
+    local parsed
+    _PY="${HIVE_PYTHON:-}"
+    [[ -z "$_PY" && -x "${HOME}/.conda/envs/vlm/bin/python3" ]] && _PY="${HOME}/.conda/envs/vlm/bin/python3"
+    [[ -z "$_PY" ]] && _PY="$(command -v python3 2>/dev/null)"
+    parsed=$("$_PY" - "$DB_FILE" <<< "$PYTHON_PARSE" 2>/dev/null)
+    if [[ -z "$parsed" ]]; then
+        echo -e "\n  ${RED}Failed to parse DB (is python3 available?).${NC}\n"
+        return 1
+    fi
+
+    local updated="" is_stale=0
+    local -a rows=()
+
+    while IFS=$'\t' read -r rectype rest; do
+        case "$rectype" in
+            UPDATED) updated="$rest" ;;
+            STALE)   is_stale=1 ;;
+            JOB)     rows+=("$rest") ;;
+            ERROR)
+                echo ""
+                printf "  ${RED}Parse error: %s${NC}\n\n" "$rest"
+                return 1
+                ;;
+        esac
+    done <<< "$parsed"
+
+    echo ""
+    if (( is_stale )); then
+        printf "  ${BOLD}[last polled: ${RED}%s  <-- stale data (>10 min ago)${NC}${BOLD}]${NC}\n" "$updated"
+    else
+        printf "  ${BOLD}[last polled: %s]${NC}\n" "$updated"
+    fi
+    echo ""
+
+    local SEP
+    SEP=$(printf '%0.s─' {1..83})
+
+    printf "  "
+    print_col "$BOLD" "JOBID"   10
+    print_col "$BOLD" "NODE"    8
+    print_col "$BOLD" "PART"    9
+    print_col "$BOLD" "ELAPSED" 10
+    print_col "$BOLD" "STATUS"  6
+    print_col "$BOLD" "GPU%"    5
+    print_col "$BOLD" "MEM"     9
+    print_col "$BOLD" "TASK"    0 ""
+    printf "${NC}\n"
+    printf "  %s\n" "$SEP"
+
+    local n_busy=0 n_idle=0
+
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str task_cmd job_stale <<< "$row"
+
+        local status_upper status_color
+        if [[ "$status" == "busy" ]]; then
+            status_upper="BUSY";    status_color="${GREEN}${BOLD}"
+            n_busy=$(( n_busy + 1 ))
+        elif [[ "$status" == "unknown" ]]; then
+            status_upper="?????";   status_color="${DIM}"
+            n_idle=$(( n_idle + 1 ))
+        else
+            status_upper="IDLE";    status_color="${YELLOW}${DIM}"
+            n_idle=$(( n_idle + 1 ))
+        fi
+
+        local gpu_int gpu_disp gpu_color
+        gpu_int=$(printf '%.0f' "${gpu_util:-0}" 2>/dev/null || echo 0)
+        gpu_disp="${gpu_util}%"
+        if (( gpu_int > 50 )); then
+            gpu_color="$GREEN"
+        elif (( gpu_int > 0 )); then
+            gpu_color="$YELLOW"
+        else
+            gpu_color="$DIM"
+        fi
+
+        local node_text="$node"
+        (( job_stale )) && node_text="${node}!"
+
+        local task_text task_color
+        if [[ "$status" == "busy" && -n "$task_cmd" ]]; then
+            task_text="$task_cmd"; task_color=""
+        else
+            task_text="—"; task_color="$DIM"
+        fi
+
+        printf "  "
+        print_col ""             "$jobid"       10
+        if (( job_stale )); then
+            printf "%s${RED}!${NC}%*s  " "$node" "$(( 8 - ${#node} - 1 ))" ""
+        else
+            print_col "" "$node" 8
+        fi
+        print_col ""             "$part"        9
+        print_col ""             "$elapsed"     10
+        print_col "$status_color" "$status_upper" 6
+        print_col "$gpu_color"   "$gpu_disp"    5
+        print_col ""             "$mem_str"     9
+        print_col "$task_color"  "$task_text"   0 ""
+        echo ""
+    done
+
+    printf "  %s\n" "$SEP"
+    printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}${BOLD}   total: %d${NC}\n" \
+        "$n_busy" "$n_idle" "$(( n_busy + n_idle ))"
+}
+
+# ── subcommand: status ────────────────────────────────────────────────────────
+cmd_status() {
+    echo ""
+    if daemon_running; then
+        local pid; pid=$(daemon_pid)
+        local start_time uptime_str=""
+        start_time=$(ps -o lstart= -p "$pid" 2>/dev/null | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+        local elapsed_secs
+        elapsed_secs=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || echo "")
+        if [[ -n "$elapsed_secs" && "$elapsed_secs" =~ ^[0-9]+$ ]]; then
+            local d=$(( elapsed_secs / 86400 ))
+            local h=$(( (elapsed_secs % 86400) / 3600 ))
+            local m=$(( (elapsed_secs % 3600) / 60 ))
+            if (( d > 0 )); then
+                uptime_str="${d}d ${h}h ${m}m"
+            elif (( h > 0 )); then
+                uptime_str="${h}h ${m}m"
+            else
+                uptime_str="${m}m"
+            fi
+        fi
+
+        local last_poll=""
+        if [[ -f "$LOG_FILE" ]]; then
+            last_poll=$(grep "DB written" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oP '^\[\K[^\]]+' || true)
+        fi
+
+        printf "  ${BOLD}daemon:${NC}     ${GREEN}RUNNING${NC}\n"
+        printf "  ${BOLD}PID:${NC}        %s\n" "$pid"
+        [[ -n "$start_time" ]] && printf "  ${BOLD}started:${NC}    %s\n" "$start_time"
+        [[ -n "$uptime_str" ]] && printf "  ${BOLD}uptime:${NC}     %s\n" "$uptime_str"
+        [[ -n "$last_poll" ]] && printf "  ${BOLD}last poll:${NC}  %s\n" "$last_poll"
+        printf "  ${BOLD}log:${NC}        %s\n" "$LOG_FILE"
+        printf "  ${BOLD}db:${NC}         %s\n" "$DB_FILE"
+    else
+        printf "  ${BOLD}daemon:${NC}     ${RED}STOPPED${NC}\n"
+        printf "  Run  ${BOLD}hive daemon start${NC}  to start the daemon.\n"
+    fi
+    echo ""
+}
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+usage() {
+    cat << EOF
+Usage: hive nodes [command | option]
+
+Commands:
+  (no args)    Show node table (auto-starts daemon if not running)
+  start        Start daemon
+  stop         Stop daemon
+  restart      Restart daemon
+  status       Show daemon PID / uptime / last poll time
+  logs         Tail last 40 lines of daemon log
+  poll         Run one immediate poll now
+
+Options:
+  -w, --watch  Clear screen, show table every 60s
+  -h, --help   Show this help
+EOF
+}
+
+# ── entry point ───────────────────────────────────────────────────────────────
+WATCH_MODE=0
+
+case "${1:-}" in
+    start)
+        daemon_start
+        exit 0
+        ;;
+    stop)
+        daemon_stop
+        exit 0
+        ;;
+    restart)
+        daemon_stop
+        sleep 1
+        daemon_start
+        exit 0
+        ;;
+    status)
+        cmd_status
+        exit 0
+        ;;
+    logs)
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -n 40 "$LOG_FILE"
+        else
+            echo -e "  ${DIM}No log file found: $LOG_FILE${NC}"
+        fi
+        exit 0
+        ;;
+    poll)
+        echo -e "${DIM}Running one-shot poll...${NC}"
+        "$POLL_BIN"
+        echo ""
+        show_table
+        show_daemon_footer
+        exit 0
+        ;;
+    -w|--watch)
+        WATCH_MODE=1
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    "")
+        # default: handled below
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
+
+# ── default / watch mode ──────────────────────────────────────────────────────
+show_once() {
+    # Auto-start daemon if not running
+    if ! daemon_running; then
+        daemon_start
+        # Brief pause to let daemon write its PID
+        sleep 1
+    fi
+    show_table
+    show_daemon_footer
+}
+
+if (( WATCH_MODE )); then
+    while true; do
+        clear
+        printf "${BOLD}${CYAN}hive nodes${NC} ${DIM}— node monitor  (Ctrl+C to quit, refresh every 60s)${NC}\n"
+        show_once
+        sleep 60
+    done
+else
+    show_once
+fi

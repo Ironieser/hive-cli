@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# hive — unified SLURM GPU pool manager
+# Usage: hive <subcommand> [args]
+#
+#   hive jobs    [flags]                  SLURM queue dashboard
+#   hive nodes   [start|stop|restart|status|logs|poll|-w]
+#   hive top                              interactive TUI monitor
+#   hive daemon  start|stop|restart|status|logs
+#   hive poll                             one-shot node poll
+#   hive help                             show this help
+
+set -euo pipefail
+
+# ── Resolve real location of this script (works through symlinks) ─────────────
+HIVE_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HIVE_ROOT="$(dirname "$HIVE_SELF")"
+HIVE_LIBEXEC="${HIVE_ROOT}/libexec"
+
+# ── Shared paths (exportable so libexec scripts inherit them) ─────────────────
+export HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
+export DB_FILE="${DB_FILE:-${HIVE_DIR}/node_monitor.json}"
+export PID_FILE="${PID_FILE:-${HIVE_DIR}/node_monitor.pid}"
+export LOG_FILE="${LOG_FILE:-${HIVE_DIR}/node_monitor.log}"
+export DAEMON_BIN="${DAEMON_BIN:-${HIVE_LIBEXEC}/hive-daemon}"
+export POLL_BIN="${POLL_BIN:-${HIVE_LIBEXEC}/hive-poll}"
+
+mkdir -p "$HIVE_DIR"
+
+# ── Python resolution for hive top ────────────────────────────────────────────
+_resolve_python() {
+    local py="${HIVE_PYTHON:-}"
+    if [[ -z "$py" && -x "${HOME}/.conda/envs/vlm/bin/python3" ]]; then
+        py="${HOME}/.conda/envs/vlm/bin/python3"
+    fi
+    if [[ -z "$py" ]]; then
+        py="$(command -v python3 2>/dev/null || true)"
+    fi
+    if [[ -z "$py" ]]; then
+        echo "hive: python3 not found. Set HIVE_PYTHON=/path/to/python3" >&2
+        exit 1
+    fi
+    echo "$py"
+}
+
+# ── Backward-compat: route by argv[0] ─────────────────────────────────────────
+_self_name="$(basename "$0")"
+case "$_self_name" in
+    myjob)           set -- jobs   "$@" ;;
+    mynode)          set -- nodes  "$@" ;;
+    jobtop|nodetop)  set -- top    "$@" ;;
+esac
+
+# ── Main dispatch ─────────────────────────────────────────────────────────────
+subcommand="${1:-help}"
+shift 2>/dev/null || true
+
+case "$subcommand" in
+    jobs)
+        exec "${HIVE_LIBEXEC}/hive-jobs" "$@"
+        ;;
+    nodes)
+        exec "${HIVE_LIBEXEC}/hive-nodes" "$@"
+        ;;
+    top)
+        py="$(_resolve_python)"
+        exec "$py" "${HIVE_LIBEXEC}/hive-top" "$@"
+        ;;
+    poll)
+        exec "${HIVE_LIBEXEC}/hive-poll" "$@"
+        ;;
+    daemon)
+        sub="${1:-status}"; shift 2>/dev/null || true
+        case "$sub" in
+            start|stop|restart|status|logs)
+                exec "${HIVE_LIBEXEC}/hive-nodes" "$sub" "$@"
+                ;;
+            *)
+                echo "hive daemon: unknown subcommand '$sub'" >&2
+                echo "Usage: hive daemon start|stop|restart|status|logs" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    help|--help|-h|"")
+        cat << 'EOF'
+
+  hive — personal GPU cluster manager
+
+  Usage: hive <subcommand> [options]
+
+  Subcommands:
+    jobs     [flags]          SLURM queue dashboard  (-a/-p/-w/-r)
+    nodes    [subcommand]     Node status table       (reads DB)
+    top                       Interactive TUI monitor (curses)
+    daemon   start|stop|restart|status|logs
+    poll                      Trigger immediate node poll
+
+  Examples:
+    hive jobs -a              Show all users' jobs
+    hive jobs -r              Show running jobs only
+    hive nodes                Show node status (auto-starts daemon)
+    hive nodes -w             Watch mode (refresh every 60s)
+    hive top                  Open interactive monitor
+    hive daemon start         Start background poller
+    hive daemon stop          Stop background poller
+    hive poll                 Poll now + update DB
+
+  Config dir:  ~/.hive/
+  DB file:     ~/.hive/node_monitor.json
+  Daemon log:  ~/.hive/node_monitor.log
+
+EOF
+        ;;
+    *)
+        echo "hive: unknown subcommand '$subcommand'" >&2
+        echo "Run 'hive help' for usage." >&2
+        exit 1
+        ;;
+esac

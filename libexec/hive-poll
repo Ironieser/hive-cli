@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# hive-poll — one-shot poller for hive-cli
+# DB: ~/.hive/node_monitor.json
+# Safe to run via cron every 5 minutes.
+
+USER="${USER:-$(whoami)}"
+HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
+DB_DIR="$HIVE_DIR"
+DB_FILE="${HIVE_DIR}/node_monitor.json"
+DB_TMP="${DB_FILE}.tmp"
+POLL_TMPDIR="/tmp/hive_poll_$$"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+fmt_elapsed_slurm() {
+    # Input: SLURM elapsed  [D-]HH:MM:SS or M:SS
+    local t="$1"
+    local days=0 hours=0 mins=0 secs=0
+    if [[ "$t" == *-* ]]; then
+        days="${t%%-*}"; t="${t#*-}"
+    fi
+    IFS=':' read -ra p <<< "$t"
+    if (( ${#p[@]} == 3 )); then
+        hours=$(( 10#${p[0]} )); mins=$(( 10#${p[1]} )); secs=$(( 10#${p[2]} ))
+    elif (( ${#p[@]} == 2 )); then
+        mins=$(( 10#${p[0]} )); secs=$(( 10#${p[1]} ))
+    fi
+    days=$(( 10#$days ))
+    if (( days > 0 )); then
+        printf "%dd%dh" "$days" "$hours"
+    elif (( hours > 0 )); then
+        printf "%dh%dm" "$hours" "$mins"
+    else
+        printf "%dm" "$mins"
+    fi
+}
+
+fmt_elapsed_ps() {
+    # Input: ps etime format  [[dd-]hh:]mm:ss
+    local t="$1"
+    local days=0 hours=0 mins=0 secs=0
+    if [[ "$t" == *-* ]]; then
+        days="${t%%-*}"; t="${t#*-}"
+    fi
+    IFS=':' read -ra p <<< "$t"
+    if (( ${#p[@]} == 3 )); then
+        hours=$(( 10#${p[0]} )); mins=$(( 10#${p[1]} )); secs=$(( 10#${p[2]} ))
+    elif (( ${#p[@]} == 2 )); then
+        mins=$(( 10#${p[0]} )); secs=$(( 10#${p[1]} ))
+    fi
+    days=$(( 10#$days ))
+    if (( days > 0 )); then
+        printf "%dd%dh" "$days" "$hours"
+    elif (( hours > 0 )); then
+        printf "%dh%dm" "$hours" "$mins"
+    else
+        printf "%dm" "$mins"
+    fi
+}
+
+json_escape() {
+    # Minimal JSON string escaping: backslash, double-quote, control chars
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# ── probe a single job (runs in background subshell) ─────────────────────────
+probe_job() {
+    local jobid="$1" node="$2" partition="$3" elapsed_raw="$4"
+    local outfile="${POLL_TMPDIR}/${jobid}.json"
+    local polled_at
+    polled_at=$(date -u '+%Y-%m-%dT%H:%M:%S')
+    local elapsed_fmt
+    elapsed_fmt=$(fmt_elapsed_slurm "$elapsed_raw")
+
+    # Probe command: nvidia-smi + ps, all in the job's cgroup via srun overlap
+    local probe_cmd
+    probe_cmd='nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; ps -u '"$USER"' -o pid,%cpu,%mem,etime,args --no-header 2>/dev/null'
+
+    local raw
+    raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
+        bash -c "$probe_cmd" 2>/dev/null)
+
+    # ── parse both sections in one pass ──────────────────────────────────────
+    local in_ps=0
+    local gpu_json="" ps_json=""
+    local first_gpu=1 first_ps=1
+    local has_process=0
+    # Skip noisy ps entries
+    local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi'
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---PS---" ]]; then
+            in_ps=1; continue
+        fi
+
+        if (( in_ps == 0 )); then
+            # ── nvidia-smi line ───────────────────────────────────────────────
+            [[ -z "$line" ]] && continue
+            IFS=',' read -r gidx gutil gmem_used gmem_total <<< "$line"
+            gidx="${gidx// /}"; gutil="${gutil// /}"
+            gmem_used="${gmem_used// /}"; gmem_total="${gmem_total// /}"
+            # Skip lines where index is not a plain number (e.g. "No devices were found")
+            [[ -z "$gidx" || ! "$gidx" =~ ^[0-9]+$ ]] && continue
+            [[ "$first_gpu" -eq 0 ]] && gpu_json+=","
+            gpu_json+="{\"index\":${gidx},\"util\":${gutil:-0},\"mem_used\":${gmem_used:-0},\"mem_total\":${gmem_total:-0}}"
+            first_gpu=0
+
+        else
+            # ── ps line ───────────────────────────────────────────────────────
+            [[ -z "$line" ]] && continue
+            # Filter noisy processes
+            echo "$line" | grep -qE "$skip_re" && continue
+
+            # Fields: pid %cpu %mem etime args...
+            local fields ppid pcpu pmem petime pcmd
+            read -ra fields <<< "$line"
+            ppid="${fields[0]}"; pcpu="${fields[1]}"; pmem="${fields[2]}"; petime="${fields[3]}"
+            pcmd="${fields[*]:4}"
+
+            [[ -z "$ppid" || -z "$pcmd" ]] && continue
+            [[ ! "$ppid" =~ ^[0-9]+$ ]] && continue
+
+            local elapsed_ps cmd_esc
+            elapsed_ps=$(fmt_elapsed_ps "$petime")
+            cmd_esc=$(json_escape "$pcmd")
+
+            [[ "$first_ps" -eq 0 ]] && ps_json+=","
+            ps_json+="{\"pid\":${ppid},\"cpu\":${pcpu:-0},\"mem\":${pmem:-0},\"elapsed\":\"${elapsed_ps}\",\"cmd\":\"${cmd_esc}\"}"
+            first_ps=0
+            has_process=1
+        fi
+    done <<< "$raw"
+
+    local status
+    if (( has_process )); then status="busy"; else status="idle"; fi
+
+    # Write per-job JSON fragment (assembled by main)
+    cat > "$outfile" <<EOF
+"${jobid}": {
+  "node": "$(json_escape "$node")",
+  "partition": "$(json_escape "$partition")",
+  "job_elapsed": "$(json_escape "$elapsed_fmt")",
+  "gpu": [${gpu_json}],
+  "processes": [${ps_json}],
+  "status": "${status}",
+  "polled_at": "${polled_at}"
+}
+EOF
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+main() {
+    log "hive-poll starting"
+
+    # Ensure cache dir
+    mkdir -p "$DB_DIR"
+    mkdir -p "$POLL_TMPDIR"
+
+    # Query running jobs (skip cursor_ssh_proxy)
+    local squeue_out
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M" 2>/dev/null \
+        | grep -v cursor_ssh_proxy)
+
+    if [[ -z "$squeue_out" ]]; then
+        log "No running jobs found."
+        local updated
+        updated=$(date -u '+%Y-%m-%dT%H:%M:%S')
+        printf '{\n  "updated": "%s",\n  "jobs": {}\n}\n' "$updated" > "$DB_TMP"
+        mv "$DB_TMP" "$DB_FILE"
+        rm -rf "$POLL_TMPDIR"
+        log "DB written (empty): $DB_FILE"
+        return
+    fi
+
+    # Launch parallel probes
+    local job_ids=()
+    declare -A JOB_NODE JOB_PART JOB_ELAPSED
+
+    while IFS='|' read -r jobid node partition elapsed; do
+        jobid="${jobid// /}"; node="${node// /}"
+        partition="${partition// /}"; elapsed="${elapsed// /}"
+        [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
+        job_ids+=("$jobid")
+        JOB_NODE["$jobid"]="$node"
+        JOB_PART["$jobid"]="$partition"
+        JOB_ELAPSED["$jobid"]="$elapsed"
+        log "Probing job $jobid on $node ($partition) elapsed=$elapsed ..."
+        probe_job "$jobid" "$node" "$partition" "$elapsed" &
+    done <<< "$squeue_out"
+
+    # Wait up to 30s for all probes
+    local waited=0
+    while true; do
+        local pending=0
+        for jid in "${job_ids[@]}"; do
+            [[ ! -f "${POLL_TMPDIR}/${jid}.json" ]] && pending=1 && break
+        done
+        (( pending == 0 )) && break
+        sleep 1
+        waited=$(( waited + 1 ))
+        (( waited >= 30 )) && log "WARNING: timeout waiting for probes after ${waited}s" && break
+    done
+    wait   # reap any remaining
+
+    log "All probes complete (waited ${waited}s). Building DB..."
+
+    # Assemble final JSON
+    local updated
+    updated=$(date -u '+%Y-%m-%dT%H:%M:%S')
+
+    {
+        printf '{\n  "updated": "%s",\n  "jobs": {\n' "$updated"
+        local first=1
+        for jid in "${job_ids[@]}"; do
+            local frag="${POLL_TMPDIR}/${jid}.json"
+            [[ ! -f "$frag" ]] && continue
+            (( first == 0 )) && printf ',\n'
+            # Each fragment line gets 4-space indent
+            while IFS= read -r fline; do
+                printf '    %s\n' "$fline"
+            done < "$frag"
+            first=0
+        done
+        printf '  }\n}\n'
+    } > "$DB_TMP"
+
+    mv "$DB_TMP" "$DB_FILE"
+    rm -rf "$POLL_TMPDIR"
+    log "DB written: $DB_FILE  (${#job_ids[@]} jobs)"
+}
+
+main "$@"
+
+# ── cron hint ─────────────────────────────────────────────────────────────────
+# To auto-poll every 5 minutes, add to crontab:
+# */5 * * * * /home/si384883/hive-cli/libexec/hive-poll >> /home/si384883/.hive/node_monitor.log 2>&1

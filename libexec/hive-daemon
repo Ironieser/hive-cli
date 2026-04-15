@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# hive-daemon — background poller daemon for hive-cli
+# Writes to ~/.hive/node_monitor.json every 120s.
+# PID file: ~/.hive/node_monitor.pid
+# Log file: ~/.hive/node_monitor.log  (rolling, last 500 lines)
+
+USER="${USER:-$(whoami)}"
+HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
+DB_DIR="$HIVE_DIR"
+DB_FILE="${HIVE_DIR}/node_monitor.json"
+DB_TMP="${DB_FILE}.tmp"
+PID_FILE="${DB_DIR}/node_monitor.pid"
+LOG_FILE="${DB_DIR}/node_monitor.log"
+POLL_INTERVAL=120
+
+# ── signal handling ───────────────────────────────────────────────────────────
+SIGUSR1_RECEIVED=0
+trap 'log "Received SIGTERM/SIGINT, exiting."; rm -f "$PID_FILE"; exit 0' TERM INT
+trap 'SIGUSR1_RECEIVED=1' USR1
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+    # Rolling: keep last 500 lines
+    local tmp="${LOG_FILE}.tmp"
+    tail -n 500 "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
+}
+
+fmt_elapsed_slurm() {
+    local t="$1"
+    local days=0 hours=0 mins=0 secs=0
+    if [[ "$t" == *-* ]]; then
+        days="${t%%-*}"; t="${t#*-}"
+    fi
+    IFS=':' read -ra p <<< "$t"
+    if (( ${#p[@]} == 3 )); then
+        hours=$(( 10#${p[0]} )); mins=$(( 10#${p[1]} )); secs=$(( 10#${p[2]} ))
+    elif (( ${#p[@]} == 2 )); then
+        mins=$(( 10#${p[0]} )); secs=$(( 10#${p[1]} ))
+    fi
+    days=$(( 10#$days ))
+    if (( days > 0 )); then
+        printf "%dd%dh" "$days" "$hours"
+    elif (( hours > 0 )); then
+        printf "%dh%dm" "$hours" "$mins"
+    else
+        printf "%dm" "$mins"
+    fi
+}
+
+fmt_elapsed_ps() {
+    local t="$1"
+    local days=0 hours=0 mins=0 secs=0
+    if [[ "$t" == *-* ]]; then
+        days="${t%%-*}"; t="${t#*-}"
+    fi
+    IFS=':' read -ra p <<< "$t"
+    if (( ${#p[@]} == 3 )); then
+        hours=$(( 10#${p[0]} )); mins=$(( 10#${p[1]} )); secs=$(( 10#${p[2]} ))
+    elif (( ${#p[@]} == 2 )); then
+        mins=$(( 10#${p[0]} )); secs=$(( 10#${p[1]} ))
+    fi
+    days=$(( 10#$days ))
+    if (( days > 0 )); then
+        printf "%dd%dh" "$days" "$hours"
+    elif (( hours > 0 )); then
+        printf "%dh%dm" "$hours" "$mins"
+    else
+        printf "%dm" "$mins"
+    fi
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# ── probe a single job ────────────────────────────────────────────────────────
+probe_job() {
+    local jobid="$1" node="$2" partition="$3" elapsed_raw="$4"
+    local outfile="${POLL_TMPDIR}/${jobid}.json"
+    local polled_at
+    polled_at=$(date -u '+%Y-%m-%dT%H:%M:%S')
+    local elapsed_fmt
+    elapsed_fmt=$(fmt_elapsed_slurm "$elapsed_raw")
+
+    local probe_cmd
+    probe_cmd='nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; ps -u '"$USER"' -o pid,%cpu,%mem,etime,args --no-header 2>/dev/null'
+
+    local raw
+    raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
+        bash -c "$probe_cmd" 2>/dev/null)
+
+    local in_ps=0
+    local gpu_json="" ps_json=""
+    local first_gpu=1 first_ps=1
+    local has_process=0
+    local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi'
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---PS---" ]]; then
+            in_ps=1; continue
+        fi
+
+        if (( in_ps == 0 )); then
+            [[ -z "$line" ]] && continue
+            IFS=',' read -r gidx gutil gmem_used gmem_total <<< "$line"
+            gidx="${gidx// /}"; gutil="${gutil// /}"
+            gmem_used="${gmem_used// /}"; gmem_total="${gmem_total// /}"
+            [[ -z "$gidx" || ! "$gidx" =~ ^[0-9]+$ ]] && continue
+            [[ "$first_gpu" -eq 0 ]] && gpu_json+=","
+            gpu_json+="{\"index\":${gidx},\"util\":${gutil:-0},\"mem_used\":${gmem_used:-0},\"mem_total\":${gmem_total:-0}}"
+            first_gpu=0
+        else
+            [[ -z "$line" ]] && continue
+            echo "$line" | grep -qE "$skip_re" && continue
+
+            local fields ppid pcpu pmem petime pcmd
+            read -ra fields <<< "$line"
+            ppid="${fields[0]}"; pcpu="${fields[1]}"; pmem="${fields[2]}"; petime="${fields[3]}"
+            pcmd="${fields[*]:4}"
+
+            [[ -z "$ppid" || -z "$pcmd" ]] && continue
+            [[ ! "$ppid" =~ ^[0-9]+$ ]] && continue
+
+            local elapsed_ps cmd_esc
+            elapsed_ps=$(fmt_elapsed_ps "$petime")
+            cmd_esc=$(json_escape "$pcmd")
+
+            [[ "$first_ps" -eq 0 ]] && ps_json+=","
+            ps_json+="{\"pid\":${ppid},\"cpu\":${pcpu:-0},\"mem\":${pmem:-0},\"elapsed\":\"${elapsed_ps}\",\"cmd\":\"${cmd_esc}\"}"
+            first_ps=0
+            has_process=1
+        fi
+    done <<< "$raw"
+
+    local status
+    if (( has_process )); then status="busy"; else status="idle"; fi
+
+    cat > "$outfile" <<EOF
+"${jobid}": {
+  "node": "$(json_escape "$node")",
+  "partition": "$(json_escape "$partition")",
+  "job_elapsed": "$(json_escape "$elapsed_fmt")",
+  "gpu": [${gpu_json}],
+  "processes": [${ps_json}],
+  "status": "${status}",
+  "polled_at": "${polled_at}"
+}
+EOF
+}
+
+# ── one poll cycle ────────────────────────────────────────────────────────────
+do_poll() {
+    POLL_TMPDIR="/tmp/hive_daemon_$$_$(date +%s)"
+    mkdir -p "$DB_DIR" "$POLL_TMPDIR"
+    log "Poll cycle starting"
+
+    local squeue_out
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%j" 2>/dev/null \
+        | grep -v cursor_ssh_proxy \
+        | sed 's/|[^|]*$//')   # strip job name column after filtering
+
+    if [[ -z "$squeue_out" ]]; then
+        log "No running jobs found."
+        local updated
+        updated=$(date -u '+%Y-%m-%dT%H:%M:%S')
+        printf '{\n  "updated": "%s",\n  "jobs": {}\n}\n' "$updated" > "$DB_TMP"
+        mv "$DB_TMP" "$DB_FILE"
+        rm -rf "$POLL_TMPDIR"
+        log "DB written (empty): $DB_FILE"
+        return
+    fi
+
+    local job_ids=()
+    declare -A JOB_NODE JOB_PART JOB_ELAPSED
+
+    # 先把 squeue 结果全部读入数组，避免 while read 的 stdin 被后台 srun 消耗
+    local -a squeue_lines=()
+    while IFS= read -r line; do
+        squeue_lines+=("$line")
+    done <<< "$squeue_out"
+
+    for line in "${squeue_lines[@]}"; do
+        IFS='|' read -r jobid node partition elapsed <<< "$line"
+        jobid="${jobid// /}"; node="${node// /}"
+        partition="${partition// /}"; elapsed="${elapsed// /}"
+        [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
+        job_ids+=("$jobid")
+        JOB_NODE["$jobid"]="$node"
+        JOB_PART["$jobid"]="$partition"
+        JOB_ELAPSED["$jobid"]="$elapsed"
+        log "Probing job $jobid on $node ($partition) elapsed=$elapsed ..."
+        probe_job "$jobid" "$node" "$partition" "$elapsed" </dev/null &
+    done
+
+    # Wait up to 35s for all probes
+    local waited=0
+    while true; do
+        local pending=0
+        for jid in "${job_ids[@]}"; do
+            [[ ! -f "${POLL_TMPDIR}/${jid}.json" ]] && pending=1 && break
+        done
+        (( pending == 0 )) && break
+        sleep 1
+        waited=$(( waited + 1 ))
+        (( waited >= 35 )) && log "WARNING: timeout waiting for probes after ${waited}s" && break
+    done
+    wait
+
+    log "All probes complete (waited ${waited}s). Building DB..."
+
+    local updated
+    updated=$(date -u '+%Y-%m-%dT%H:%M:%S')
+
+    {
+        printf '{\n  "updated": "%s",\n  "jobs": {\n' "$updated"
+        local first=1
+        for jid in "${job_ids[@]}"; do
+            local frag="${POLL_TMPDIR}/${jid}.json"
+            # probe 失败时写 fallback 记录（status=unknown）
+            if [[ ! -f "$frag" ]]; then
+                local polled_at; polled_at=$(date -u '+%Y-%m-%dT%H:%M:%S')
+                local elapsed_fmt; elapsed_fmt=$(fmt_elapsed_slurm "${JOB_ELAPSED[$jid]:-0:00}")
+                cat > "$frag" <<FBEOF
+"${jid}": {
+  "node": "$(json_escape "${JOB_NODE[$jid]}")",
+  "partition": "$(json_escape "${JOB_PART[$jid]}")",
+  "job_elapsed": "$(json_escape "$elapsed_fmt")",
+  "gpu": [],
+  "processes": [],
+  "status": "unknown",
+  "polled_at": "${polled_at}"
+}
+FBEOF
+            fi
+            (( first == 0 )) && printf ',\n'
+            while IFS= read -r fline; do
+                printf '    %s\n' "$fline"
+            done < "$frag"
+            first=0
+        done
+        printf '  }\n}\n'
+    } > "$DB_TMP"
+
+    mv "$DB_TMP" "$DB_FILE"
+    rm -rf "$POLL_TMPDIR"
+    log "DB written: $DB_FILE  (${#job_ids[@]} jobs)"
+}
+
+# ── main loop ─────────────────────────────────────────────────────────────────
+main() {
+    mkdir -p "$DB_DIR"
+
+    # Write PID file
+    echo $$ > "$PID_FILE"
+    log "hive-daemon started (PID $$, interval=${POLL_INTERVAL}s)"
+
+    # Immediate first poll
+    do_poll
+
+    while true; do
+        # Sleep in 1s increments to catch SIGUSR1 quickly
+        local slept=0
+        SIGUSR1_RECEIVED=0
+        while (( slept < POLL_INTERVAL )); do
+            sleep 1
+            slept=$(( slept + 1 ))
+            if (( SIGUSR1_RECEIVED )); then
+                log "SIGUSR1 received — triggering immediate poll"
+                break
+            fi
+        done
+        do_poll
+    done
+}
+
+main "$@"
