@@ -179,13 +179,14 @@ Backward-compat symlinks: `myjob` → `hive jobs`, `mynode` → `hive nodes`, `j
 ## `hive pool` — node pool management
 
 ```bash
-hive pool init              # create ~/.hive/pool_config.json (first-time setup)
-hive pool config            # show presets and verify script paths
-hive pool add               # sbatch one hold job (default preset)
-hive pool add highgpu       # use a named preset
-hive pool add --count 3     # submit 3 hold jobs at once
-hive pool release 584954    # scancel a specific hold job
-hive pool release --idle    # scancel all currently IDLE hold jobs
+hive pool init                          # create ~/.hive/pool_config.json (first-time setup)
+hive pool config                        # show presets and verify script paths
+hive pool add                           # sbatch one hold job (default preset)
+hive pool add highgpu                   # use a named preset
+hive pool add ~/hold.slurm              # pass a script path directly
+hive pool add --count 3 --time 12:00:00 # submit 3 hold jobs, override wall time
+hive pool release 584954                # scancel a specific hold job
+hive pool release --idle                # scancel all currently IDLE hold jobs
 ```
 
 ### First-time setup

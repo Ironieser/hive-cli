@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-15
+
+### Added
+- `hive pool add` now accepts a direct `.slurm` / `.sh` script path in addition to preset names
+  - e.g. `hive pool add ~/1_normal_gpu.slurm --time 12:00:00`
+  - Detection: path starting with `~`/`/`/`./`, ending in `.slurm`/`.sh`, or file exists → treated as script
+- `docs/agent_guide.md` — step-by-step guide for AI agents using hive-cli
+
+---
+
 ## [0.3.0] - 2026-04-15
 
 ### Added

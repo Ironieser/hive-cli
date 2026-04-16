@@ -40,7 +40,8 @@ Installs to `~/.local/share/hive-cli/`, symlinks `hive` into `~/bin/`.
 hive pool init              # first-time setup: create ~/.hive/pool_config.json
 hive pool add               # sbatch a new hold job (default preset)
 hive pool add highgpu       # use a named preset
-hive pool add --count 3     # add 3 nodes at once
+hive pool add ~/my.slurm    # pass a script path directly
+hive pool add --count 3 --time 12:00:00   # 3 nodes, override wall time
 hive pool release 584954    # scancel a specific hold job
 hive pool release --idle    # scancel all idle hold jobs
 hive pool config            # verify preset scripts exist
@@ -69,6 +70,7 @@ hive queue submit "python train.py --config exp/v1.yaml"   # submit command
 hive queue submit job.hive                                   # submit .hive script
 hive queue list                                              # show queue
 hive queue logs 3 -f                                         # follow task log
+hive queue wait 3                                            # block until done, then print log + exit $?
 hive queue cancel 3                                          # cancel task
 hive queue daemon start|stop|status|logs
 ```
@@ -115,6 +117,10 @@ hive-cli is for **active, short-term debug sessions** — not permanent resource
 - Hold jobs are visible in `squeue` to everyone
 
 > Clusters work best when shared resources are borrowed, not owned.
+
+## For AI Agents
+
+See **[docs/agent_guide.md](docs/agent_guide.md)** for a step-by-step guide on how to install, configure, and use hive-cli inside an AI agent session.
 
 ## Requirements
 
