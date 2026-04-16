@@ -122,6 +122,8 @@ hive-cli is for **active, short-term debug sessions** — not permanent resource
 
 See **[docs/agent_guide.md](docs/agent_guide.md)** for a step-by-step guide on how to install, configure, and use hive-cli inside an AI agent session.
 
+A **Claude Code skill** is included and installed automatically. Once installed, invoke `/hive status`, `/hive submit "cmd"`, `/hive wait <id>` etc. directly in Claude Code.
+
 ## Requirements
 
 - SLURM with `srun --overlap` support

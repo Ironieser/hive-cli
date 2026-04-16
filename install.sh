@@ -106,7 +106,20 @@ if [[ -f "${HIVE_DIR}/node_monitor.pid" ]]; then
     fi
 fi
 
-# ── 7. PATH reminder ─────────────────────────────────────────────────────────
+# ── 7. Install Claude Code skill (optional) ──────────────────────────────────
+title "6. Claude Code skill"
+CLAUDE_CMD_DIR="${HOME}/.claude/commands"
+SKILL_SRC="${INSTALL_DIR}/.claude/commands/hive.md"
+SKILL_DST="${CLAUDE_CMD_DIR}/hive.md"
+if [[ -f "$SKILL_SRC" ]]; then
+    mkdir -p "$CLAUDE_CMD_DIR"
+    cp "$SKILL_SRC" "$SKILL_DST"
+    info "Installed skill: ${SKILL_DST}  (invoke as /hive in Claude Code)"
+else
+    warn "Skill file not found in install dir — skipping"
+fi
+
+# ── 8. PATH reminder ─────────────────────────────────────────────────────────
 echo ""
 if echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     info "${BIN_DIR} is already in PATH"

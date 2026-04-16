@@ -136,6 +136,8 @@ hive jobs -p gpu    # 按分区过滤
 
 请参阅 **[docs/agent_guide.md](docs/agent_guide.md)**，了解如何在 AI agent session 中安装、配置和使用 hive-cli。
 
+安装时会自动安装 **Claude Code skill**。安装完成后，在 Claude Code 中直接使用：`/hive status`、`/hive submit "cmd"`、`/hive wait <id>` 等命令。
+
 ## 系统要求
 
 - SLURM（支持 `srun --overlap`）

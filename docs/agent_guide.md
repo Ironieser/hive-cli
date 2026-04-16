@@ -13,6 +13,33 @@ This guide is written for **AI coding agents** (Claude Code, Cursor, etc.) runni
 
 ---
 
+## Claude Code Skill
+
+hive-cli ships a Claude Code skill at `.claude/commands/hive.md`. It is installed automatically by `install.sh` to `~/.claude/commands/hive.md`.
+
+Once installed, invoke it in any Claude Code session with:
+
+```
+/hive status          # check node pool + queue
+/hive submit "cmd"    # submit an experiment
+/hive wait <id>       # block until task done, show log
+/hive logs <id>       # read task log
+/hive cancel <id>     # cancel a task
+/hive add             # add a node to the pool
+/hive release --idle  # return idle nodes to cluster
+```
+
+The skill contains actionable instructions for Claude: exact commands to run, critical rules (don't scancel hold jobs), chaining patterns, and troubleshooting quick-reference.
+
+To install the skill manually without running `install.sh`:
+
+```bash
+mkdir -p ~/.claude/commands
+cp ~/.local/share/hive-cli/.claude/commands/hive.md ~/.claude/commands/hive.md
+```
+
+---
+
 ## Installation
 
 ### One-line install
