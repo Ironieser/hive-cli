@@ -41,18 +41,13 @@ daemon_running() {
 }
 
 daemon_start() {
-    # 先清理多余的 daemon 实例（防止重复）
-    local running_pids
-    running_pids=$(pgrep -f "hive-daemon" 2>/dev/null | tr '\n' ' ')
-    local count; count=$(echo "$running_pids" | wc -w)
-    if (( count > 1 )); then
-        echo -e "  ${YELLOW}检测到 ${count} 个 daemon 实例，清理中...${NC}"
-        pgrep -f "hive-daemon" | xargs -r kill -9 2>/dev/null
-        rm -f "$PID_FILE"
-    elif daemon_running; then
-        local pid; pid=$(daemon_pid)
-        echo -e "  ${DIM}Daemon already running (PID $pid).${NC}"
-        return 0
+    # Use PID file as the single source of truth.
+    # pgrep is NOT used here — probe_job subshells also show as "hive-daemon"
+    # in pgrep output, making instance-count unreliable.
+    local pid
+    pid=$(daemon_pid 2>/dev/null)
+    if [[ -n "$pid" ]]; then
+        return 0  # already running, nothing to do
     fi
     mkdir -p "$(dirname "$PID_FILE")"
     nohup "$DAEMON_BIN" >> "$LOG_FILE" 2>&1 &
