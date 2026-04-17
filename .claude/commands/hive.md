@@ -164,15 +164,60 @@ Both daemons auto-start when needed — you only need to manage them manually wh
 
 ## Critical Rules
 
+### Pool / node management
+
 1. **NEVER `scancel` hold jobs directly** — always use `hive pool release`. Directly scancelling leaves orphaned tasks in the queue.
 
 2. **NEVER run `hive pool release --idle` if there are PENDING tasks** — the scheduler will try to dispatch them to nodes that no longer exist → immediate FAILED.
 
 3. **Only release nodes you intend to give back** — `hive list` shows `IDLE`, you have no pending tasks, session is over → `hive pool release --idle` is safe.
 
-4. **Queue is flock-protected** — multiple agents submitting concurrently is safe. No need to coordinate submissions between sessions.
+### Writing the cmd correctly
 
-5. **Workdir must exist on the compute node** — `~` and lustre/NFS paths are fine. Local `/tmp/` paths on the submit node won't exist on the compute node.
+4. **NEVER put `srun` in the cmd.** hive handles dispatch via `srun --overlap` internally. Adding `srun --jobid=...` inside the cmd creates a nested srun that is fragile and redundant.
+
+   ```bash
+   # ✗ WRONG — srun prefix is redundant, hive already dispatches to the node
+   hive submit "srun --jobid=584951 python train.py ..."
+
+   # ✓ CORRECT — just the command; hive puts it on the right node
+   hive submit "python train.py ..."
+   ```
+
+5. **NEVER use a HuggingFace model name string as `--model` when the model needs to load from NFS.** Loading large models from NFS (Lustre) is slow and can cause shard-level deadlocks on some nodes. Always rsync the model to node-local `/tmp/` first.
+
+   ```bash
+   # ✗ WRONG — loads from NFS every time, slow and deadlock-prone on highgpu nodes
+   hive submit "python eval.py --model Qwen/Qwen3-VL-4B-Instruct ..."
+
+   # ✓ CORRECT — rsync to /tmp/ if not already there, then load locally
+   hive submit "
+   MODEL=/tmp/Qwen3-VL-4B-Instruct
+   [ ! -d \$MODEL ] && rsync -aL \
+     \$(ls -d ~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/*/ | tail -1) \
+     \$MODEL/
+   python eval.py --model \$MODEL ...
+   "
+   ```
+
+   Or write it as a `.hive` file (recommended for multi-line commands):
+
+   ```bash
+   #!/bin/bash
+   #HIVE workdir=/lustre/fs1/home/user/project
+   #HIVE name=eval-v1
+
+   MODEL=/tmp/Qwen3-VL-4B-Instruct
+   [ ! -d $MODEL ] && rsync -aL \
+     $(ls -d ~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/*/ | tail -1) \
+     $MODEL/
+
+   python eval.py --model $MODEL ...
+   ```
+
+6. **Queue is flock-protected** — multiple agents submitting concurrently is safe.
+
+7. **Workdir must exist on the compute node** — `~` and lustre/NFS paths are fine. Local `/tmp/` paths on the *submit* node won't exist on the compute node (but `/tmp/` paths created *inside the cmd* are fine — they run on the compute node).
 
 ---
 
