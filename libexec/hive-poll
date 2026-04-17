@@ -80,13 +80,19 @@ probe_job() {
     elapsed_fmt=$(fmt_elapsed_slurm "$elapsed_raw")
 
     # Probe command: nvidia-smi via srun --overlap.
-    # Correctness relies on SLURM cgroup device isolation, NOT on CUDA_VISIBLE_DEVICES.
-    # Each job's cgroup device allowlist (set at job allocation time) restricts nvidia-smi
-    # to only that job's GPU(s) at the kernel level. This isolation is stable regardless
-    # of CUDA_VISIBLE_DEVICES, which can be corrupted under concurrent srun --overlap steps.
-    # We use --id=0: inside any single-GPU job's cgroup, the visible GPU is always index 0.
+    #
+    # GPU stats (utilization/memory) use --id=0, which relies on SLURM cgroup device
+    # isolation (set at job allocation time) to scope to this job's GPU.
+    #
+    # Process filtering uses /proc/<pid>/cgroup to check job ownership.
+    # CUDA_VISIBLE_DEVICES is unreliable under concurrent srun --overlap steps (multiple
+    # parallel probes on the same node corrupt each other's GPU index mappings), so
+    # --query-compute-apps can return PIDs from other jobs' GPUs. The fix: after getting
+    # PIDs from compute-apps, verify each PID's /proc/<pid>/cgroup contains
+    # /job_<SLURM_JOB_ID>/ — this is set by the kernel at job allocation and is immune
+    # to concurrent step launches.
     local probe_cmd
-    probe_cmd='nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
+    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
     local raw
     raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
