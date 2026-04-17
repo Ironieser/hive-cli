@@ -93,7 +93,7 @@ probe_job() {
     local first_gpu=1 first_ps=1
     local has_process=0
     # Skip noisy ps entries
-    local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi'
+    local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi|tmux|zsh|fish|-bash|-zsh|-fish'
 
     while IFS= read -r line; do
         if [[ "$line" == "---PS---" ]]; then
