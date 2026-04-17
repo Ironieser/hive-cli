@@ -292,9 +292,14 @@ for jid, job in new_db["jobs"].items():
     old_status = old_job.get("status")
 
     if new_status == "idle":
-        # Only start warning timer if job was previously BUSY (state transition).
-        # A job that was always idle (e.g. hold job with no work dispatched) stays idle.
-        if old_status in ("busy", "warning"):
+        # Only warn if the job previously had REAL GPU memory (≥500MB loaded).
+        # If GPU mem was always 0 (hold job / no work dispatched), stay idle immediately.
+        # This prevents grace-period thrash for hold jobs whose GPU util briefly
+        # flickers above 5% from nvidia-smi noise without ever loading a model.
+        old_max_mem = max((g.get("mem_used", 0) for g in old_job.get("gpu", [])), default=0)
+        had_real_work = old_max_mem >= 500
+
+        if old_status in ("busy", "warning") and had_real_work:
             old_since = old_job.get("gpu_idle_since")
             if old_since is None:
                 # First poll after going idle — start timer, keep showing busy (grace)
@@ -308,7 +313,7 @@ for jid, job in new_db["jobs"].items():
                 job["status"] = "busy"
             changed = True
         else:
-            # Was already idle / cpu / unknown — just stay idle, clear any stale timer
+            # No real GPU work (mem was <500MB) or was already idle — stay idle
             if job.get("gpu_idle_since") is not None:
                 job["gpu_idle_since"] = None
                 changed = True
