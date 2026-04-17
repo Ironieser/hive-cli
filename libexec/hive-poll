@@ -142,21 +142,22 @@ probe_job() {
         fi
     done <<< "$raw"
 
-    # status (raw — Python post-processing in main() resolves proc_gpu_idle):
-    #   cpu           — job has no GPU allocated (mem_total=0 for all GPUs)
-    #   idle          — GPU job, no significant processes
-    #   busy          — GPU actively used (util≥5% or mem≥500MB)
-    #   proc_gpu_idle — GPU job, processes running but GPU appears idle;
-    #                   Python will convert to "warning" after 3min, else keep "busy"
+    # status (raw — Python post-processing in main() resolves warning transitions):
+    #   cpu     — job has no GPU allocated (mem_total=0 for all GPUs)
+    #   idle    — GPU allocated but not active (util<5% AND mem<500MB)
+    #   busy    — GPU actively used (util≥5% or mem≥500MB)
+    #
+    # NOTE: ps output is node-wide (not cgroup-scoped), so has_process is
+    # unreliable on multi-GPU nodes with multiple hold jobs — DO NOT use it
+    # for status. GPU data from nvidia-smi is reliable (CUDA_VISIBLE_DEVICES
+    # is properly scoped per job by SLURM). processes[] is kept for display only.
     local status
     if (( max_gpu_total == 0 )); then
         status="cpu"
-    elif (( has_process == 0 )); then
-        status="idle"
     elif (( max_gpu_util >= 5 || max_gpu_mem >= 500 )); then
         status="busy"
     else
-        status="proc_gpu_idle"
+        status="idle"
     fi
 
     # Write per-job JSON fragment (assembled by main)
@@ -257,15 +258,16 @@ main() {
 
     mv "$DB_TMP" "$DB_FILE"
 
-    # ── Apply gpu_idle_since timer (warning after 3min of proc_gpu_idle) ────────
-    # Needs the old DB for timestamps; DB_FILE is the new raw DB at this point.
-    # We pass the old DB content via a temp var captured before the mv.
+    # ── Apply gpu_idle_since timer (warning after 3min of busy→idle transition) ──
+    # Trigger: job was BUSY in previous poll, now shows IDLE (GPU dropped to 0).
+    # This catches the "model loaded, then GPU went silent" failure pattern.
+    # Relies on transition, NOT on ps processes (which are node-wide and unreliable).
     python3 - "$DB_FILE" "$OLD_DB_CONTENT_FILE" << 'PYEOF'
 import json, time, sys, os
 
 db_file   = sys.argv[1]
 old_file  = sys.argv[2]  # path to temp file holding old DB content
-WARN_SECS = 180          # 3 minutes
+WARN_SECS = 180          # 3 minutes grace before warning
 
 try:
     new_db = json.load(open(db_file))
@@ -281,24 +283,33 @@ now = time.time()
 changed = False
 
 for jid, job in new_db["jobs"].items():
-    raw = job.get("status")
-    if raw == "proc_gpu_idle":
-        old_since = old_db["jobs"].get(jid, {}).get("gpu_idle_since")
-        if old_since is None:
-            # First time seeing GPU idle — start the clock, show as busy (grace)
-            job["gpu_idle_since"] = now
-            job["status"] = "busy"
-        elif now - old_since >= WARN_SECS:
-            # Been idle long enough — warn
-            job["gpu_idle_since"] = old_since
-            job["status"] = "warning"
+    new_status = job.get("status")
+    old_job    = old_db["jobs"].get(jid, {})
+    old_status = old_job.get("status")
+
+    if new_status == "idle":
+        # Only start warning timer if job was previously BUSY (state transition).
+        # A job that was always idle (e.g. hold job with no work dispatched) stays idle.
+        if old_status in ("busy", "warning"):
+            old_since = old_job.get("gpu_idle_since")
+            if old_since is None:
+                # First poll after going idle — start timer, keep showing busy (grace)
+                job["gpu_idle_since"] = now
+                job["status"] = "busy"
+            elif now - old_since >= WARN_SECS:
+                job["gpu_idle_since"] = old_since
+                job["status"] = "warning"
+            else:
+                job["gpu_idle_since"] = old_since
+                job["status"] = "busy"
+            changed = True
         else:
-            # Still within grace period
-            job["gpu_idle_since"] = old_since
-            job["status"] = "busy"
-        changed = True
+            # Was already idle / cpu / unknown — just stay idle, clear any stale timer
+            if job.get("gpu_idle_since") is not None:
+                job["gpu_idle_since"] = None
+                changed = True
     else:
-        # Any non-idle state clears the timer
+        # busy or cpu → clear the timer
         if job.get("gpu_idle_since") is not None:
             job["gpu_idle_since"] = None
             changed = True
