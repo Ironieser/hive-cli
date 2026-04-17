@@ -92,6 +92,7 @@ probe_job() {
     local gpu_json="" ps_json=""
     local first_gpu=1 first_ps=1
     local has_process=0
+    local max_gpu_mem=0 max_gpu_util=0
     # Skip noisy ps entries
     local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi|tmux|zsh|fish|-bash|-zsh|-fish'
 
@@ -111,6 +112,8 @@ probe_job() {
             [[ "$first_gpu" -eq 0 ]] && gpu_json+=","
             gpu_json+="{\"index\":${gidx},\"util\":${gutil:-0},\"mem_used\":${gmem_used:-0},\"mem_total\":${gmem_total:-0}}"
             first_gpu=0
+            (( ${gmem_used:-0} > max_gpu_mem )) && max_gpu_mem=${gmem_used:-0}
+            (( ${gutil:-0}    > max_gpu_util )) && max_gpu_util=${gutil:-0}
 
         else
             # ── ps line ───────────────────────────────────────────────────────
@@ -138,8 +141,19 @@ probe_job() {
         fi
     done <<< "$raw"
 
+    # status:
+    #   idle  — no significant processes
+    #   cpu   — processes running but GPU is free (util<5% and mem<500MB)
+    #           node is in use but GPU slot is unoccupied; scheduler won't dispatch here
+    #   busy  — GPU actively used (util≥5% or mem≥500MB)
     local status
-    if (( has_process )); then status="busy"; else status="idle"; fi
+    if (( has_process == 0 )); then
+        status="idle"
+    elif (( max_gpu_util >= 5 || max_gpu_mem >= 500 )); then
+        status="busy"
+    else
+        status="cpu"
+    fi
 
     # Write per-job JSON fragment (assembled by main)
     cat > "$outfile" <<EOF

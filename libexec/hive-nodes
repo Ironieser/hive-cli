@@ -265,7 +265,7 @@ show_table() {
     printf "${NC}\n"
     printf "  %s\n" "$SEP"
 
-    local n_busy=0 n_idle=0
+    local n_busy=0 n_cpu=0 n_idle=0
 
     for row in "${rows[@]}"; do
         IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str task_cmd job_stale <<< "$row"
@@ -274,6 +274,9 @@ show_table() {
         if [[ "$status" == "busy" ]]; then
             status_upper="BUSY";    status_color="${GREEN}${BOLD}"
             n_busy=$(( n_busy + 1 ))
+        elif [[ "$status" == "cpu" ]]; then
+            status_upper="CPU  ";   status_color="${CYAN}${BOLD}"
+            n_cpu=$(( n_cpu + 1 ))
         elif [[ "$status" == "unknown" ]]; then
             status_upper="?????";   status_color="${DIM}"
             n_idle=$(( n_idle + 1 ))
@@ -320,8 +323,8 @@ show_table() {
     done
 
     printf "  %s\n" "$SEP"
-    printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}${BOLD}   total: %d${NC}\n" \
-        "$n_busy" "$n_idle" "$(( n_busy + n_idle ))"
+    printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   cpu: ${CYAN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}${BOLD}   total: %d${NC}\n" \
+        "$n_busy" "$n_cpu" "$n_idle" "$(( n_busy + n_cpu + n_idle ))"
 }
 
 # ── subcommand: status ────────────────────────────────────────────────────────
