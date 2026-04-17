@@ -287,6 +287,16 @@ def cmd_submit(args):
     else:
         spec = {"cmd": target}
 
+    # Reject cmds that contain srun — hive handles dispatch internally;
+    # nested srun causes fragile double-dispatch into the same job cgroup.
+    cmd_first_line = spec["cmd"].strip().split('\n')[0].strip()
+    if re.match(r'\bsrun\b', cmd_first_line) or re.search(r';\s*srun\b', spec["cmd"]):
+        print(f"{C_RED}Error:{C_RESET} cmd must not contain 'srun'.", file=sys.stderr)
+        print("hive dispatches to the node via srun internally.", file=sys.stderr)
+        print("Remove the srun prefix and submit just the command:", file=sys.stderr)
+        print(f"  hive submit \"python train.py ...\"", file=sys.stderr)
+        sys.exit(1)
+
     # CLI flags override .hive directives
     if args.workdir:
         spec["workdir"] = os.path.abspath(args.workdir)
