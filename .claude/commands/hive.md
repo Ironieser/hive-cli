@@ -1,217 +1,228 @@
 # hive — GPU Node Pool & Experiment Queue
 
-Manage pre-allocated GPU nodes and submit experiments via the hive task queue. Usage: `/hive <action> [args]`
-
-## Actions
-
-- `/hive status` — show node pool status + queue state
-- `/hive submit <"cmd" | script.hive>` — submit an experiment to the task queue
-- `/hive wait <id>` — block until task finishes, show log, return exit code
-- `/hive logs <id>` — show task log (add `-f` to follow)
-- `/hive cancel <id>` — cancel a pending or running task
-- `/hive add [preset] [--count N] [--time T]` — add a node to the pool
-- `/hive release --idle` — release idle hold nodes back to the cluster
+Manage pre-allocated GPU nodes on a SLURM cluster. Submit experiments to the task queue; the scheduler auto-assigns them to idle nodes.
 
 ---
 
-## Instructions
-
-When this command is invoked, perform the following based on the action:
-
-### status
-
-Run both:
-```bash
-hive nodes          # node pool: BUSY/IDLE status, GPU%, running task
-hive queue list     # task queue: pending/running/done/failed tasks
-```
-
-Show the combined picture: how many nodes are available, what's running, what's queued.
-
-If `hive-sched` is not running, note it and offer to start:
-```bash
-hive queue daemon status
-hive queue daemon start   # if not running
-```
-
-### submit
-
-1. Determine the command and workdir:
-   - If given an inline string: `hive queue submit --workdir <project_dir> "<cmd>"`
-   - If given a `.hive` file: `hive queue submit <file.hive>` (workdir/priority/name from `#HIVE` directives)
-   - Default workdir = current project directory
-
-2. Ensure the scheduler is running before submitting:
-   ```bash
-   hive queue daemon status   # check
-   # → auto-started by submit if not running
-   ```
-
-3. Submit and capture the task ID:
-   ```bash
-   hive queue submit --workdir /path/to/project "python train.py --config ..."
-   # → Submitted task #N
-   ```
-
-4. After submit, show `hive queue list` so the user can see the task entered the queue.
-
-5. **Do not `hive queue wait` automatically** unless the user explicitly asks to block. For background experiments, just confirm submission and move on.
-
-### wait
-
-Block until the task reaches a terminal state (done/failed/cancelled):
+## Quick Command Reference
 
 ```bash
-hive queue wait <id>
-# → prints state transitions as they happen
-# → prints full log when done
-# → exits with the task's exit code
+# Check status
+hive nodes                                    # node pool: BUSY/IDLE, GPU%, running process
+hive list                                     # task queue: pending/running/done/failed
+
+# Submit an experiment
+hive submit "python train.py --config v1.yaml"                   # inline command
+hive submit --workdir /path/to/project "python train.py ..."     # explicit workdir
+hive submit --priority 10 --name train-v1 "python train.py ..."  # with priority + name
+hive submit experiment.hive                                       # from .hive script file
+
+# Wait for a task (agent pattern — blocks until done)
+hive wait <ID>            # block, print log when done, exit with task's exit code
+
+# Inspect
+hive logs <ID>            # print full log
+hive logs <ID> -f         # tail -f (live stream)
+hive list --state running # filter by state
+
+# Cancel / clean up
+hive cancel <ID>          # cancel pending or running task
+hive queue rm <ID>        # delete done/failed/cancelled record
+
+# Pool management
+hive pool add                    # sbatch a new hold job (default preset)
+hive pool add highgpu            # named preset
+hive pool add ~/hold.slurm       # direct script path
+hive pool add --count 2 --time 12:00:00
+hive pool release --idle         # scancel all IDLE hold jobs (⚠️ see rules below)
+hive pool release <JOBID>        # scancel one specific hold job
 ```
 
-Use exit code to decide next step:
-```bash
-hive queue wait 5 && echo "Success" || echo "Failed — check hive queue logs 5"
-```
+---
 
-For multi-step pipelines:
-```bash
-ID=$(hive queue submit "python train.py" | grep -oP '#\K\d+')
-hive queue wait $ID || { echo "Training failed"; exit 1; }
-hive queue submit "python eval.py --checkpoint results/best.pt"
-```
+## The `.hive` Script Format
 
-### logs
-
-```bash
-hive queue logs <id>        # full log
-hive queue logs <id> -f     # live tail (Ctrl-C to stop)
-```
-
-Log is at `~/.hive/logs/task-<id>.log`. Includes:
-- Header: node, workdir, cmd, start time
-- Full stdout + stderr from the command
-- srun errors (if node was unavailable)
-- Footer: finish time, exit code
-
-### cancel
-
-```bash
-hive queue cancel <id>
-```
-
-- PENDING tasks: immediately cancelled
-- RUNNING tasks: kills the srun process, marks cancelled
-
-After cancelling, run `hive queue list` to confirm.
-
-### add
-
-Add a new hold job to expand the pool:
+For multi-line or parameterized runs, write a `.hive` file (like `#SBATCH` for SLURM):
 
 ```bash
-hive pool add                           # default preset
-hive pool add highgpu                   # named preset
-hive pool add ~/my_hold.slurm           # direct script path
-hive pool add --count 2 --time 12:00:00 # 2 nodes, 12h wall time
+#!/bin/bash
+#HIVE workdir=/lustre/home/user/project
+#HIVE priority=5
+#HIVE name=train-v1
+
+python train.py \
+  --config exp/v1.yaml \
+  --output results/v1
 ```
 
-After adding, run `squeue -u $USER` to confirm the job was submitted. The new node appears in `hive nodes` once it starts running and the daemon polls it (up to 120s).
+Submit with: `hive submit experiment.hive`
 
-### release
+Supported `#HIVE` directives:
 
-**⚠️ Use with caution — this cancels SLURM jobs.**
+| Directive | Default | Description |
+|---|---|---|
+| `workdir` | `$PWD` at submit time | Working directory on the node |
+| `priority` | 0 | Higher = dispatched first |
+| `name` | — | Label shown in `hive list` |
+
+CLI flags `--workdir`, `--priority`, `--name` override the file's directives.
+
+---
+
+## Agent Workflow: Submit → Wait → Read Results
 
 ```bash
-hive pool release --idle     # scancel all IDLE nodes (safe to return to cluster)
-hive pool release <jobid>    # scancel one specific hold job
+# Step 1: submit
+hive submit --workdir /path/to/project "python eval.py --model results/best.pt"
+# Output: Submitted task #7
+
+# Step 2: block until done (exit code = 0 success, non-zero failure)
+hive wait 7
+# prints state transitions:  [0s] PENDING  →  [4s] RUNNING on evc23  →  [12m34s] DONE
+# then prints full log
+# exits with the task's exit code
+
+# Step 3: check exit code
+echo "exit: $?"
+
+# Or chain directly:
+hive wait 7 && echo "Done" || { echo "Failed"; hive logs 7; exit 1; }
 ```
 
-Only release nodes that are confirmed IDLE (`hive nodes` shows `IDLE`). Never release a node with `BUSY` status or one that has a task in `running` state in `hive queue list`.
+**Capture task ID from submit:**
+
+```bash
+ID=$(hive submit "python train.py" | grep -oP '#\K\d+')
+hive wait $ID
+```
+
+**Multi-step pipeline:**
+
+```bash
+ID=$(hive submit --name train "python train.py --config v1.yaml" | grep -oP '#\K\d+')
+hive wait $ID || { echo "Training failed"; hive logs $ID; exit 1; }
+hive submit "python eval.py --checkpoint results/v1/best.pt"
+```
+
+---
+
+## `hive list` Output
+
+```
+  ID  NAME      STATE    NODE    ELAPSED    CMD
+  ─────────────────────────────────────────────────────────────────────
+   5  train-v1  RUNNING  evc23   12m34s     python train.py --config ...
+   6  —         PENDING  —       wait:3m02s python eval.py --model ...
+   3  —         DONE     evc39   1h30m      python train.py --config ...
+   2  —         FAILED   evc36   3m02s      python bad_script.py
+```
+
+States: `RUNNING` (green) → `PENDING` (yellow) → `DONE` (dim) → `FAILED` (red) → `CANCELLED` (dim)
+
+ELAPSED format: `<N>s` / `<N>m<SS>s` / `<N>h<MM>m`. Pending shows `wait:<time>` (since submitted).
+
+The bottom of `hive list` also shows scheduler status: `scheduler: running  2 running  1 pending`
+
+---
+
+## Task Log Format
+
+Each task writes to `~/.hive/logs/task-<ID>.log`:
+
+```
+=== hive task #5 started at 2026-04-15T10:01:05 ===
+=== node: evc23  slurm_jobid: 584954 ===
+=== workdir: /lustre/home/user/project ===
+=== cmd: python train.py --config exp/v1.yaml ===
+
+[... stdout + stderr from your command ...]
+
+=== hive task #5 finished at 2026-04-15T11:31:22  exit_code=0 ===
+```
+
+If `srun` itself fails (node expired, job gone), the srun error appears at the **top** of the log, before the header.
+
+---
+
+## Daemon Management
+
+```bash
+hive queue daemon start           # start hive-sched (auto-started by hive submit)
+hive queue daemon stop
+hive queue daemon status          # → hive-sched: running  PID 2201107  host evc1  last heartbeat 20s ago
+hive queue daemon logs            # last 40 lines of scheduler log
+
+hive daemon start                 # start node monitor daemon (auto-started by hive nodes)
+hive daemon stop
+hive daemon status
+hive daemon logs
+```
+
+Both daemons auto-start when needed — you only need to manage them manually when troubleshooting.
 
 ---
 
 ## Critical Rules
 
-1. **NEVER `scancel` hold jobs directly** — always use `hive pool release`. Directly scancelling bypasses the queue state machine and leaves tasks orphaned.
+1. **NEVER `scancel` hold jobs directly** — always use `hive pool release`. Directly scancelling leaves orphaned tasks in the queue.
 
-2. **NEVER run `hive pool release --idle` if there are PENDING tasks in the queue** — the scheduler will try to dispatch them to nodes that no longer exist, causing immediate FAILED status.
+2. **NEVER run `hive pool release --idle` if there are PENDING tasks** — the scheduler will try to dispatch them to nodes that no longer exist → immediate FAILED.
 
-3. **Always check `hive nodes` before manually entering a node** — if a node shows BUSY, another experiment is running there. Don't `srun` in manually unless you intend to share the GPU.
+3. **Only release nodes you intend to give back** — `hive list` shows `IDLE`, you have no pending tasks, session is over → `hive pool release --idle` is safe.
 
-4. **`hive pool release --idle` is for returning unused resources** — only use it when you're done with a session and have nothing pending.
+4. **Queue is flock-protected** — multiple agents submitting concurrently is safe. No need to coordinate submissions between sessions.
 
-5. **The queue is flock-protected** — multiple agents submitting simultaneously is safe and tested. Don't worry about races when submitting from concurrent sessions.
+5. **Workdir must exist on the compute node** — `~` and lustre/NFS paths are fine. Local `/tmp/` paths on the submit node won't exist on the compute node.
 
 ---
 
-## Workflow: Agent Running an Experiment
+## Checking Scheduler Health
 
 ```bash
-# 1. Check what's available
-hive nodes
-hive queue list
-
-# 2. Submit experiment (background, non-blocking)
-hive queue submit --workdir ~/project "python train.py --config v1.yaml"
-# → Submitted task #7
-
-# 3. Check status after 30s (node assignment takes ≤30s)
-hive queue list
-
-# 4. Stream logs if needed
-hive queue logs 7 -f
-
-# 5. Wait for completion (for chained steps)
-hive queue wait 7
-echo "exit: $?"
+hive queue daemon status
+# → hive-sched: running  PID 2201107  host evc1  last heartbeat 20s ago
+# → hive-sched: stopped        ← means no scheduler; start with: hive queue daemon start
 ```
 
-## Workflow: Pool Maintenance
+If tasks are stuck in PENDING and you have IDLE nodes, the scheduler is likely stopped:
 
 ```bash
-# Add a node when pool is empty
-hive pool add
-
-# Check it appeared
-hive nodes   # (after ~120s for daemon to poll)
-
-# Release idle nodes at end of session
-hive nodes   # verify IDLE
-hive queue list   # verify no PENDING tasks
-hive pool release --idle
+hive nodes            # confirm there are IDLE nodes
+hive queue daemon start
 ```
 
 ---
 
-## State Files (readable from any node)
-
-```
-~/.hive/node_monitor.json   # live node status (updated every 120s)
-~/.hive/queue.json          # task queue DB
-~/.hive/logs/task-<id>.log  # per-task stdout+stderr
-~/.hive/sched.heartbeat     # hive-sched liveness (mtime ≤ 30s if alive)
-```
-
-Quick Python read:
+## Programmatic State Reading (Python)
 
 ```python
 import json, os
-db   = json.load(open(os.path.expanduser("~/.hive/node_monitor.json")))
-q    = json.load(open(os.path.expanduser("~/.hive/queue.json")))
-idle = [jid for jid, v in db["jobs"].items() if v["status"] == "idle"]
-pend = [t for t in q["tasks"].values() if t["state"] == "pending"]
-run  = [t for t in q["tasks"].values() if t["state"] == "running"]
-print(f"Nodes IDLE: {len(idle)} | Queue: {len(pend)} pending, {len(run)} running")
+
+HIVE_DIR = os.path.expanduser("~/.hive")
+
+db = json.load(open(f"{HIVE_DIR}/node_monitor.json"))
+q  = json.load(open(f"{HIVE_DIR}/queue.json"))
+
+idle  = [(jid, v["node"]) for jid, v in db["jobs"].items() if v["status"] == "idle"]
+run   = [t for t in q["tasks"].values() if t["state"] == "running"]
+pend  = [t for t in q["tasks"].values() if t["state"] == "pending"]
+print(f"IDLE nodes: {idle}")
+print(f"Queue: {len(run)} running, {len(pend)} pending")
+
+# Read a specific task's log
+task_id = 5
+print(open(f"{HIVE_DIR}/logs/task-{task_id}.log").read())
 ```
 
 ---
 
-## Troubleshooting Quick Reference
+## Troubleshooting
 
-| Symptom | Command | Action |
-|---------|---------|--------|
-| Task stuck PENDING | `hive nodes` | No IDLE nodes → `hive pool add` |
-| Scheduler stopped | `hive queue daemon status` | `hive queue daemon start` |
-| Task FAILED fast | `hive queue logs <id>` | Read first lines for srun/workdir error |
-| Node stuck `?????` | `hive poll` | Force re-probe; may need new hold job |
-| Log missing | `hive queue logs <id>` | Task not started yet (still PENDING) |
+| Symptom | Check | Fix |
+|---------|-------|-----|
+| Task stuck PENDING | `hive nodes` — IDLE nodes? | No idle → `hive pool add` |
+| Pending stays >2 min with IDLE nodes | `hive queue daemon status` | `hive queue daemon start` |
+| Task FAILED immediately | `hive logs <id>` — check top lines | srun error or bad workdir |
+| Log empty / not found | `hive list` — is it still PENDING? | Wait for scheduler to dispatch (≤30s) |
+| `hive submit` returns error | run `hive queue daemon status` | Scheduler may have crashed |
+| Node shows `?????` | `hive poll` | Force re-probe; hold job may have expired |

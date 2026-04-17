@@ -76,6 +76,11 @@ case "$subcommand" in
         py="$(_resolve_python)"
         exec "$py" "${HIVE_LIBEXEC}/hive-pool" "$@"
         ;;
+    # ── Queue shortcuts (hive submit → hive queue submit, etc.) ──────────────
+    submit|wait|list|ls|cancel|logs|rm)
+        py="$(_resolve_python)"
+        exec "$py" "${HIVE_LIBEXEC}/hive-queue" "$subcommand" "$@"
+        ;;
     daemon)
         sub="${1:-status}"; shift 2>/dev/null || true
         case "$sub" in
@@ -102,8 +107,13 @@ case "$subcommand" in
     top                       Interactive TUI monitor (curses)
     daemon   start|stop|restart|status|logs
     poll                      Trigger immediate node poll
-    queue    submit|list|cancel|logs|rm|daemon
-                              Task queue (auto-schedules to idle nodes)
+    submit   "cmd"|job.hive   Submit to task queue (shortcut for queue submit)
+    wait     ID               Block until task done, print log, exit $?
+    list                      Show task queue (shortcut for queue list)
+    logs     ID [-f]          Show / follow task log
+    cancel   ID               Cancel pending or running task
+    queue    submit|list|wait|cancel|logs|rm|daemon
+                              Full task queue interface
     pool     add|release|init|config
                               Manage node pool (sbatch hold jobs / scancel)
 
@@ -112,10 +122,11 @@ case "$subcommand" in
     hive nodes                Show node status once (auto-starts daemon)
     hive top                  Open interactive monitor (continuous)
     hive poll                 Poll now + update DB
-    hive queue submit "python train.py --config exp/v1.yaml"
-    hive queue submit job.hive
-    hive queue list
-    hive queue logs 3 -f
+    hive submit "python train.py --config exp/v1.yaml"
+    hive submit job.hive
+    hive list
+    hive wait 3
+    hive logs 3 -f
 
   Config dir:  ~/.hive/
   DB file:     ~/.hive/node_monitor.json
