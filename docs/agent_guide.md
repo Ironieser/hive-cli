@@ -256,7 +256,7 @@ TASK_ID=$(hive queue submit "python eval.py" | grep -oP '#\K\d+')
 hive queue wait $TASK_ID
 # blocks until DONE/FAILED/CANCELLED
 # prints the full log when done
-# exits with the task's exit code ($? = 0 for success, non-zero for failure)
+# exits with the task's exit code ($? = 0 for success, non-zero for failure, 130 for cancelled)
 ```
 
 This is the recommended pattern for agent workflows that need to chain steps:

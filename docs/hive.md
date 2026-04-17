@@ -353,12 +353,16 @@ hive queue list --state running
   ID  NAME      STATE    NODE    ELAPSED    CMD
   ────────────────────────────────────────────────────────────────
    5  train-v1  RUNNING  evc23   12m34s     python train.py --config ...
-   6  (unnamed) PENDING  —       wait:3m    python eval.py --model ...
-   3  (unnamed) DONE     evc39   1h30m12s   python train.py --config ...
+   6  (unnamed) PENDING  —       wait:3m02s python eval.py --model ...
+   3  (unnamed) DONE     evc39   1h30m      python train.py --config ...
    2  (unnamed) FAILED   evc36   3m02s      python bad_script.py
 ```
 
-ELAPSED for `running` = wall time since started. For `done`/`failed` = total execution time. For `pending` = `wait:Xm` since submitted.
+ELAPSED format: `<N>s` / `<N>m<SS>s` / `<N>h<MM>m` / `<N>d<HH>h` (seconds dropped at hour+ scale).
+- `running`: wall time since task started
+- `done` / `failed`: total execution time (started → finished)
+- `pending`: `wait:<elapsed>` since submitted
+- `cancelled`: `—`
 
 ### Logs
 
@@ -386,7 +390,8 @@ If the node is gone or the SLURM job expired, srun's error message appears at th
 
 ### Wait (agent pattern)
 
-Block until a task reaches a terminal state, then print its log and exit with the task's exit code:
+Block until a task reaches a terminal state, then print its log and exit with the task's exit code.
+Exit code mapping: `done+exit_code=0` → 0; `done+exit_code≠0` / `failed` → task's exit code (negative ec → 1); `cancelled` → 130 (shell convention for SIGTERM).
 
 ```bash
 hive queue wait <id>
