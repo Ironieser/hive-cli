@@ -189,8 +189,11 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
 
     stale_flag = "1" if is_job_stale(polled_at) else "0"
 
+    # task_cmd MUST be last: bash IFS=$'\t' read collapses consecutive tabs
+    # (tab is IFS whitespace), so an empty task_cmd field would be swallowed.
+    # Putting it last lets the final read variable capture "" correctly.
     fields = "\t".join([jobid, node, part, elapsed, status,
-                        str(gpu_util), mem_str, task_cmd, stale_flag])
+                        str(gpu_util), mem_str, stale_flag, task_cmd])
     print(f"JOB\t{fields}")
 PYEOF
 
@@ -263,7 +266,7 @@ show_table() {
     local n_busy=0 n_cpu=0 n_idle=0
 
     for row in "${rows[@]}"; do
-        IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str task_cmd job_stale <<< "$row"
+        IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str job_stale task_cmd <<< "$row"
 
         local status_upper status_color
         if [[ "$status" == "busy" ]]; then

@@ -79,11 +79,13 @@ probe_job() {
     local elapsed_fmt
     elapsed_fmt=$(fmt_elapsed_slurm "$elapsed_raw")
 
-    # Probe command: nvidia-smi + ps, all in the job's cgroup via srun overlap.
-    # ps is scoped to this job's PIDs only via scontrol listpids — prevents
-    # node-wide contamination on multi-job nodes (e.g. 4 hold jobs on evc101).
+    # Probe command: nvidia-smi (GPU stats + compute-apps) via srun overlap.
+    # CUDA_VISIBLE_DEVICES is correctly scoped per job by SLURM — both queries
+    # only see this job's allocated GPU(s). No ps/cgroup needed for process
+    # detection: nvidia-smi --query-compute-apps gives exactly the processes
+    # using this job's GPU, immune to concurrent overlap contamination.
     local probe_cmd
-    probe_cmd='nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; PIDS=$(scontrol listpids $SLURM_JOB_ID 2>/dev/null | awk '"'"'NR>1{print $1}'"'"' | paste -sd,); [ -n "$PIDS" ] && ps -p "$PIDS" -o pid,%cpu,%mem,etime,args --no-header 2>/dev/null || true'
+    probe_cmd='nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
     local raw
     raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
