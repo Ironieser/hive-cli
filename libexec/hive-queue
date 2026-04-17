@@ -20,7 +20,7 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HIVE_DIR      = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
@@ -345,23 +345,47 @@ def cmd_submit(args):
 
 # ── List ──────────────────────────────────────────────────────────────────────
 
-STATE_ORDER = {"running": 0, "pending": 1, "done": 2, "failed": 3, "cancelled": 4}
+DONE_HIDE_HOURS = 24   # hide done tasks older than this by default
 
 
 def cmd_list(args):
     queue = load_queue()
-    tasks = list(queue.get("tasks", {}).values())
+    all_tasks = list(queue.get("tasks", {}).values())
 
     filter_state = args.state.lower() if args.state else None
     if filter_state:
-        tasks = [t for t in tasks if t["state"] == filter_state]
+        all_tasks = [t for t in all_tasks if t["state"] == filter_state]
+
+    # Filter: hide old done tasks unless --all or --state is explicitly set
+    hidden_count = 0
+    if not getattr(args, "all", False) and not filter_state:
+        cutoff = datetime.now() - timedelta(hours=DONE_HIDE_HOURS)
+        visible, hidden = [], []
+        for t in all_tasks:
+            if t["state"] == "done":
+                finished = parse_iso(t.get("finished_at"))
+                if finished is not None and finished < cutoff:
+                    hidden.append(t)
+                    continue
+            visible.append(t)
+        hidden_count = len(hidden)
+        tasks = visible
+    else:
+        tasks = all_tasks
 
     if not tasks:
-        print("No tasks found.")
+        if hidden_count:
+            print(f"No tasks in current window ({hidden_count} old done tasks hidden — use --all).")
+        else:
+            print("No tasks found.")
         return
 
-    # Sort: running first, then pending, then by id desc
-    tasks.sort(key=lambda t: (STATE_ORDER.get(t["state"], 9), -t["id"]))
+    # Sort: running/pending first (by id desc), then all terminal states by id desc
+    def sort_key(t):
+        is_active = 1 if t["state"] in ("running", "pending") else 0
+        return (-is_active, -t["id"])
+
+    tasks.sort(key=sort_key)
 
     # Column widths
     id_w    = max(len(str(t["id"])) for t in tasks)
@@ -384,7 +408,16 @@ def cmd_list(args):
     print(f"{C_BOLD}{header}{C_RESET}")
     print(sep)
 
+    prev_active = None
     for t in tasks:
+        is_active = t["state"] in ("running", "pending")
+
+        # Insert separator between active and terminal sections
+        if prev_active is True and not is_active:
+            print(sep)
+
+        prev_active = is_active
+
         tid     = str(t["id"])
         name    = t.get("name") or "—"
         state   = t["state"]
@@ -402,8 +435,11 @@ def cmd_list(args):
     running_n = sum(1 for t in tasks if t["state"] == "running")
     pending_n = sum(1 for t in tasks if t["state"] == "pending")
     sched_status = f"{C_GREEN}running{C_RESET}" if is_sched_running() else f"{C_RED}stopped{C_RESET}"
-    print(f"  {C_DIM}scheduler: {sched_status}  "
-          f"{running_n} running  {pending_n} pending{C_RESET}")
+    footer = f"  {C_DIM}scheduler: {sched_status}  {running_n} running  {pending_n} pending"
+    if hidden_count:
+        footer += f"  (+{hidden_count} old done hidden — hive queue list --all)"
+    footer += C_RESET
+    print(footer)
 
 
 # ── Cancel ────────────────────────────────────────────────────────────────────
@@ -567,6 +603,8 @@ def build_parser():
     pl = sub.add_parser("list", aliases=["ls"], help="List tasks")
     pl.add_argument("--state", "-s", metavar="STATE",
                     help="Filter by state: pending|running|done|failed|cancelled")
+    pl.add_argument("--all", "-a", action="store_true",
+                    help=f"Show all tasks including done tasks older than {DONE_HIDE_HOURS}h (hidden by default)")
 
     # cancel
     pc = sub.add_parser("cancel", help="Cancel a pending or running task")

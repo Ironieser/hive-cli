@@ -14,6 +14,7 @@
 
 HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
 DB_FILE="${DB_FILE:-${HIVE_DIR}/node_monitor.json}"
+QUEUE_FILE="${HIVE_DIR}/queue.json"
 PID_FILE="${PID_FILE:-${HIVE_DIR}/node_monitor.pid}"
 LOG_FILE="${LOG_FILE:-${HIVE_DIR}/node_monitor.log}"
 # DAEMON_BIN and POLL_BIN may be exported by the hive dispatcher;
@@ -119,10 +120,23 @@ show_daemon_footer() {
 
 # ── Python helper: parse DB, emit tab-separated rows ─────────────────────────
 read -r -d '' PYTHON_PARSE << 'PYEOF'
-import sys, json, re
+import sys, json, re, os
 from datetime import datetime, timezone
 
-db_path = sys.argv[1]
+db_path    = sys.argv[1]
+queue_path = sys.argv[2] if len(sys.argv) > 2 else None
+
+# Build slurm_jobid → task map for running hive tasks
+jobid_to_task = {}
+if queue_path:
+    try:
+        with open(queue_path) as _qf:
+            _q = json.load(_qf)
+        for _t in _q.get("tasks", {}).values():
+            if _t.get("state") == "running" and _t.get("slurm_jobid"):
+                jobid_to_task[str(_t["slurm_jobid"])] = _t
+    except Exception:
+        pass
 try:
     with open(db_path) as f:
         data = json.load(f)
@@ -184,8 +198,18 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
         raw_cmd = best.get("cmd", "")
         m = re.search(r"(python\S*\s.+|bash\s.+)", raw_cmd)
         task_cmd = m.group(1).strip() if m else raw_cmd.strip()
-        if len(task_cmd) > 55:
-            task_cmd = task_cmd[:54] + "…"
+
+    # Override with authoritative queue data if a hive task owns this job
+    qt = jobid_to_task.get(jobid)
+    if qt:
+        tid    = qt["id"]
+        name   = qt.get("name") or ""
+        qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
+        prefix = f"#{tid} {name}: " if name else f"#{tid}: "
+        task_cmd = prefix + qcmd
+
+    if len(task_cmd) > 55:
+        task_cmd = task_cmd[:54] + "…"
 
     stale_flag = "1" if is_job_stale(polled_at) else "0"
 
@@ -218,7 +242,7 @@ show_table() {
     _PY="${HIVE_PYTHON:-}"
     [[ -z "$_PY" && -x "${HOME}/.conda/envs/vlm/bin/python3" ]] && _PY="${HOME}/.conda/envs/vlm/bin/python3"
     [[ -z "$_PY" ]] && _PY="$(command -v python3 2>/dev/null)"
-    parsed=$("$_PY" - "$DB_FILE" <<< "$PYTHON_PARSE" 2>/dev/null)
+    parsed=$("$_PY" - "$DB_FILE" "$QUEUE_FILE" <<< "$PYTHON_PARSE" 2>/dev/null)
     if [[ -z "$parsed" ]]; then
         echo -e "\n  ${RED}Failed to parse DB (is python3 available?).${NC}\n"
         return 1

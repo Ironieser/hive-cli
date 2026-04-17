@@ -14,9 +14,10 @@ import time
 from datetime import datetime, timezone
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-HIVE_DIR = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
-DB_PATH  = os.path.join(HIVE_DIR, "node_monitor.json")
-PID_PATH = os.path.join(HIVE_DIR, "node_monitor.pid")
+HIVE_DIR    = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
+DB_PATH     = os.path.join(HIVE_DIR, "node_monitor.json")
+PID_PATH    = os.path.join(HIVE_DIR, "node_monitor.pid")
+QUEUE_PATH  = os.path.join(HIVE_DIR, "queue.json")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DAEMON_POLL_INTERVAL = 120   # seconds between daemon polls
@@ -206,13 +207,14 @@ def wrap_cmd(cmd, width, indent=4):
 class NodeTop:
     def __init__(self, stdscr):
         self.stdscr  = stdscr
-        self.data    = None
-        self.err     = None
-        self.cursor  = 0          # selected row index
-        self.expanded = None      # job_id of expanded row, or None
-        self.paused  = False
-        self.last_refresh = 0.0   # time.monotonic of last file read
-        self.rows    = []         # sorted [(job_id, job_data), ...]
+        self.data         = None
+        self.err          = None
+        self.cursor       = 0          # selected row index
+        self.expanded     = None       # job_id of expanded row, or None
+        self.paused       = False
+        self.last_refresh = 0.0        # time.monotonic of last file read
+        self.rows         = []         # sorted [(job_id, job_data), ...]
+        self.jobid_to_task = {}        # slurm_jobid → running hive task
 
         init_colors()
         curses.curs_set(0)
@@ -231,6 +233,17 @@ class NodeTop:
             # Clamp cursor
             if self.cursor >= len(self.rows):
                 self.cursor = max(0, len(self.rows) - 1)
+
+        # Load queue: build slurm_jobid → task map for running hive tasks
+        self.jobid_to_task = {}
+        try:
+            with open(QUEUE_PATH) as f:
+                q = json.load(f)
+            for t in q.get("tasks", {}).values():
+                if t.get("state") == "running" and t.get("slurm_jobid"):
+                    self.jobid_to_task[str(t["slurm_jobid"])] = t
+        except Exception:
+            pass
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
@@ -350,7 +363,7 @@ class NodeTop:
             mem_total = gpus[0].get("mem_total", 0) if gpus else 0
             mem_str   = fmt_mem(mem_used, mem_total) if gpus else "?"
 
-            # Main task command (first process with python or any)
+            # Main task command — prefer authoritative queue data, fall back to probe
             task_cmd = "—"
             for p in procs:
                 cmd = p.get("cmd", "")
@@ -359,6 +372,15 @@ class NodeTop:
                     break
             if task_cmd == "—" and procs:
                 task_cmd = procs[0].get("cmd", "—")
+
+            qt = self.jobid_to_task.get(jid)
+            if qt:
+                tid    = qt["id"]
+                name   = qt.get("name") or ""
+                qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
+                prefix = f"#{tid} {name}: " if name else f"#{tid}: "
+                task_cmd = prefix + qcmd
+
             task_cmd_short = short_cmd(task_cmd, task_w)
 
             # Build line
