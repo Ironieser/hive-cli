@@ -92,7 +92,7 @@ probe_job() {
     local gpu_json="" ps_json=""
     local first_gpu=1 first_ps=1
     local has_process=0
-    local max_gpu_mem=0 max_gpu_util=0
+    local max_gpu_mem=0 max_gpu_util=0 max_gpu_total=0
     # Skip noisy ps entries
     local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi|tmux|zsh|fish|-bash|-zsh|-fish'
 
@@ -112,8 +112,9 @@ probe_job() {
             [[ "$first_gpu" -eq 0 ]] && gpu_json+=","
             gpu_json+="{\"index\":${gidx},\"util\":${gutil:-0},\"mem_used\":${gmem_used:-0},\"mem_total\":${gmem_total:-0}}"
             first_gpu=0
-            (( ${gmem_used:-0} > max_gpu_mem )) && max_gpu_mem=${gmem_used:-0}
-            (( ${gutil:-0}    > max_gpu_util )) && max_gpu_util=${gutil:-0}
+            (( ${gmem_used:-0}  > max_gpu_mem   )) && max_gpu_mem=${gmem_used:-0}
+            (( ${gutil:-0}     > max_gpu_util  )) && max_gpu_util=${gutil:-0}
+            (( ${gmem_total:-0} > max_gpu_total )) && max_gpu_total=${gmem_total:-0}
 
         else
             # ── ps line ───────────────────────────────────────────────────────
@@ -141,21 +142,25 @@ probe_job() {
         fi
     done <<< "$raw"
 
-    # status:
-    #   idle  — no significant processes
-    #   cpu   — processes running but GPU is free (util<5% and mem<500MB)
-    #           node is in use but GPU slot is unoccupied; scheduler won't dispatch here
-    #   busy  — GPU actively used (util≥5% or mem≥500MB)
+    # status (raw — Python post-processing in main() resolves proc_gpu_idle):
+    #   cpu           — job has no GPU allocated (mem_total=0 for all GPUs)
+    #   idle          — GPU job, no significant processes
+    #   busy          — GPU actively used (util≥5% or mem≥500MB)
+    #   proc_gpu_idle — GPU job, processes running but GPU appears idle;
+    #                   Python will convert to "warning" after 3min, else keep "busy"
     local status
-    if (( has_process == 0 )); then
+    if (( max_gpu_total == 0 )); then
+        status="cpu"
+    elif (( has_process == 0 )); then
         status="idle"
     elif (( max_gpu_util >= 5 || max_gpu_mem >= 500 )); then
         status="busy"
     else
-        status="cpu"
+        status="proc_gpu_idle"
     fi
 
     # Write per-job JSON fragment (assembled by main)
+    # gpu_idle_since is a placeholder (null); Python post-processing fills it in
     cat > "$outfile" <<EOF
 "${jobid}": {
   "node": "$(json_escape "$node")",
@@ -164,6 +169,7 @@ probe_job() {
   "gpu": [${gpu_json}],
   "processes": [${ps_json}],
   "status": "${status}",
+  "gpu_idle_since": null,
   "polled_at": "${polled_at}"
 }
 EOF
@@ -245,7 +251,63 @@ main() {
         printf '  }\n}\n'
     } > "$DB_TMP"
 
+    # Save old DB for gpu_idle_since timer before overwriting
+    local OLD_DB_CONTENT_FILE="${POLL_TMPDIR}/old_db.json"
+    [[ -f "$DB_FILE" ]] && cp "$DB_FILE" "$OLD_DB_CONTENT_FILE" || touch "$OLD_DB_CONTENT_FILE"
+
     mv "$DB_TMP" "$DB_FILE"
+
+    # ── Apply gpu_idle_since timer (warning after 3min of proc_gpu_idle) ────────
+    # Needs the old DB for timestamps; DB_FILE is the new raw DB at this point.
+    # We pass the old DB content via a temp var captured before the mv.
+    python3 - "$DB_FILE" "$OLD_DB_CONTENT_FILE" << 'PYEOF'
+import json, time, sys, os
+
+db_file   = sys.argv[1]
+old_file  = sys.argv[2]  # path to temp file holding old DB content
+WARN_SECS = 180          # 3 minutes
+
+try:
+    new_db = json.load(open(db_file))
+except Exception:
+    sys.exit(0)
+
+try:
+    old_db = json.load(open(old_file)) if os.path.exists(old_file) else {"jobs": {}}
+except Exception:
+    old_db = {"jobs": {}}
+
+now = time.time()
+changed = False
+
+for jid, job in new_db["jobs"].items():
+    raw = job.get("status")
+    if raw == "proc_gpu_idle":
+        old_since = old_db["jobs"].get(jid, {}).get("gpu_idle_since")
+        if old_since is None:
+            # First time seeing GPU idle — start the clock, show as busy (grace)
+            job["gpu_idle_since"] = now
+            job["status"] = "busy"
+        elif now - old_since >= WARN_SECS:
+            # Been idle long enough — warn
+            job["gpu_idle_since"] = old_since
+            job["status"] = "warning"
+        else:
+            # Still within grace period
+            job["gpu_idle_since"] = old_since
+            job["status"] = "busy"
+        changed = True
+    else:
+        # Any non-idle state clears the timer
+        if job.get("gpu_idle_since") is not None:
+            job["gpu_idle_since"] = None
+            changed = True
+
+if changed:
+    with open(db_file, 'w') as f:
+        json.dump(new_db, f, indent=2)
+PYEOF
+
     rm -rf "$POLL_TMPDIR"
     log "DB written: $DB_FILE  (${#job_ids[@]} jobs)"
 }

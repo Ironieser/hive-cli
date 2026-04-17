@@ -36,6 +36,7 @@ C_SEL     = 8
 C_STALE   = 9
 C_BORDER  = 10
 C_CPU     = 11
+C_WARN    = 12
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -47,6 +48,7 @@ def init_colors():
     curses.init_pair(C_BUSY,    curses.COLOR_GREEN,   -1)
     curses.init_pair(C_IDLE,    curses.COLOR_YELLOW,  -1)
     curses.init_pair(C_CPU,     curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_WARN,    curses.COLOR_YELLOW,  -1)
     curses.init_pair(C_DIM,     curses.COLOR_WHITE,   -1)
     curses.init_pair(C_GPU_HI,  curses.COLOR_GREEN,   -1)
     curses.init_pair(C_GPU_MID, curses.COLOR_YELLOW,  -1)
@@ -168,8 +170,8 @@ def sort_jobs(jobs_dict):
     def key(item):
         jid, jdata = item
         status = jdata.get("status", "unknown")
-        # busy first, then cpu, then idle/unknown
-        order = 0 if status == "busy" else (1 if status == "cpu" else 2)
+        # busy/warning first, then cpu, then idle/unknown
+        order = 0 if status in ("busy", "warning") else (1 if status == "cpu" else 2)
         try:
             jnum = -int(jid)
         except ValueError:
@@ -382,6 +384,8 @@ class NodeTop:
                 status_x = 2 + 10 + 1 + 8 + 1 + 10 + 1 + 10 + 1
                 if status == "BUSY":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY) | curses.A_BOLD)
+                elif status == "WARNING":
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_WARN) | curses.A_BOLD | curses.A_BLINK)
                 elif status == "CPU":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_CPU) | curses.A_BOLD)
                 elif status == "IDLE":

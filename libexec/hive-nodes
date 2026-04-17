@@ -277,6 +277,9 @@ show_table() {
         elif [[ "$status" == "cpu" ]]; then
             status_upper="CPU  ";   status_color="${CYAN}${BOLD}"
             n_cpu=$(( n_cpu + 1 ))
+        elif [[ "$status" == "warning" ]]; then
+            status_upper="WARN ";   status_color="${YELLOW}${BOLD}"
+            n_busy=$(( n_busy + 1 ))
         elif [[ "$status" == "unknown" ]]; then
             status_upper="?????";   status_color="${DIM}"
             n_idle=$(( n_idle + 1 ))
