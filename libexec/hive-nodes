@@ -60,23 +60,43 @@ daemon_start() {
 daemon_stop() {
     local pid; pid=$(daemon_pid 2>/dev/null)
     if [[ -z "$pid" ]]; then
-        echo -e "  ${DIM}Daemon not running.${NC}"
+        echo -e "  ${DIM}Daemon not running (per PID file).${NC}"
         rm -f "$PID_FILE"
-        return 0
-    fi
-    kill -TERM "$pid" 2>/dev/null
-    local waited=0
-    while kill -0 "$pid" 2>/dev/null && (( waited < 10 )); do
-        sleep 1
-        waited=$(( waited + 1 ))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null
-        echo -e "  ${RED}Daemon (PID $pid) force-killed after ${waited}s.${NC}"
     else
-        echo -e "  ${GREEN}Daemon (PID $pid) stopped.${NC}"
+        kill -TERM "$pid" 2>/dev/null
+        local waited=0
+        while kill -0 "$pid" 2>/dev/null && (( waited < 10 )); do
+            sleep 1
+            waited=$(( waited + 1 ))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null
+            echo -e "  ${RED}Daemon (PID $pid) force-killed after ${waited}s.${NC}"
+        else
+            echo -e "  ${GREEN}Daemon (PID $pid) stopped.${NC}"
+        fi
+        rm -f "$PID_FILE"
     fi
-    rm -f "$PID_FILE"
+
+    # Sweep: kill any stale hive-daemon main processes (running > 60s).
+    # Probe subshells also appear as "hive-daemon" in pgrep but complete in < 30s,
+    # so the elapsed-time filter reliably targets only lingering daemon instances.
+    local stale_pids=()
+    while read -r spid; do
+        [[ "$spid" == "$pid" ]] && continue   # already handled above
+        local elapsed
+        elapsed=$(ps -o etimes= -p "$spid" 2>/dev/null | tr -d ' ')
+        [[ -n "$elapsed" && "$elapsed" -gt 60 ]] && stale_pids+=("$spid")
+    done < <(pgrep -f "hive-daemon" 2>/dev/null)
+
+    if (( ${#stale_pids[@]} > 0 )); then
+        echo -e "  ${YELLOW}Cleaning up ${#stale_pids[@]} stale daemon process(es): ${stale_pids[*]}${NC}"
+        kill -TERM "${stale_pids[@]}" 2>/dev/null
+        sleep 1
+        for spid in "${stale_pids[@]}"; do
+            kill -0 "$spid" 2>/dev/null && kill -KILL "$spid" 2>/dev/null
+        done
+    fi
 }
 
 # ── daemon status footer ──────────────────────────────────────────────────────
@@ -97,11 +117,19 @@ show_daemon_footer() {
             fi
         fi
 
+        # Read actual poll interval from daemon startup log line
+        local poll_interval=120
+        if [[ -f "$LOG_FILE" ]]; then
+            local interval_str
+            interval_str=$(grep "hive-daemon started" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oP 'interval=\K[0-9]+')
+            [[ -n "$interval_str" ]] && poll_interval="$interval_str"
+        fi
+
         local next_str=""
         if [[ -n "$last_poll_epoch" ]]; then
             local now_epoch; now_epoch=$(date +%s)
             local elapsed_since=$(( now_epoch - last_poll_epoch ))
-            local remaining=$(( 120 - elapsed_since ))
+            local remaining=$(( poll_interval - elapsed_since ))
             if (( remaining < 0 )); then remaining=0; fi
             local nm=$(( remaining / 60 )) ns=$(( remaining % 60 ))
             next_str="~${nm}m ${ns}s"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # hive-daemon — background poller daemon for hive-cli
-# Writes to ~/.hive/node_monitor.json every 120s.
+# Writes to ~/.hive/node_monitor.json every 900s.
 # PID file: ~/.hive/node_monitor.pid
 # Log file: ~/.hive/node_monitor.log  (rolling, last 500 lines)
 
@@ -11,7 +11,7 @@ DB_FILE="${HIVE_DIR}/node_monitor.json"
 DB_TMP="${DB_FILE}.tmp"
 PID_FILE="${DB_DIR}/node_monitor.pid"
 LOG_FILE="${DB_DIR}/node_monitor.log"
-POLL_INTERVAL=120
+POLL_INTERVAL=900
 
 # ── signal handling ───────────────────────────────────────────────────────────
 SIGUSR1_RECEIVED=0
