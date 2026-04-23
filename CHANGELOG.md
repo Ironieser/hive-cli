@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-23
+
+### Fixed
+- **daemon: stale process sweep on stop/restart** — `daemon_stop` now kills all
+  `hive-daemon` main processes (elapsed > 60s) beyond the PID-file entry. Previously,
+  repeated `hive daemon restart` left zombie daemons running from prior sessions;
+  10 simultaneous daemons at 120s poll interval consumed ~5.9 srun steps/min per
+  job, exhausting SLURM's MaxStepCount=40000 on long-running hold jobs.
+- **nodes: read actual poll interval from daemon log** — `show_daemon_footer` no
+  longer hard-codes 120s; it reads the `interval=N` value from the daemon's startup
+  log line so "next poll in Xs" is accurate after the interval is changed.
+- **daemon: increase default POLL_INTERVAL to 900s** — reduces srun step consumption
+  from ~0.5/min (120s) to ~0.067/min (900s) per job, keeping well under MaxStepCount.
+
+---
+
 ## [0.3.1] - 2026-04-15
 
 ### Added
