@@ -90,7 +90,7 @@ probe_job() {
     elapsed_fmt=$(fmt_elapsed_slurm "$elapsed_raw")
 
     local probe_cmd
-    probe_cmd='nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; ps -u '"$USER"' -o pid,%cpu,%mem,etime,args --no-header 2>/dev/null'
+    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
     local raw
     raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
@@ -99,8 +99,8 @@ probe_job() {
     local in_ps=0
     local gpu_json="" ps_json=""
     local first_gpu=1 first_ps=1
-    local has_process=0
-    local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi'
+    local max_gpu_mem=0 max_gpu_util=0 max_gpu_total=0
+    local skip_re='sleep|slurm_script|bash|sh |srun|ps -u|grep|nvidia-smi|tmux|zsh|fish|-bash|-zsh|-fish'
 
     while IFS= read -r line; do
         if [[ "$line" == "---PS---" ]]; then
@@ -116,6 +116,9 @@ probe_job() {
             [[ "$first_gpu" -eq 0 ]] && gpu_json+=","
             gpu_json+="{\"index\":${gidx},\"util\":${gutil:-0},\"mem_used\":${gmem_used:-0},\"mem_total\":${gmem_total:-0}}"
             first_gpu=0
+            (( ${gmem_used:-0}  > max_gpu_mem   )) && max_gpu_mem=${gmem_used:-0}
+            (( ${gutil:-0}     > max_gpu_util  )) && max_gpu_util=${gutil:-0}
+            (( ${gmem_total:-0} > max_gpu_total )) && max_gpu_total=${gmem_total:-0}
         else
             [[ -z "$line" ]] && continue
             echo "$line" | grep -qE "$skip_re" && continue
@@ -135,12 +138,17 @@ probe_job() {
             [[ "$first_ps" -eq 0 ]] && ps_json+=","
             ps_json+="{\"pid\":${ppid},\"cpu\":${pcpu:-0},\"mem\":${pmem:-0},\"elapsed\":\"${elapsed_ps}\",\"cmd\":\"${cmd_esc}\"}"
             first_ps=0
-            has_process=1
         fi
     done <<< "$raw"
 
     local status
-    if (( has_process )); then status="busy"; else status="idle"; fi
+    if (( max_gpu_total == 0 )); then
+        status="cpu"
+    elif (( max_gpu_util >= 5 || max_gpu_mem >= 500 )); then
+        status="busy"
+    else
+        status="idle"
+    fi
 
     cat > "$outfile" <<EOF
 "${jobid}": {
@@ -150,6 +158,7 @@ probe_job() {
   "gpu": [${gpu_json}],
   "processes": [${ps_json}],
   "status": "${status}",
+  "gpu_idle_since": null,
   "polled_at": "${polled_at}"
 }
 EOF
