@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""hive-feedback — submit & manage issue/feedback reports for hive-cli
+
+Lets any agent (or user) file structured feedback into the hive-cli repo so the
+repo-owning agent can triage it. Each entry is one Markdown file with YAML-ish
+frontmatter under  <feedback-dir>/inbox/ ; an INDEX.md is kept in sync.
+
+Storage location resolution (first match wins):
+  1. $HIVE_FEEDBACK_DIR
+  2. <repo-root>/feedback        (repo-root = parent of this script's libexec dir)
+  3. $HIVE_DIR/feedback          (~/.hive/feedback)
+
+Untracked inbox/*.md survive `git reset --hard` (install.sh never runs git clean),
+so feedback filed against an installed copy is not wiped on upgrade.
+
+Commands:
+  hive feedback "free text ..."                 quick submit
+  hive feedback submit --title T [--severity S] [--tags a,b] [--task 1,2] ["text"|--file F]
+  hive feedback list [--status STATUS]
+  hive feedback show <id>
+  hive feedback triage <id> --status STATUS [--note "..."]
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+LIBEXEC_DIR = os.path.dirname(os.path.realpath(__file__))
+REPO_ROOT   = os.path.dirname(LIBEXEC_DIR)
+HIVE_DIR    = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
+
+
+def feedback_dir():
+    d = os.environ.get("HIVE_FEEDBACK_DIR")
+    if d:
+        return os.path.expanduser(d)
+    repo_fb = os.path.join(REPO_ROOT, "feedback")
+    # Prefer the repo feedback dir if its parent is writable (normal install/checkout)
+    if os.path.isdir(repo_fb) or os.access(REPO_ROOT, os.W_OK):
+        return repo_fb
+    return os.path.join(HIVE_DIR, "feedback")
+
+
+FB_DIR     = feedback_dir()
+INBOX_DIR  = os.path.join(FB_DIR, "inbox")
+INDEX_FILE = os.path.join(FB_DIR, "INDEX.md")
+LOCK_FILE  = os.path.join(FB_DIR, ".feedback.lock")
+
+SEVERITIES = ["critical", "high", "medium", "low"]
+STATUSES   = ["open", "triaged", "in-progress", "done", "wontfix", "duplicate"]
+
+C_RESET = "\033[0m"; C_BOLD = "\033[1m"; C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"; C_RED = "\033[31m"; C_DIM = "\033[2m"; C_CYAN = "\033[36m"
+
+SEV_COLOR = {"critical": C_RED, "high": C_RED, "medium": C_YELLOW, "low": C_DIM}
+STATUS_COLOR = {"open": C_YELLOW, "triaged": C_CYAN, "in-progress": C_CYAN,
+                "done": C_DIM, "wontfix": C_DIM, "duplicate": C_DIM}
+
+
+# ── Lock ──────────────────────────────────────────────────────────────────────
+class DirLock:
+    def __enter__(self):
+        os.makedirs(FB_DIR, exist_ok=True)
+        self._fd = open(LOCK_FILE, "w")
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fd.close()
+
+
+# ── Frontmatter (minimal, dependency-free) ────────────────────────────────────
+def parse_entry(path):
+    """Return (meta:dict, body:str) for a feedback file. Tolerant of hand edits."""
+    meta, body_lines, in_fm, fm_done = {}, [], False, False
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError:
+        return {}, ""
+    for i, line in enumerate(lines):
+        s = line.rstrip("\n")
+        if i == 0 and s.strip() == "---":
+            in_fm = True
+            continue
+        if in_fm and not fm_done:
+            if s.strip() == "---":
+                fm_done = True
+                continue
+            m = re.match(r"^(\w+):\s*(.*)$", s)
+            if m:
+                key, val = m.group(1), m.group(2).strip()
+                if val.startswith("[") and val.endswith("]"):
+                    inner = val[1:-1].strip()
+                    meta[key] = [x.strip() for x in inner.split(",") if x.strip()] if inner else []
+                else:
+                    meta[key] = val
+        else:
+            body_lines.append(s)
+    return meta, "\n".join(body_lines).strip()
+
+
+def fmt_list(v):
+    if isinstance(v, list):
+        return "[" + ", ".join(v) + "]"
+    return str(v)
+
+
+def write_entry(path, meta, body):
+    order = ["id", "title", "severity", "status", "tags", "submitter",
+             "hive_version", "task_ids", "created", "updated", "source", "triage_note"]
+    keys = order + [k for k in meta if k not in order]
+    with open(path, "w") as f:
+        f.write("---\n")
+        for k in keys:
+            if k in meta and meta[k] not in (None, ""):
+                f.write(f"{k}: {fmt_list(meta[k])}\n")
+        f.write("---\n\n")
+        f.write(body.strip() + "\n")
+
+
+def slugify(title):
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")
+    return (s or "feedback")[:48]
+
+
+def all_entries():
+    if not os.path.isdir(INBOX_DIR):
+        return []
+    out = []
+    for name in sorted(os.listdir(INBOX_DIR)):
+        if not name.endswith(".md"):
+            continue
+        meta, body = parse_entry(os.path.join(INBOX_DIR, name))
+        meta["_file"] = name
+        meta["_body"] = body
+        out.append(meta)
+    out.sort(key=lambda m: int(m.get("id", 0) or 0))
+    return out
+
+
+def next_id(entries):
+    return max((int(m.get("id", 0) or 0) for m in entries), default=0) + 1
+
+
+# ── Context capture ───────────────────────────────────────────────────────────
+def hive_version():
+    cl = os.path.join(REPO_ROOT, "CHANGELOG.md")
+    try:
+        with open(cl) as f:
+            for line in f:
+                m = re.match(r"^##\s*\[([0-9][^\]]*)\]", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return "unknown"
+
+
+def queue_snapshot():
+    qf = os.path.join(HIVE_DIR, "queue.json")
+    try:
+        with open(qf) as f:
+            tasks = json.load(f).get("tasks", {}).values()
+    except (OSError, json.JSONDecodeError):
+        return None
+    from collections import Counter
+    c = Counter(t.get("state", "?") for t in tasks)
+    return "  ".join(f"{k}:{v}" for k, v in sorted(c.items()))
+
+
+def node_snapshot():
+    nf = os.path.join(HIVE_DIR, "node_monitor.json")
+    try:
+        with open(nf) as f:
+            db = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    from collections import Counter
+    jobs = db.get("jobs", {})
+    c = Counter(j.get("status", "?") for j in jobs.values())
+    return f"updated={db.get('updated','?')}  " + "  ".join(f"{k}:{v}" for k, v in sorted(c.items()))
+
+
+def build_context(task_ids):
+    lines = []
+    lines.append(f"- hive_version: {hive_version()}")
+    qs = queue_snapshot()
+    if qs:
+        lines.append(f"- queue: {qs}")
+    ns = node_snapshot()
+    if ns:
+        lines.append(f"- nodes: {ns}")
+    for tid in task_ids:
+        log = os.path.join(HIVE_DIR, "logs", f"task-{tid}.log")
+        if os.path.exists(log):
+            try:
+                with open(log, errors="replace") as f:
+                    tail = f.readlines()[-15:]
+                lines.append(f"\n<details><summary>task-{tid}.log (tail)</summary>\n\n```\n"
+                             + "".join(tail) + "\n```\n</details>")
+            except OSError:
+                pass
+    return "\n".join(lines)
+
+
+# ── Index ─────────────────────────────────────────────────────────────────────
+def rebuild_index():
+    entries = all_entries()
+    lines = ["# Feedback Index", "",
+             "Auto-generated by `hive feedback`. Do not edit by hand — run any "
+             "`hive feedback` command to refresh.", "",
+             "New reports land in `inbox/`. See [TRIAGE.md](TRIAGE.md) for the "
+             "maintainer workflow and [ROADMAP.md](ROADMAP.md) for the synthesized plan.",
+             "", "| ID | Severity | Status | Title | Tags | Submitter | Created |",
+             "|----|----------|--------|-------|------|-----------|---------|"]
+    open_n = 0
+    for m in entries:
+        st = m.get("status", "open")
+        if st in ("open", "triaged", "in-progress"):
+            open_n += 1
+        tags = ", ".join(m["tags"]) if isinstance(m.get("tags"), list) else (m.get("tags") or "")
+        lines.append("| {id} | {sev} | {st} | {title} | {tags} | {sub} | {created} |".format(
+            id=m.get("id", "?"), sev=m.get("severity", ""), st=st,
+            title=(m.get("title", "") or "").replace("|", "\\|"),
+            tags=tags, sub=m.get("submitter", ""), created=m.get("created", "")[:10]))
+    lines.insert(5, f"\n**{open_n} active (open/triaged/in-progress) / {len(entries)} total**\n")
+    os.makedirs(FB_DIR, exist_ok=True)
+    with open(INDEX_FILE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+def cmd_submit(args):
+    title = args.title
+    body_text = ""
+    if args.file:
+        with open(os.path.expanduser(args.file)) as f:
+            body_text = f.read().strip()
+    elif args.text:
+        body_text = args.text.strip()
+
+    if not title:
+        # Derive a title from the first line of the body for quick submits.
+        title = (body_text.splitlines()[0] if body_text else "untitled")[:80]
+    if not body_text:
+        body_text = title
+
+    severity = args.severity or "medium"
+    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    task_ids = [t.strip() for t in (args.task or "").split(",") if t.strip()]
+
+    with DirLock():
+        os.makedirs(INBOX_DIR, exist_ok=True)
+        entries = all_entries()
+        fid = next_id(entries)
+        created = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        meta = {
+            "id": fid, "title": title, "severity": severity, "status": "open",
+            "tags": tags, "submitter": os.environ.get("USER", "unknown"),
+            "hive_version": hive_version(), "task_ids": task_ids,
+            "created": created, "source": "cli",
+        }
+        ctx = build_context(task_ids)
+        body = body_text + "\n\n## Auto-captured context\n\n" + ctx
+        fname = f"{fid:04d}-{slugify(title)}.md"
+        write_entry(os.path.join(INBOX_DIR, fname), meta, body)
+        rebuild_index()
+
+    print(f"{C_GREEN}✓{C_RESET} Filed feedback #{fid}: {title}")
+    print(f"  {C_DIM}{os.path.join(INBOX_DIR, fname)}{C_RESET}")
+
+
+def cmd_list(args):
+    entries = all_entries()
+    want = args.status
+    if want:
+        entries = [m for m in entries if m.get("status") == want]
+    if not entries:
+        print("No feedback entries." if not want else f"No feedback with status '{want}'.")
+        print(f"{C_DIM}dir: {FB_DIR}{C_RESET}")
+        return
+    print(f"{C_BOLD}  ID  SEV       STATUS       TITLE{C_RESET}")
+    print("  " + "─" * 70)
+    for m in entries:
+        sev = m.get("severity", "")
+        st = m.get("status", "open")
+        sc = SEV_COLOR.get(sev, "")
+        stc = STATUS_COLOR.get(st, "")
+        print(f"  {str(m.get('id','?')):>3}  {sc}{sev:<8}{C_RESET}  "
+              f"{stc}{st:<11}{C_RESET}  {m.get('title','')}")
+    print()
+    print(f"{C_DIM}  {len(entries)} entr{'y' if len(entries)==1 else 'ies'}  ·  dir: {FB_DIR}{C_RESET}")
+
+
+def _find(fid):
+    for m in all_entries():
+        if str(m.get("id")) == str(fid):
+            return m
+    return None
+
+
+def cmd_show(args):
+    m = _find(args.id)
+    if not m:
+        print(f"Feedback #{args.id} not found.", file=sys.stderr)
+        sys.exit(1)
+    path = os.path.join(INBOX_DIR, m["_file"])
+    subprocess.run(["cat", path])
+
+
+def cmd_triage(args):
+    if args.status not in STATUSES:
+        print(f"Invalid status '{args.status}'. Choose from: {', '.join(STATUSES)}", file=sys.stderr)
+        sys.exit(1)
+    with DirLock():
+        m = _find(args.id)
+        if not m:
+            print(f"Feedback #{args.id} not found.", file=sys.stderr)
+            sys.exit(1)
+        path = os.path.join(INBOX_DIR, m["_file"])
+        meta, body = parse_entry(path)
+        meta["status"] = args.status
+        meta["updated"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        if args.note:
+            meta["triage_note"] = args.note
+        write_entry(path, meta, body)
+        rebuild_index()
+    print(f"{C_GREEN}✓{C_RESET} Feedback #{args.id} → {args.status}")
+
+
+def cmd_reindex(args):
+    with DirLock():
+        rebuild_index()
+    print(f"{C_GREEN}✓{C_RESET} Rebuilt {INDEX_FILE}")
+
+
+# ── Parser ────────────────────────────────────────────────────────────────────
+def build_parser():
+    p = argparse.ArgumentParser(prog="hive feedback",
+                                description="Submit & manage hive-cli feedback")
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+
+    ps = sub.add_parser("submit", help="File a new feedback entry")
+    ps.add_argument("text", nargs="?", help="Free-text body (or use --file)")
+    ps.add_argument("--title", "-T", help="Short title (default: first line of body)")
+    ps.add_argument("--severity", "-s", choices=SEVERITIES, help="Severity (default: medium)")
+    ps.add_argument("--tags", help="Comma-separated tags, e.g. scheduler,oom")
+    ps.add_argument("--task", help="Related hive task ids, e.g. 3536,3541")
+    ps.add_argument("--file", "-f", help="Read body from a file")
+
+    pl = sub.add_parser("list", aliases=["ls"], help="List feedback entries")
+    pl.add_argument("--status", "-s", choices=STATUSES, help="Filter by status")
+
+    psh = sub.add_parser("show", help="Show a feedback entry")
+    psh.add_argument("id")
+
+    pt = sub.add_parser("triage", help="Update a feedback entry's status")
+    pt.add_argument("id")
+    pt.add_argument("--status", "-s", required=True, help=f"One of: {', '.join(STATUSES)}")
+    pt.add_argument("--note", "-m", help="Triage note recorded in frontmatter")
+
+    sub.add_parser("reindex", help="Rebuild INDEX.md")
+    return p
+
+
+def main():
+    argv = sys.argv[1:]
+    # Bare quick-submit:  hive feedback "some text"  (no subcommand)
+    known = {"submit", "list", "ls", "show", "triage", "reindex",
+             "-h", "--help"}
+    if argv and argv[0] not in known:
+        ns = argparse.Namespace(command="submit", text=" ".join(argv), title=None,
+                                severity=None, tags=None, task=None, file=None)
+        cmd_submit(ns)
+        return
+
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+    if args.command == "submit":
+        cmd_submit(args)
+    elif args.command in ("list", "ls"):
+        cmd_list(args)
+    elif args.command == "show":
+        cmd_show(args)
+    elif args.command == "triage":
+        cmd_triage(args)
+    elif args.command == "reindex":
+        cmd_reindex(args)
+
+
+if __name__ == "__main__":
+    main()

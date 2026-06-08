@@ -7,8 +7,11 @@ USER="${USER:-$(whoami)}"
 HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
 DB_DIR="$HIVE_DIR"
 DB_FILE="${HIVE_DIR}/node_monitor.json"
-DB_TMP="${DB_FILE}.tmp"
+DB_TMP="${DB_FILE}.$$.tmp"          # PID-scoped so concurrent writers don't clobber (feedback OPT-C)
+DB_LOCK="${DB_FILE}.lock"
 POLL_TMPDIR="/tmp/hive_poll_$$"
+_LIBEXEC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DBPOST_BIN="${_LIBEXEC}/hive-dbpost"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -70,9 +73,34 @@ json_escape() {
     printf '%s' "$s"
 }
 
+slurm_time_to_secs() {
+    # SLURM TimeLeft (%L): [D-]HH:MM:SS / HH:MM:SS / MM:SS / UNLIMITED / N/A.
+    # Emits a JSON token (no quotes): integer seconds, -1 for UNLIMITED, or null.
+    local t="$1"
+    case "$t" in
+        UNLIMITED|unlimited|INFINITE|infinite) printf '%s' '-1'; return ;;
+        ''|N/A|n/a|INVALID|NOT_SET)           printf 'null';     return ;;
+    esac
+    local days=0
+    if [[ "$t" == *-* ]]; then days="${t%%-*}"; t="${t#*-}"; fi
+    local IFS=':'; local -a p; read -ra p <<< "$t"
+    local h=0 m=0 s=0
+    if (( ${#p[@]} == 3 )); then
+        h=$(( 10#${p[0]:-0} )); m=$(( 10#${p[1]:-0} )); s=$(( 10#${p[2]:-0} ))
+    elif (( ${#p[@]} == 2 )); then
+        m=$(( 10#${p[0]:-0} )); s=$(( 10#${p[1]:-0} ))
+    elif (( ${#p[@]} == 1 )); then
+        s=$(( 10#${p[0]:-0} ))
+    else
+        printf 'null'; return
+    fi
+    days=$(( 10#${days:-0} ))
+    printf '%s' "$(( days*86400 + h*3600 + m*60 + s ))"
+}
+
 # ── probe a single job (runs in background subshell) ─────────────────────────
 probe_job() {
-    local jobid="$1" node="$2" partition="$3" elapsed_raw="$4"
+    local jobid="$1" node="$2" partition="$3" elapsed_raw="$4" time_left_secs="${5:-null}"
     local outfile="${POLL_TMPDIR}/${jobid}.json"
     local polled_at
     polled_at=$(date -u '+%Y-%m-%dT%H:%M:%S')
@@ -94,9 +122,21 @@ probe_job() {
     local probe_cmd
     probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
-    local raw
+    # Run the probe; retry once on a transient failure (empty output, non-zero
+    # exit, or missing ---PS--- marker = srun never executed our command). This
+    # distinguishes "probe failed" from "GPU genuinely idle" (feedback OPT-A).
+    local raw rc
     raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
-        bash -c "$probe_cmd" 2>/dev/null)
+        bash -c "$probe_cmd" 2>/dev/null); rc=$?
+    if [[ $rc -ne 0 || -z "$raw" || "$raw" != *"---PS---"* ]]; then
+        sleep 1
+        raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
+            bash -c "$probe_cmd" 2>/dev/null); rc=$?
+    fi
+    local probe_failed=0
+    if [[ $rc -ne 0 || -z "$raw" || "$raw" != *"---PS---"* ]]; then
+        probe_failed=1
+    fi
 
     # ── parse both sections in one pass ──────────────────────────────────────
     local in_ps=0
@@ -162,8 +202,12 @@ probe_job() {
     # unreliable on multi-GPU nodes with multiple hold jobs — DO NOT use it
     # for status. GPU data from nvidia-smi is reliable (CUDA_VISIBLE_DEVICES
     # is properly scoped per job by SLURM). processes[] is kept for display only.
+    #   probe_failed — the srun --overlap probe could not be run (NOT idle/cpu).
+    #                   hive-dbpost may carry forward the last-good state.
     local status
-    if (( max_gpu_total == 0 )); then
+    if (( probe_failed )); then
+        status="probe_failed"
+    elif (( max_gpu_total == 0 )); then
         status="cpu"
     elif (( max_gpu_util >= 5 || max_gpu_mem >= 500 )); then
         status="busy"
@@ -182,6 +226,7 @@ probe_job() {
   "processes": [${ps_json}],
   "status": "${status}",
   "gpu_idle_since": null,
+  "time_left_secs": ${time_left_secs},
   "polled_at": "${polled_at}"
 }
 EOF
@@ -195,9 +240,20 @@ main() {
     mkdir -p "$DB_DIR"
     mkdir -p "$POLL_TMPDIR"
 
-    # Query running jobs (skip cursor_ssh_proxy)
+    # Serialize writers to node_monitor.json (feedback OPT-C). If another poll /
+    # the daemon already holds the lock, a second concurrent poll is redundant —
+    # exit immediately rather than racing on the final mv.
+    exec 9>"$DB_LOCK"
+    if ! flock -n 9; then
+        log "Another poll is already in progress — exiting."
+        rm -rf "$POLL_TMPDIR"
+        return
+    fi
+
+    # Query running jobs (skip cursor_ssh_proxy). %L = TimeLeft (remaining walltime)
+    # so the scheduler can avoid placing long tasks on a soon-expiring node.
     local squeue_out
-    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M" 2>/dev/null \
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L" 2>/dev/null \
         | grep -v cursor_ssh_proxy)
 
     if [[ -z "$squeue_out" ]]; then
@@ -213,18 +269,19 @@ main() {
 
     # Launch parallel probes
     local job_ids=()
-    declare -A JOB_NODE JOB_PART JOB_ELAPSED
+    declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT
 
-    while IFS='|' read -r jobid node partition elapsed; do
+    while IFS='|' read -r jobid node partition elapsed timeleft; do
         jobid="${jobid// /}"; node="${node// /}"
-        partition="${partition// /}"; elapsed="${elapsed// /}"
+        partition="${partition// /}"; elapsed="${elapsed// /}"; timeleft="${timeleft// /}"
         [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
         job_ids+=("$jobid")
         JOB_NODE["$jobid"]="$node"
         JOB_PART["$jobid"]="$partition"
         JOB_ELAPSED["$jobid"]="$elapsed"
-        log "Probing job $jobid on $node ($partition) elapsed=$elapsed ..."
-        probe_job "$jobid" "$node" "$partition" "$elapsed" &
+        JOB_TIMELEFT["$jobid"]="$(slurm_time_to_secs "$timeleft")"
+        log "Probing job $jobid on $node ($partition) elapsed=$elapsed left=${timeleft:-?} ..."
+        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" &
     done <<< "$squeue_out"
 
     # Wait up to 30s for all probes
@@ -252,7 +309,26 @@ main() {
         local first=1
         for jid in "${job_ids[@]}"; do
             local frag="${POLL_TMPDIR}/${jid}.json"
-            [[ ! -f "$frag" ]] && continue
+            # probe subshell was reaped before writing — emit an explicit
+            # probe_failed fallback instead of silently dropping the node
+            # (feedback OPT-A: a missing node is invisible to the scheduler).
+            if [[ ! -f "$frag" ]]; then
+                local fb_polled; fb_polled=$(date -u '+%Y-%m-%dT%H:%M:%S')
+                local fb_elapsed; fb_elapsed=$(fmt_elapsed_slurm "${JOB_ELAPSED[$jid]:-0:00}")
+                cat > "$frag" <<FBEOF
+"${jid}": {
+  "node": "$(json_escape "${JOB_NODE[$jid]}")",
+  "partition": "$(json_escape "${JOB_PART[$jid]}")",
+  "job_elapsed": "$(json_escape "$fb_elapsed")",
+  "gpu": [],
+  "processes": [],
+  "status": "probe_failed",
+  "gpu_idle_since": null,
+  "time_left_secs": ${JOB_TIMELEFT[$jid]:-null},
+  "polled_at": "${fb_polled}"
+}
+FBEOF
+            fi
             (( first == 0 )) && printf ',\n'
             # Each fragment line gets 4-space indent
             while IFS= read -r fline; do
@@ -269,78 +345,12 @@ main() {
 
     mv "$DB_TMP" "$DB_FILE"
 
-    # ── Apply gpu_idle_since timer (warning after 3min of busy→idle transition) ──
-    # Trigger: job was BUSY in previous poll, now shows IDLE (GPU dropped to 0).
-    # This catches the "model loaded, then GPU went silent" failure pattern.
-    # Relies on transition, NOT on ps processes (which are node-wide and unreliable).
-    python3 - "$DB_FILE" "$OLD_DB_CONTENT_FILE" << 'PYEOF'
-import json, time, sys, os
-
-db_file   = sys.argv[1]
-old_file  = sys.argv[2]  # path to temp file holding old DB content
-WARN_SECS = 180          # 3 minutes grace before warning
-
-try:
-    new_db = json.load(open(db_file))
-except Exception:
-    sys.exit(0)
-
-try:
-    old_db = json.load(open(old_file)) if os.path.exists(old_file) else {"jobs": {}}
-except Exception:
-    old_db = {"jobs": {}}
-
-now = time.time()
-changed = False
-
-for jid, job in new_db["jobs"].items():
-    new_status = job.get("status")
-    old_job    = old_db["jobs"].get(jid, {})
-    old_status = old_job.get("status")
-
-    if new_status == "idle":
-        # WARNING semantics:
-        #   "Job is still running, previously had a real model loaded (GPU mem ≥500MB),
-        #    now GPU has been empty for >3 min — needs investigation."
-        #
-        # Two-stage check to handle multi-poll grace correctly:
-        #   Stage 1 (timer already running): old_since is set → keep counting.
-        #     Do NOT re-check old gpu mem here — DB already shows 0G from last poll.
-        #   Stage 2 (first transition): old_since is None, previous poll had ≥500MB
-        #     → this is the first idle poll after real work; start the timer.
-        #   Otherwise: GPU was always near-zero → IDLE immediately (hold jobs, etc.)
-        old_since   = old_job.get("gpu_idle_since")
-        old_max_mem = max((g.get("mem_used", 0) for g in old_job.get("gpu", [])), default=0)
-
-        if old_since is not None:
-            # Timer already running from a previous poll — continue counting
-            if now - old_since >= WARN_SECS:
-                job["gpu_idle_since"] = old_since
-                job["status"] = "warning"
-            else:
-                job["gpu_idle_since"] = old_since
-                job["status"] = "busy"
-            changed = True
-        elif old_status in ("busy", "warning") and old_max_mem >= 500:
-            # First idle poll after real GPU work — start grace timer
-            job["gpu_idle_since"] = now
-            job["status"] = "busy"
-            changed = True
-        else:
-            # GPU was always near-zero (no model loaded) — IDLE immediately
-            if job.get("gpu_idle_since") is not None:
-                job["gpu_idle_since"] = None
-                changed = True
-    else:
-        # busy or cpu → clear the timer
-        if job.get("gpu_idle_since") is not None:
-            job["gpu_idle_since"] = None
-            changed = True
-
-if changed:
-    with open(db_file, 'w') as f:
-        json.dump(new_db, f, indent=2)
-PYEOF
+    # Post-process: busy→idle warning grace timer + carry-forward of last-good
+    # state for probe_failed jobs. Shared with hive-daemon via hive-dbpost so the
+    # two pollers can't drift apart (feedback OPT-A).
+    if [[ -x "$DBPOST_BIN" ]]; then
+        python3 "$DBPOST_BIN" "$DB_FILE" "$OLD_DB_CONTENT_FILE" 2>/dev/null || true
+    fi
 
     rm -rf "$POLL_TMPDIR"
     log "DB written: $DB_FILE  (${#job_ids[@]} jobs)"

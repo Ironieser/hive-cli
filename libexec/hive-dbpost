@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""hive-dbpost — post-process node_monitor.json after a poll/daemon cycle.
+
+Usage:  hive-dbpost <new_db> <old_db>
+
+Shared by hive-poll AND hive-daemon so both produce identical state semantics
+(the old code duplicated only part of this in hive-poll, so `hive poll` and the
+daemon disagreed — see feedback OPT-A / SESSION#1).
+
+Two transforms, applied per job:
+
+1. busy→idle WARNING grace timer (`gpu_idle_since`): a job that had a real model
+   loaded (GPU mem ≥500MB) and then went quiet is held as `busy` for WARN_SECS
+   before flipping to a true `idle`, so a brief GPU dip doesn't churn the table.
+
+2. CARRY-FORWARD on probe failure: a job whose probe just failed
+   (`status == "probe_failed"`) keeps its last *good* state (idle/busy/cpu) if that
+   reading is younger than CARRY_MAX_AGE. This stops a single transient
+   `srun --overlap` miss from stranding an otherwise-idle GPU for a whole poll
+   cycle. The carried record is flagged `carried_forward: true` and keeps its
+   original `polled_at` so staleness stays visible; the scheduler still
+   verifies-before-dispatch (see hive-sched).
+"""
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+WARN_SECS     = 180     # grace before busy→idle becomes a warning
+CARRY_MAX_AGE = 1800    # carry a last-good state forward up to 30 min of failures
+
+GOOD_STATES = ("idle", "busy", "cpu", "warning")
+
+
+def _age_seconds(iso):
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except ValueError:
+        return None
+
+
+def main():
+    if len(sys.argv) < 3:
+        return
+    new_file, old_file = sys.argv[1], sys.argv[2]
+
+    try:
+        new_db = json.load(open(new_file))
+    except (OSError, json.JSONDecodeError):
+        return
+    try:
+        old_db = json.load(open(old_file)) if os.path.exists(old_file) else {"jobs": {}}
+    except (OSError, json.JSONDecodeError):
+        old_db = {"jobs": {}}
+
+    old_jobs = old_db.get("jobs", {})
+    now = time.time()
+    changed = False
+
+    for jid, job in new_db.get("jobs", {}).items():
+        old_job = old_jobs.get(jid, {})
+        status  = job.get("status")
+
+        # ── (1) Carry-forward on probe failure ───────────────────────────────
+        if status == "probe_failed":
+            old_status = old_job.get("status")
+            old_age    = _age_seconds(old_job.get("polled_at"))
+            if (old_status in GOOD_STATES
+                    and old_age is not None and old_age <= CARRY_MAX_AGE):
+                job["gpu"]            = old_job.get("gpu", [])
+                job["processes"]      = old_job.get("processes", [])
+                job["status"]         = old_status
+                job["gpu_idle_since"] = old_job.get("gpu_idle_since")
+                job["carried_forward"] = True
+                job["probe_failed_at"] = job.get("polled_at")
+                job["polled_at"]       = old_job.get("polled_at")  # keep last-good stamp
+                changed = True
+            # else: leave it as probe_failed (genuinely lost / long outage)
+            continue
+
+        # A fresh successful probe — make sure stale carry flags don't linger.
+        if job.get("carried_forward"):
+            job.pop("carried_forward", None)
+            job.pop("probe_failed_at", None)
+            changed = True
+
+        # ── (2) busy→idle warning grace timer ────────────────────────────────
+        if status == "idle":
+            old_since   = old_job.get("gpu_idle_since")
+            old_status  = old_job.get("status")
+            old_max_mem = max((g.get("mem_used", 0) for g in old_job.get("gpu", [])),
+                              default=0)
+            if old_since is not None:
+                job["gpu_idle_since"] = old_since
+                job["status"] = "warning" if (now - old_since >= WARN_SECS) else "busy"
+                changed = True
+            elif old_status in ("busy", "warning") and old_max_mem >= 500:
+                job["gpu_idle_since"] = now
+                job["status"] = "busy"
+                changed = True
+            else:
+                if job.get("gpu_idle_since") is not None:
+                    job["gpu_idle_since"] = None
+                    changed = True
+        else:
+            # busy / cpu / probe_failed-resolved → clear the timer
+            if job.get("gpu_idle_since") is not None:
+                job["gpu_idle_since"] = None
+                changed = True
+
+    if changed:
+        tmp = new_file + f".post.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(new_db, f, indent=2)
+        os.replace(tmp, new_file)
+
+
+if __name__ == "__main__":
+    main()

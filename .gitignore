@@ -4,3 +4,11 @@ __pycache__/
 # User-local config — never commit these
 pool_config.json
 *.local.json
+
+# SLURM hold-job stdout dumped into the repo cwd by `sbatch` (see feedback SESSION#9).
+# Kept on disk, just not tracked. `hive pool add` now redirects these to
+# $HIVE_DIR/pool-logs/ so new hold jobs won't land here.
+slurm-*.out
+
+# feedback runtime lock; inbox/*.md entries ARE tracked (see feedback/TRIAGE.md)
+feedback/.feedback.lock

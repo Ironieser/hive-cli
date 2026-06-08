@@ -11,7 +11,7 @@ Personal GPU node pool manager for SLURM clusters. Designed for agentic workflow
                         │   ~/.hive/ (shared Lustre)   │
                         │                              │
   hive-daemon  ─poll──▶ │  node_monitor.json           │
-  (120s loop)           │                              │
+  (900s loop)           │                              │
                         │  queue.json  ◀─ flock ─┐    │
   hive-sched   ─read──▶ │  queue.lock            │    │
   (30s loop)            │  sched.heartbeat       │    │
@@ -29,7 +29,7 @@ Personal GPU node pool manager for SLURM clusters. Designed for agentic workflow
 **Key design points:**
 
 - `~/.hive/` lives on the shared filesystem (Lustre/NFS) — readable/writable from any node
-- `node_monitor.json` is updated every 120s by `hive-daemon` (one per user, on any node)
+- `node_monitor.json` is updated every 900s by `hive-daemon` (one per user, on any node)
 - `queue.json` is protected by `fcntl.flock` so concurrent agents can submit safely
 - `hive-sched` dispatches tasks via `srun --overlap`, which enters the node's existing cgroup
 - Heartbeat file is written every 30s inside the running task wrapper; scheduler detects crashes at 5 min silence
@@ -204,7 +204,7 @@ Sends SIGUSR1 to the running daemon. Results appear in `node_monitor.json` withi
 
 ## `hive daemon` — Node Monitor Daemon
 
-Background bash process that probes all hold jobs every 120s via `srun --overlap`.
+Background bash process that probes all hold jobs every 900s via `srun --overlap`.
 
 ```bash
 hive daemon start      # start (auto-started by hive nodes if not running)
@@ -481,7 +481,7 @@ Footer shows: idle nodes in each partition, QOS blocks, reasons your pending job
 ```
 ~/.hive/
 ├── pool_config.json        # preset sbatch scripts (local only, not in git)
-├── node_monitor.json       # live node state (written by hive-daemon every 120s)
+├── node_monitor.json       # live node state (written by hive-daemon every 900s)
 ├── node_monitor.pid        # hive-daemon PID
 ├── node_monitor.log        # daemon log (rolling 500 lines)
 ├── queue.json              # task queue DB (written by hive-sched + hive-queue)

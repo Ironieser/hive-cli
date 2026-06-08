@@ -38,7 +38,7 @@
                    │   hive-daemon       │─────────────┘
                    │   (background)      │  SIGUSR1 = poll now
                    │                     │
-                   │  loop every 120s:   │
+                   │  loop every 900s:   │
                    │  ┌───────────────┐  │
                    │  │ squeue -t R   │  │
                    │  │ for each job: │  │
@@ -99,7 +99,7 @@ SLURM cluster
 ## State Files (`~/.hive/`)
 
 ```
-node_monitor.json    # DB written by daemon/poll, read by nodes/top
+node_monitor.json    # DB written by daemon/poll (+ hive-dbpost), read by nodes/top/sched
 {
   "updated": "ISO8601",
   "jobs": {
@@ -109,20 +109,60 @@ node_monitor.json    # DB written by daemon/poll, read by nodes/top
       "job_elapsed": "3d13h",
       "gpu": [{"index":0, "util":87, "mem_used":42301, "mem_total":81920}],
       "processes": [{"pid":1234, "cpu":242, "mem":5.4, "elapsed":"1d2h", "cmd":"python ..."}],
-      "status": "busy|idle|unknown",
+      "status": "idle|busy|warning|cpu|probe_failed",   # see docs/status_model.md
+      "gpu_idle_since": null,                            # busy→idle grace timer
+      "carried_forward": true,                           # (optional) last-good reused after a probe miss
+      "time_left_secs": 79200,                           # remaining hold-job walltime (squeue %L); -1=unlimited, null=unknown
       "polled_at": "ISO8601"
     }
   }
 }
 
-node_monitor.pid     # daemon PID (validated with kill -0 before use)
-node_monitor.log     # daemon log, rolling 500 lines
+node_monitor.json.lock   # flock serializing concurrent pollers (poll + daemon)
+node_monitor.pid         # daemon PID (validated with kill -0 before use)
+node_monitor.log         # daemon log, rolling 500 lines
+pool-logs/slurm-<id>.out # hold-job stdout (redirected by `hive pool add`)
+
+events.jsonl             # durable append-only task lifecycle log (hive_events.py)
+{"ts":"…","event":"submit",  "task":5,"name":"train","est_runtime_secs":7200}
+{"ts":"…","event":"dispatch","task":5,"node":"evc23","slurm_jobid":"584954","node_time_left_secs":45000}
+{"ts":"…","event":"finish",  "task":5,"state":"done","run_secs":4332,"queued_secs":192}
+{"ts":"…","event":"requeue", "task":6,"reason":"infra_failure","checkpoint_lost":true}
+# append-only timing history (run/queue durations); survives queue.json pruning.
+# read by `hive stats` + `--est-runtime auto`; appends serialized by queue.lock.
+# bounded: auto-trimmed to the recent tail past ~4 MB (hive_events.py), so it can't
+# grow without limit and reads stay cheap (stats/estimates reflect recent history).
 ```
+
+> **Status semantics & dispatch gating are specified in
+> [status_model.md](status_model.md).** Probe failures become `probe_failed`
+> (never `cpu`/`busy`); the scheduler verifies uncertain nodes with a live probe and
+> gates dispatch on a GPU-clean / free-mem check rather than trusting `status`
+> blindly.
+
+## Cluster-singleton daemons (multi-node safety)
+
+`~/.hive` is on the shared filesystem and agents may invoke hive from **different**
+nodes. Both daemons are therefore **cluster-wide singletons**, coordinated over the
+shared FS rather than with host-local PID checks (which would let every node spawn its
+own copy — feedback C5):
+
+| | scheduler `hive-sched` | poller `hive-daemon` |
+|---|---|---|
+| PID file | `sched.pid` = `<pid>\n<host>` | `node_monitor.pid` = `<pid>\n<host>` |
+| heartbeat | `sched.heartbeat` (30s) | `node_monitor.heartbeat` (~30s) |
+| "running?" | heartbeat fresh (any node) **or** same-host PID alive | same |
+| force action | — | `node_monitor.poll-request` file → immediate poll |
+| remote stop | SIGTERM same-host | `node_monitor.stop-request` file (honored each tick) |
+
+SIGUSR1 is kept only as a same-host fast path for forcing a re-poll; the request files
+are what make it work across nodes. Result: one queue, one scheduler, one poller for the
+whole cluster regardless of how many agents/nodes call hive.
 
 ## Node Probing Mechanism
 
 ```
-hive-daemon (every 120s)
+hive-daemon (every 900s)
   │
   ├── squeue -u $USER -t R  →  job list (jobid|node|partition|elapsed)
   │
@@ -135,11 +175,17 @@ hive-daemon (every 120s)
         │
         ├── parse nvidia-smi → gpu[] array
         ├── parse ps → processes[] array (filter: sleep/bash/srun noise)
-        ├── status = "busy" if any real process found, else "idle"
+        ├── status from GPU only: busy if util≥5 or mem≥500MiB; cpu if no GPU;
+        │      probe_failed if the probe returned nothing (after one retry); else idle
         └── write /tmp/hive_daemon_PID/jobid.json
       
-  atomic: cat all frags → .json.tmp → mv → node_monitor.json
+  flock(node_monitor.json.lock); cat all frags → .json.$$.tmp → mv → node_monitor.json
+  then hive-dbpost: apply busy→idle warning timer + carry-forward of probe_failed jobs
 ```
+
+The scheduler (`hive-sched`) does **not** trust `status` blindly: see
+[status_model.md](status_model.md) for verify-before-dispatch, the GPU-clean gate,
+`pending_reason`, the starvation watchdog, and crash-safe dispatch.
 
 ## Environment Variables
 

@@ -29,11 +29,17 @@ QUEUE_LOCK    = os.path.join(HIVE_DIR, "queue.lock")
 SCHED_PID     = os.path.join(HIVE_DIR, "sched.pid")
 SCHED_LOG     = os.path.join(HIVE_DIR, "sched.log")
 SCHED_HB      = os.path.join(HIVE_DIR, "sched.heartbeat")
+SCHED_START_LOCK = os.path.join(HIVE_DIR, "sched.start.lock")
 LOG_DIR       = os.path.join(HIVE_DIR, "logs")
+HEARTBEAT_DIR = os.path.join(HIVE_DIR, "heartbeat")
 
 LIBEXEC_DIR = os.path.dirname(os.path.realpath(__file__))
 SCHED_BIN   = os.path.join(LIBEXEC_DIR, "hive-sched")
 PYTHON      = sys.executable  # same interpreter (vlm conda env)
+
+# Shared append-only event log (durable timing/runtime history).
+sys.path.insert(0, LIBEXEC_DIR)
+import hive_events as ev
 
 HEARTBEAT_DAEMON_TIMEOUT = 90   # 3× poll interval → daemon considered dead
 
@@ -121,6 +127,90 @@ def fmt_elapsed(seconds):
     return f"{d}d{h:02d}h"
 
 
+def parse_duration(s):
+    """Parse a human runtime estimate into seconds. Accepts:
+        '3600' (bare = secs), '45s', '30m', '2h', '1d', '2h30m',
+        '12:00:00', '90:00', '1-12:00:00' (SLURM clock).
+    Returns int seconds, or None if unparseable."""
+    if s is None:
+        return None
+    s = str(s).strip().lower()
+    if not s:
+        return None
+    if ":" in s:                              # SLURM-style [D-]HH:MM:SS / MM:SS
+        days, rest = 0, s
+        if "-" in rest:
+            d, rest = rest.split("-", 1)
+            try:
+                days = int(d)
+            except ValueError:
+                return None
+        try:
+            parts = [int(p) for p in rest.split(":")]
+        except ValueError:
+            return None
+        if len(parts) == 3:
+            h, m, sec = parts
+        elif len(parts) == 2:
+            h, m, sec = 0, parts[0], parts[1]
+        elif len(parts) == 1:
+            h, m, sec = 0, 0, parts[0]
+        else:
+            return None
+        return days * 86400 + h * 3600 + m * 60 + sec
+    total, matched = 0, False               # unit-suffixed: 2h30m / 90m / 45s / 1d
+    for num, unit in re.findall(r'(\d+)\s*([dhms])', s):
+        matched = True
+        total += int(num) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
+    if matched:
+        return total
+    if re.fullmatch(r'\d+', s):             # bare integer = seconds
+        return int(s)
+    return None
+
+
+def _percentile(sorted_vals, pct):
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    rank = pct / 100.0 * (len(sorted_vals) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    return int(round(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (rank - lo)))
+
+
+def runs_by_name():
+    """{name: [run_secs, ...]} merging the durable event log (survives prune) with any
+    `done` tasks still in queue.json, deduped by task id (event log preferred)."""
+    merged = {}   # task_id -> (name, run_secs)
+    try:
+        for tid, (nm, rs) in ev.done_runs().items():
+            merged[tid] = (nm, rs)
+    except Exception:
+        pass
+    for t in load_queue().get("tasks", {}).values():
+        if t.get("state") == "done" and isinstance(t.get("duration_secs"), int) \
+                and t["duration_secs"] > 0:
+            merged.setdefault(t["id"], (t.get("name") or "", t["duration_secs"]))
+    by_name = {}
+    for _tid, (nm, rs) in merged.items():
+        by_name.setdefault(nm, []).append(rs)
+    return by_name
+
+
+def history_estimate(name):
+    """Conservative runtime estimate (secs) for a task name from completed history:
+    the p90 of past `done` run durations. Returns (est_secs, sample_n); (None, 0) if no
+    history. p90 (not mean) so the estimate covers near-worst-case walltime."""
+    if not name:
+        return None, 0
+    durs = sorted(runs_by_name().get(name, []))
+    if not durs:
+        return None, 0
+    return _percentile(durs, 90), len(durs)
+
+
 def task_elapsed(task):
     now = datetime.now()
     state = task["state"]
@@ -178,6 +268,13 @@ def parse_hive_file(path):
             pass
     if "name" in meta:
         result["name"] = meta["name"]
+    if "need_mb" in meta:
+        try:
+            result["need_mb"] = int(meta["need_mb"])
+        except ValueError:
+            pass
+    if "est_runtime" in meta:
+        result["est_runtime"] = meta["est_runtime"]   # parsed/resolved in cmd_submit
 
     return result
 
@@ -199,22 +296,23 @@ def read_sched_pid():
 
 def is_sched_running():
     pid, host = read_sched_pid()
-    if pid is None:
-        return False
 
-    # Check heartbeat file — works cross-node since it's on shared FS
-    if os.path.exists(SCHED_HB):
-        age = time.time() - os.path.getmtime(SCHED_HB)
-        if age < HEARTBEAT_DAEMON_TIMEOUT:
-            return True
-
-    # On same host: check PID directly
-    if host and host == socket.gethostname():
+    # If the scheduler is recorded on THIS host, the live PID is authoritative —
+    # detect a killed scheduler immediately rather than trusting a stale-but-recent
+    # heartbeat (which would block a restart for up to HEARTBEAT_DAEMON_TIMEOUT and
+    # mask an unexpected death).
+    if pid is not None and (not host or host == socket.gethostname()):
         try:
             os.kill(pid, 0)
             return True
         except (ProcessLookupError, PermissionError):
-            pass
+            return False
+
+    # Different (or unknown) host: rely on the shared-FS heartbeat freshness.
+    if os.path.exists(SCHED_HB):
+        age = time.time() - os.path.getmtime(SCHED_HB)
+        if age < HEARTBEAT_DAEMON_TIMEOUT:
+            return True
 
     return False
 
@@ -223,20 +321,45 @@ def cmd_daemon(args):
     sub = args.subcmd if hasattr(args, 'subcmd') else "status"
 
     if sub == "start":
-        if is_sched_running():
-            pid, _ = read_sched_pid()
-            print(f"hive-sched is already running (PID {pid})")
-            return
         os.makedirs(HIVE_DIR, exist_ok=True)
-        proc = subprocess.Popen(
-            [PYTHON, SCHED_BIN],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        time.sleep(0.6)
-        print(f"hive-sched started (PID {proc.pid})")
+        # Atomic start mutex: when many agents `hive submit` simultaneously with no
+        # scheduler yet running, a plain check-then-start (TOCTOU) lets each spawn its
+        # own hive-sched. An flock serializes the check+start so only one wins.
+        # flock is always same-node-atomic; cross-node-atomic where the shared FS
+        # honors it. We also publish liveness immediately so racers bail fast.
+        lock_fd = open(SCHED_START_LOCK, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("hive-sched start already in progress on another agent")
+            lock_fd.close()
+            return
+        try:
+            if is_sched_running():
+                pid, _ = read_sched_pid()
+                print(f"hive-sched is already running (PID {pid})")
+                return
+            proc = subprocess.Popen(
+                [PYTHON, SCHED_BIN],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            # Publish pid+host and a heartbeat NOW (the child also writes these, but
+            # not until it boots) so a concurrent starter sees "running" immediately.
+            try:
+                with open(SCHED_PID, "w") as f:
+                    f.write(f"{proc.pid}\n{socket.gethostname()}\n")
+                with open(SCHED_HB, "w") as f:
+                    f.write(now_iso())
+            except OSError:
+                pass
+            time.sleep(0.6)
+            print(f"hive-sched started (PID {proc.pid})")
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     elif sub == "stop":
         pid, _ = read_sched_pid()
@@ -311,6 +434,39 @@ def cmd_submit(args):
     if args.name:
         spec["name"] = args.name
 
+    if getattr(args, "need_mb", None) is not None:
+        spec["need_mb"] = args.need_mb
+
+    # Runtime estimate (drives walltime-aware scheduling). Source priority:
+    # CLI --est-runtime > #HIVE est_runtime=. Value 'auto' resolves from history.
+    est_raw = None
+    if getattr(args, "est_runtime", None) is not None:
+        est_raw = args.est_runtime
+    elif "est_runtime" in spec:
+        est_raw = spec["est_runtime"]
+
+    # Resolve the estimate BEFORE taking the queue lock — history_estimate() scans
+    # events.jsonl + queue.json (reads only), and a few seconds of staleness in that
+    # history is harmless. Keeping it out of the lock avoids holding queue.lock during a
+    # potentially large history scan (review #2).
+    est_secs, est_source = None, None
+    if est_raw is not None:
+        if str(est_raw).strip().lower() == "auto":
+            est_secs, n = history_estimate(spec.get("name", ""))
+            if est_secs:
+                est_source = "history"
+                print(f"(auto estimate from {n} past '{spec.get('name')}' run(s))")
+            else:
+                print("(no runtime history for this name yet — "
+                      "submitting without an estimate)")
+        else:
+            est_secs = parse_duration(est_raw)
+            if est_secs:
+                est_source = "user"
+            else:
+                print(f"{C_YELLOW}Warning:{C_RESET} could not parse "
+                      f"--est-runtime '{est_raw}'; ignoring.")
+
     with QueueLock() as lfd:
         queue = load_queue(lfd)
         task_id = queue["next_id"]
@@ -330,12 +486,26 @@ def cmd_submit(args):
             "node":         None,
             "srun_pid":     None,
             "exit_code":    None,
+            "need_mb":      spec.get("need_mb", 0),
+            "est_runtime_secs":    est_secs,
+            "est_source":          est_source,
+            "requeue_count":       0,
+            "checkpoint_warning":  False,
+            "node_time_left_secs": None,
+            "duration_secs":       None,
+            "queued_secs":         None,
             "log":          os.path.join(LOG_DIR, f"task-{task_id}.log"),
         }
         queue["tasks"][str(task_id)] = task
         save_queue(queue, lfd)
+        ev.record("submit", task=task_id, name=spec.get("name") or None,
+                  est_runtime_secs=est_secs, need_mb=spec.get("need_mb") or None,
+                  priority=spec.get("priority") or None)
 
     print(f"Submitted task #{task_id}")
+    if est_secs:
+        print(f"  runtime estimate: {fmt_elapsed(est_secs)} (source: {est_source}) — "
+              f"scheduler will avoid nodes with < estimate + 10m walltime left")
 
     # Auto-start scheduler daemon if not running
     if not is_sched_running():
@@ -345,7 +515,21 @@ def cmd_submit(args):
 
 # ── List ──────────────────────────────────────────────────────────────────────
 
-DONE_HIDE_HOURS = 24   # hide done tasks older than this by default
+DONE_HIDE_DAYS_DEFAULT = 7   # default window: hide terminal tasks finished > N days ago
+
+
+def _date_label(d):
+    """Calendar-date group header label: 'Today  06-08', else 'MM-DD' (or 'YYYY-MM-DD'
+    in another year)."""
+    if d is None:
+        return "no finish date"
+    today = datetime.now().date()
+    md = d.strftime('%m-%d') if d.year == today.year else d.strftime('%Y-%m-%d')
+    if d == today:
+        return f"Today  {md}"
+    if d == today - timedelta(days=1):
+        return f"Yesterday  {md}"
+    return md
 
 
 def cmd_list(args):
@@ -353,91 +537,129 @@ def cmd_list(args):
     all_tasks = list(queue.get("tasks", {}).values())
 
     filter_state = args.state.lower() if args.state else None
-    if filter_state:
-        all_tasks = [t for t in all_tasks if t["state"] == filter_state]
+    show_all     = getattr(args, "all", False)
+    days         = getattr(args, "days", None) or DONE_HIDE_DAYS_DEFAULT
 
-    # Filter: hide old done tasks unless --all or --state is explicitly set
+    # ── Windowing: keep active (running/pending) always; hide terminal tasks
+    # finished more than `days` ago unless --all / --state is set. ────────────────
     hidden_count = 0
-    if not getattr(args, "all", False) and not filter_state:
-        cutoff = datetime.now() - timedelta(hours=DONE_HIDE_HOURS)
-        visible, hidden = [], []
+    cutoff = None
+    if filter_state:
+        tasks = [t for t in all_tasks if t["state"] == filter_state]
+    elif show_all:
+        tasks = all_tasks
+    else:
+        cutoff = datetime.now() - timedelta(days=days)
+        visible = []
         for t in all_tasks:
-            if t["state"] == "done":
-                finished = parse_iso(t.get("finished_at"))
-                if finished is not None and finished < cutoff:
-                    hidden.append(t)
+            if t["state"] in TERMINAL_STATES:
+                fin = parse_iso(t.get("finished_at"))
+                if fin is not None and fin < cutoff:
+                    hidden_count += 1
                     continue
             visible.append(t)
-        hidden_count = len(hidden)
         tasks = visible
-    else:
-        tasks = all_tasks
 
     if not tasks:
         if hidden_count:
-            print(f"No tasks in current window ({hidden_count} old done tasks hidden — use --all).")
+            print(f"No tasks in the last {days}d ({hidden_count} older hidden — "
+                  f"hive list --all).")
         else:
             print("No tasks found.")
         return
 
-    # Sort: running/pending first (by id desc), then all terminal states by id desc
-    def sort_key(t):
-        is_active = 1 if t["state"] in ("running", "pending") else 0
-        return (-is_active, -t["id"])
+    active   = [t for t in tasks if t["state"] in ("running", "pending")]
+    terminal = [t for t in tasks if t["state"] in TERMINAL_STATES]
+    active.sort(key=lambda t: -t["id"])
+    # Terminal newest-first; group by finish date below.
+    terminal.sort(key=lambda t: (parse_iso(t.get("finished_at")) or datetime.min, t["id"]),
+                  reverse=True)
 
-    tasks.sort(key=sort_key)
+    # For PENDING tasks the NODE column is empty, so we reuse it to show *why* the
+    # task hasn't dispatched (set by the scheduler — feedback OBSERVED#8 / SESSION#8).
+    def node_display(t):
+        if t["state"] == "pending" and t.get("pending_reason"):
+            base = t["pending_reason"]
+        else:
+            base = t.get("node") or "—"
+        # Flag tasks that were re-dispatched after a node was reclaimed mid-run, so the
+        # checkpoint-loss is visible at a glance (full warning is in the log / hive wait).
+        rq = t.get("requeue_count", 0) or 0
+        if rq and t["state"] in ("pending", "running"):
+            base = f"{base} (re-disp x{rq})"
+        return base
 
-    # Column widths
+    # Column widths (over everything shown)
     id_w    = max(len(str(t["id"])) for t in tasks)
     name_w  = max(len(t.get("name") or "—") for t in tasks)
     name_w  = max(name_w, 6)
     state_w = 9
-    node_w  = max((len(t.get("node") or "—") for t in tasks), default=4)
+    node_w  = max((len(node_display(t)) for t in tasks), default=4)
     node_w  = max(node_w, 4)
     elap_w  = 10
     cmd_avail = max(40, 80 - id_w - name_w - state_w - node_w - elap_w - 12)
 
     def truncate(s, n):
-        if len(s) <= n:
-            return s
-        return s[:n-1] + "…"
+        return s if len(s) <= n else s[:n-1] + "…"
 
     header = (f"  {'ID':>{id_w}}  {'NAME':<{name_w}}  {'STATE':<{state_w}}  "
               f"{'NODE':<{node_w}}  {'ELAPSED':<{elap_w}}  CMD")
-    sep = "  " + "─" * (len(header) - 2)
-    print(f"{C_BOLD}{header}{C_RESET}")
-    print(sep)
+    width = len(header) - 2
+    sep = "  " + "─" * width
 
-    prev_active = None
-    for t in tasks:
-        is_active = t["state"] in ("running", "pending")
+    def group_line(label):
+        text = f"── {label} "
+        return f"  {C_DIM}{text}{'─' * max(0, width - len(text))}{C_RESET}"
 
-        # Insert separator between active and terminal sections
-        if prev_active is True and not is_active:
-            print(sep)
-
-        prev_active = is_active
-
+    def print_row(t):
         tid     = str(t["id"])
         name    = t.get("name") or "—"
         state   = t["state"]
-        node    = t.get("node") or "—"
+        node    = node_display(t)
         elapsed = task_elapsed(t)
         cmd     = truncate(t["cmd"].replace('\n', ' '), cmd_avail)
-
         color = STATE_COLORS.get(state, "")
         state_str = f"{color}{state.upper():<{state_w}}{C_RESET}"
-        row = (f"  {tid:>{id_w}}  {name:<{name_w}}  {state_str}  "
-               f"{node:<{node_w}}  {elapsed:<{elap_w}}  {cmd}")
-        print(row)
+        print(f"  {tid:>{id_w}}  {name:<{name_w}}  {state_str}  "
+              f"{node:<{node_w}}  {elapsed:<{elap_w}}  {cmd}")
+
+    # ── Scope line (makes the current view explicit) ─────────────────────────────
+    r = sum(1 for t in tasks if t["state"] == "running")
+    p = sum(1 for t in tasks if t["state"] == "pending")
+    if filter_state:
+        scope = f"queue · filter={filter_state} · {len(tasks)} shown"
+    elif show_all:
+        scope = f"queue · {r} running · {p} pending · all history ({len(terminal)} terminal)"
+    else:
+        scope = f"queue · {r} running · {p} pending"
+        if cutoff is not None:
+            scope += f" · since {cutoff.strftime('%m-%d')} (last {days}d)"
+        if hidden_count:
+            scope += f" · {hidden_count} older hidden (--all)"
+    print(f"{C_BOLD}{scope}{C_RESET}")
+
+    print(f"{C_BOLD}{header}{C_RESET}")
+    print(sep)
+
+    # Active first (no date header — they're current)
+    for t in active:
+        print_row(t)
+
+    # Terminal grouped by finish date (newest group first)
+    prev_date = None
+    for t in terminal:
+        fin = parse_iso(t.get("finished_at"))
+        d = fin.date() if fin else None
+        if d != prev_date:
+            print(group_line(_date_label(d)))
+            prev_date = d
+        print_row(t)
 
     print()
-    running_n = sum(1 for t in tasks if t["state"] == "running")
-    pending_n = sum(1 for t in tasks if t["state"] == "pending")
     sched_status = f"{C_GREEN}running{C_RESET}" if is_sched_running() else f"{C_RED}stopped{C_RESET}"
-    footer = f"  {C_DIM}scheduler: {sched_status}  {running_n} running  {pending_n} pending"
+    footer = f"  {C_DIM}scheduler: {sched_status}"
     if hidden_count:
-        footer += f"  (+{hidden_count} old done hidden — hive queue list --all)"
+        footer += f"  ·  +{hidden_count} older hidden (hive list --all)"
     footer += C_RESET
     print(footer)
 
@@ -468,6 +690,8 @@ def cmd_cancel(args):
         task["state"]       = "cancelled"
         task["finished_at"] = now_iso()
         save_queue(queue, lfd)
+        ev.record("cancel", task=task["id"], name=task.get("name") or None,
+                  node=task.get("node"))
     print(f"Task #{task_id} cancelled.")
 
 
@@ -477,7 +701,13 @@ def cmd_logs(args):
     task_id = str(args.id)
     queue = load_queue()
     task = queue["tasks"].get(task_id)
+    # A pruned task is gone from queue.json, but its log file (deterministic path) may
+    # still be on disk — fall back to it so `hive logs` keeps working after a prune.
     if not task:
+        fallback = os.path.join(LOG_DIR, f"task-{task_id}.log")
+        if os.path.exists(fallback):
+            subprocess.run(["tail", "-f", fallback] if args.follow else ["cat", fallback])
+            return
         print(f"Task #{task_id} not found.", file=sys.stderr)
         sys.exit(1)
 
@@ -515,7 +745,12 @@ def cmd_wait(args):
 
     print(f"Waiting for task #{task_id}...", flush=True)
 
+    pending_timeout = getattr(args, "pending_timeout", 0) or 0
+
     prev_state = None
+    prev_requeue = 0
+    prev_reason = None
+    pending_since = None
     while True:
         queue = load_queue()
         task  = queue["tasks"].get(task_id)
@@ -533,10 +768,74 @@ def cmd_wait(args):
                   flush=True)
             prev_state = state
 
+        # Tell the agent when the task was moved to another node mid-run: the new run
+        # does NOT resume from the interrupted one unless the command checkpoints.
+        rq = task.get("requeue_count", 0) or 0
+        if rq > prev_requeue:
+            reason = task.get("pending_reason") or "node reclaimed"
+            print(f"  {C_YELLOW}⚠ re-dispatched to a different node "
+                  f"(attempt {task.get('attempts', rq)}, reason: {reason}). "
+                  f"Earlier progress is LOST unless your command resumes from a "
+                  f"checkpoint.{C_RESET}", flush=True)
+            prev_requeue = rq
+
+        # Surface WHY a task is held (so the agent perceives a block instead of waiting
+        # blind). `insufficient_walltime` in particular may never clear on its own.
+        if state == "pending":
+            if pending_since is None:
+                pending_since = time.time()
+            reason = task.get("pending_reason")
+            if reason and reason != prev_reason:
+                if reason == "insufficient_walltime":
+                    est = task.get("est_runtime_secs")
+                    print(f"  {C_YELLOW}⚠ held: insufficient_walltime — no node has enough "
+                          f"remaining walltime for est {fmt_elapsed(est) if est else '?'} "
+                          f"(+10m margin). It will NOT run until a longer-walltime node is "
+                          f"added (hive pool add --time …) or you lower --est-runtime."
+                          f"{C_RESET}", flush=True)
+                else:
+                    print(f"  {C_DIM}pending: {reason}{C_RESET}", flush=True)
+                prev_reason = reason
+            if pending_timeout and (time.time() - pending_since) > pending_timeout:
+                print(f"  {C_RED}gave up: task still PENDING "
+                      f"({task.get('pending_reason') or 'unscheduled'}) after "
+                      f"{int(time.time() - pending_since)}s — it never dispatched."
+                      f"{C_RESET}", flush=True)
+                sys.exit(75)
+        else:
+            pending_since = None
+
         if state in TERMINAL_STATES:
             break
 
         time.sleep(poll_secs)
+
+    # ── Explicit timing feedback returned to the agent ───────────────────────
+    # Real measured durations (no estimate): queue wait + run time on the node, plus a
+    # re-dispatch count if the node was reclaimed mid-run. Prefer the values the
+    # scheduler recorded at finish; fall back to computing from timestamps.
+    qs = task.get("queued_secs")
+    if qs is None:
+        t0, t1 = parse_iso(task.get("submitted_at")), parse_iso(task.get("started_at"))
+        qs = int((t1 - t0).total_seconds()) if t0 and t1 else None
+    rs = task.get("duration_secs")
+    if rs is None:
+        t0, t1 = parse_iso(task.get("started_at")), parse_iso(task.get("finished_at"))
+        rs = int((t1 - t0).total_seconds()) if t0 and t1 else None
+    node = task.get("node") or "—"
+    mark = {"done": f"{C_GREEN}✓", "failed": f"{C_RED}✗",
+            "cancelled": f"{C_DIM}∅"}.get(state, "")
+    parts = []
+    if qs is not None:
+        parts.append(f"queued {fmt_elapsed(qs)}")
+    if rs is not None:
+        parts.append(f"ran {fmt_elapsed(rs)}")
+    if task.get("requeue_count"):
+        parts.append(f"re-disp x{task['requeue_count']}")
+    detail = " · ".join(parts)
+    print(f"{mark} task #{task_id} {state}{C_RESET}"
+          + (f" · {detail}" if detail else "")
+          + (f" · on {node}" if node != "—" else ""), flush=True)
 
     # Print log
     if not no_log:
@@ -559,6 +858,43 @@ def cmd_wait(args):
         sys.exit(0 if state == "done" else 1)
 
 
+# ── Stats (runtime history → estimate helper for agents) ──────────────────────
+
+def cmd_stats(args):
+    """Show completed-task runtime history grouped by name, so an agent can pick an
+    --est-runtime value (or just pass --est-runtime auto, which uses p90 here). Reads
+    the durable event log (`events.jsonl`) merged with any done tasks still in the
+    queue, so history survives even after the queue is pruned."""
+    name = getattr(args, "name", None)
+
+    groups = {(k or "—"): v for k, v in runs_by_name().items()}
+    if name:
+        groups = {k: v for k, v in groups.items() if k == name}
+
+    if not groups:
+        scope = f" for name '{name}'" if name else ""
+        print(f"No completed-task runtime history{scope} yet.")
+        print("(History accrues as named tasks finish; submit with --name to group them.)")
+        return
+
+    name_w = max([len(k) for k in groups], default=4)
+    name_w = max(name_w, 4)
+    header = (f"  {'NAME':<{name_w}}  {'N':>3}  {'MIN':>8}  {'MED':>8}  "
+              f"{'P90':>8}  {'MAX':>8}")
+    print(f"{C_BOLD}{header}{C_RESET}")
+    print("  " + "─" * (len(header) - 2))
+    for nm in sorted(groups):
+        durs = sorted(groups[nm])
+        n = len(durs)
+        mn, md = durs[0], _percentile(durs, 50)
+        p90, mx = _percentile(durs, 90), durs[-1]
+        print(f"  {nm:<{name_w}}  {n:>3}  {fmt_elapsed(mn):>8}  {fmt_elapsed(md):>8}  "
+              f"{fmt_elapsed(p90):>8}  {fmt_elapsed(mx):>8}")
+    print()
+    print(f"  {C_DIM}Tip: hive submit --name <NAME> --est-runtime auto  "
+          f"(uses P90 above so the scheduler avoids soon-expiring nodes).{C_RESET}")
+
+
 # ── Remove ────────────────────────────────────────────────────────────────────
 
 def cmd_rm(args):
@@ -576,6 +912,106 @@ def cmd_rm(args):
         del queue["tasks"][task_id]
         save_queue(queue, lfd)
     print(f"Task #{task_id} removed.")
+
+
+# ── Prune ─────────────────────────────────────────────────────────────────────
+
+PRUNE_DEFAULT_OLDER = 7 * 86400   # default: keep the last 7 days of terminal tasks
+
+
+def _drop_internal_files(task_id, log_path, drop_logs):
+    """Remove a pruned task's internal scheduler files (heartbeat + exit), and its log
+    only if explicitly asked (`--logs`). Logs hold the task's actual output, so they're
+    kept by default."""
+    for p in (os.path.join(HEARTBEAT_DIR, str(task_id)),
+              os.path.join(HEARTBEAT_DIR, f"{task_id}.exit")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    if drop_logs and log_path:
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
+
+
+def cmd_prune(args):
+    """Remove old terminal (done/failed/cancelled) tasks from queue.json. Never touches
+    pending/running. The durable timing history stays in events.jsonl, so this only
+    trims the live queue — use it to keep queue.json small. Logs are kept unless
+    --logs is given; heartbeat/exit files are always cleaned for pruned tasks."""
+    older_than = None
+    if args.older_than is not None:
+        older_than = parse_duration(args.older_than)
+        if older_than is None:
+            print(f"{C_RED}Error:{C_RESET} could not parse --older-than "
+                  f"'{args.older_than}' (try 24h, 7d, or 0 for all).", file=sys.stderr)
+            sys.exit(1)
+    state_filter = args.state.lower() if args.state else None
+    if state_filter and state_filter not in TERMINAL_STATES:
+        print(f"{C_RED}Error:{C_RESET} --state must be one of done|failed|cancelled.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    now = datetime.now()
+
+    def finished(t):
+        return parse_iso(t.get("finished_at"))
+
+    with QueueLock() as lfd:
+        queue = load_queue(lfd)
+        tasks = queue.get("tasks", {})
+        cand = [t for t in tasks.values()
+                if t["state"] in TERMINAL_STATES
+                and (not state_filter or t["state"] == state_filter)]
+
+        if args.keep is not None:
+            # Keep the N most-recent terminal tasks (by finish time); prune the rest.
+            ordered = sorted(cand, key=lambda t: (finished(t) or datetime.min),
+                             reverse=True)
+            victims = ordered[max(0, args.keep):]
+        else:
+            thr = older_than if older_than is not None else PRUNE_DEFAULT_OLDER
+            victims = []
+            for t in cand:
+                f = finished(t)
+                age = (now - f).total_seconds() if f else None
+                if thr == 0 or (age is not None and age >= thr):
+                    victims.append(t)
+
+        if not victims:
+            print("Nothing to prune (no terminal tasks match the criteria).")
+            return
+
+        # Summary by state
+        by_state = {}
+        for t in victims:
+            by_state[t["state"]] = by_state.get(t["state"], 0) + 1
+        summary = ", ".join(f"{n} {s}" for s, n in sorted(by_state.items()))
+
+        if args.dry_run:
+            print(f"{C_BOLD}[dry-run]{C_RESET} would prune {len(victims)} task(s): {summary}")
+            for t in sorted(victims, key=lambda t: t["id"])[:20]:
+                print(f"  #{t['id']:>5}  {t['state']:<9}  {t.get('name') or '—'}")
+            if len(victims) > 20:
+                print(f"  … and {len(victims) - 20} more")
+            remain = len(tasks) - len(victims)
+            print(f"{remain} task(s) would remain. (re-run without --dry-run to apply)")
+            return
+
+        for t in victims:
+            _drop_internal_files(t["id"], t.get("log"), args.logs)
+            del tasks[str(t["id"])]
+        save_queue(queue, lfd)
+        ev.record("prune", count=len(victims), by_state=by_state,
+                  logs_removed=bool(args.logs))
+
+    remain = len(tasks)
+    print(f"Pruned {len(victims)} task(s): {summary}.  {remain} task(s) remain.")
+    if not args.logs:
+        print(f"{C_DIM}(task logs kept; use --logs to also delete them. "
+              f"History is preserved in events.jsonl.){C_RESET}")
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -598,13 +1034,23 @@ def build_parser():
                     help="Priority (higher = runs first, default: 0)")
     ps.add_argument("--name", "-n", metavar="NAME",
                     help="Display name for this task")
+    ps.add_argument("--need-mb", type=int, metavar="MB", dest="need_mb",
+                    help="Min free GPU memory (MiB) required before dispatch; "
+                         "the scheduler holds the task PENDING until a node has it free")
+    ps.add_argument("--est-runtime", metavar="DUR", dest="est_runtime",
+                    help="Estimated runtime (e.g. 2h, 90m, 1-12:00:00, or 'auto' to use "
+                         "P90 of this name's history). The scheduler then won't place the "
+                         "task on a node whose remaining walltime < estimate + 10m.")
 
     # list
     pl = sub.add_parser("list", aliases=["ls"], help="List tasks")
     pl.add_argument("--state", "-s", metavar="STATE",
                     help="Filter by state: pending|running|done|failed|cancelled")
+    pl.add_argument("--days", "-d", type=int, metavar="N",
+                    help=f"Show terminal tasks finished in the last N days "
+                         f"(default {DONE_HIDE_DAYS_DEFAULT}); active tasks always shown")
     pl.add_argument("--all", "-a", action="store_true",
-                    help=f"Show all tasks including done tasks older than {DONE_HIDE_HOURS}h (hidden by default)")
+                    help="Show all tasks regardless of age (grouped by date)")
 
     # cancel
     pc = sub.add_parser("cancel", help="Cancel a pending or running task")
@@ -620,6 +1066,27 @@ def build_parser():
     pr = sub.add_parser("rm", help="Remove a finished/cancelled task from queue")
     pr.add_argument("id", type=int, metavar="ID")
 
+    # stats
+    pst = sub.add_parser("stats", help="Show completed-task runtime history (by name)")
+    pst.add_argument("name", nargs="?", metavar="NAME",
+                     help="Limit to a single task name")
+
+    # prune
+    pp = sub.add_parser("prune", help="Remove old terminal tasks from the queue "
+                                      "(history stays in events.jsonl)")
+    pp.add_argument("--older-than", metavar="DUR", dest="older_than",
+                    help="Prune terminal tasks finished more than DUR ago "
+                         "(e.g. 24h, 7d; 0 = all). Default: 7d")
+    pp.add_argument("--keep", type=int, metavar="N",
+                    help="Instead of age: keep the N most-recent terminal tasks, "
+                         "prune the rest")
+    pp.add_argument("--state", metavar="STATE",
+                    help="Only prune this terminal state: done|failed|cancelled")
+    pp.add_argument("--logs", action="store_true",
+                    help="Also delete the matching task log files (default: keep them)")
+    pp.add_argument("-n", "--dry-run", action="store_true", dest="dry_run",
+                    help="Show what would be pruned; change nothing")
+
     # wait
     pw = sub.add_parser("wait", help="Block until task finishes, print log, exit with task's exit code")
     pw.add_argument("id", type=int, metavar="ID")
@@ -627,6 +1094,10 @@ def build_parser():
                     help="Poll interval in seconds (default: 5)")
     pw.add_argument("--no-log", action="store_true",
                     help="Don't print log on completion")
+    pw.add_argument("--pending-timeout", type=float, default=0, metavar="SEC",
+                    dest="pending_timeout",
+                    help="If the task stays PENDING (never dispatches) longer than SEC, "
+                         "stop waiting and exit 75. Default 0 = wait forever.")
 
     # daemon
     pd = sub.add_parser("daemon", help="Manage hive-sched daemon")
@@ -656,6 +1127,10 @@ def main():
         cmd_rm(args)
     elif cmd == "wait":
         cmd_wait(args)
+    elif cmd == "stats":
+        cmd_stats(args)
+    elif cmd == "prune":
+        cmd_prune(args)
     elif cmd == "daemon":
         cmd_daemon(args)
 

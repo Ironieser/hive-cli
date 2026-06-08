@@ -19,6 +19,7 @@ import sys
 HIVE_DIR     = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
 CONFIG_FILE  = os.path.join(HIVE_DIR, "pool_config.json")
 NODE_DB      = os.path.join(HIVE_DIR, "node_monitor.json")
+POOL_LOG_DIR = os.path.join(HIVE_DIR, "pool-logs")
 
 LIBEXEC_DIR  = os.path.dirname(os.path.realpath(__file__))
 EXAMPLE_FILE = os.path.join(os.path.dirname(LIBEXEC_DIR), "pool_config.example.json")
@@ -103,15 +104,40 @@ def cmd_add(args):
     count = args.count
     time_arg = args.time
 
-    time_str = f"  time={time_arg}" if time_arg else ""
-    print(f"Submitting {count}× hold job  [{preset_name}]  {desc}{time_str}")
+    # Redirect hold-job stdout/stderr to $HIVE_DIR/pool-logs/ instead of dumping
+    # slurm-<jobid>.out into the submission cwd (feedback SESSION#9). A --output on
+    # the sbatch command line overrides any #SBATCH --output in the script.
+    os.makedirs(POOL_LOG_DIR, exist_ok=True)
+    out_pat = os.path.join(POOL_LOG_DIR, "slurm-%j.out")
+    err_pat = os.path.join(POOL_LOG_DIR, "slurm-%j.err")
 
-    for _ in range(count):
+    def build_cmd(extra=None):
         cmd = ["sbatch"]
+        if extra:
+            cmd += extra
         if time_arg:
             cmd += ["--time", time_arg]
-        cmd.append(script)
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        cmd += ["--output", out_pat, "--error", err_pat, script]
+        return cmd
+
+    # Validate the script with a dry-run before looping `--count` times, so a bad
+    # preset fails once with a clear message instead of N times (feedback OPT-I).
+    if not args.no_validate:
+        test = subprocess.run(build_cmd(["--test-only"]), capture_output=True, text=True)
+        if test.returncode != 0:
+            print(f"{C_RED}✗ Preset '{preset_name}' rejected by sbatch --test-only:{C_RESET}",
+                  file=sys.stderr)
+            print(f"  {test.stderr.strip() or test.stdout.strip()}", file=sys.stderr)
+            print(f"  {C_DIM}Fix the script, or bypass with: hive pool add ... --no-validate{C_RESET}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    time_str = f"  time={time_arg}" if time_arg else ""
+    print(f"Submitting {count}× hold job  [{preset_name}]  {desc}{time_str}")
+    print(f"  {C_DIM}logs → {POOL_LOG_DIR}/slurm-<jobid>.out{C_RESET}")
+
+    for _ in range(count):
+        result = subprocess.run(build_cmd(), capture_output=True, text=True)
         if result.returncode == 0:
             print(f"  {C_GREEN}✓{C_RESET} {result.stdout.strip()}")
         else:
@@ -196,6 +222,17 @@ def cmd_config(args):
                             break
             except OSError:
                 pass
+            # Validate via sbatch --test-only so SLURM-rejected presets surface here
+            # (feedback OPT-I) instead of only at submit time.
+            if not args.no_validate:
+                test = subprocess.run(
+                    ["sbatch", "--test-only", script],
+                    capture_output=True, text=True)
+                if test.returncode == 0:
+                    print(f"    valid:  {C_GREEN}✓ sbatch accepts{C_RESET}")
+                else:
+                    msg = (test.stderr.strip() or test.stdout.strip()).split("\n")[0]
+                    print(f"    valid:  {C_RED}✗ {msg}{C_RESET}")
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -217,6 +254,8 @@ def build_parser():
                     help="Number of hold jobs to submit (default: 1)")
     pa.add_argument("--time", "-t", default=None, metavar="TIME",
                     help="Override --time in the sbatch script, e.g. 1-00:00:00, 12:00:00, 3d")
+    pa.add_argument("--no-validate", action="store_true",
+                    help="Skip the 'sbatch --test-only' pre-flight check")
 
     # release
     pr = sub.add_parser("release", help="Cancel a hold job (scancel)")
@@ -230,7 +269,9 @@ def build_parser():
     sub.add_parser("init", help=f"Create {CONFIG_FILE} from example")
 
     # config
-    sub.add_parser("config", help="Show current preset configuration")
+    pcfg = sub.add_parser("config", help="Show current preset configuration")
+    pcfg.add_argument("--no-validate", action="store_true",
+                      help="Skip the per-preset 'sbatch --test-only' check")
 
     return p
 

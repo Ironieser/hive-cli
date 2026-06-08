@@ -9,6 +9,7 @@ import json
 import os
 import re
 import signal
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,12 +18,15 @@ from datetime import datetime, timezone
 HIVE_DIR    = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
 DB_PATH     = os.path.join(HIVE_DIR, "node_monitor.json")
 PID_PATH    = os.path.join(HIVE_DIR, "node_monitor.pid")
+HB_PATH     = os.path.join(HIVE_DIR, "node_monitor.heartbeat")
+POLL_REQ    = os.path.join(HIVE_DIR, "node_monitor.poll-request")
 QUEUE_PATH  = os.path.join(HIVE_DIR, "queue.json")
 
 # ── Constants ────────────────────────────────────────────────────────────────
-DAEMON_POLL_INTERVAL = 120   # seconds between daemon polls
+DAEMON_POLL_INTERVAL = 900   # seconds between daemon polls (matches hive-daemon POLL_INTERVAL)
 AUTO_REFRESH         = 30    # seconds between UI file reloads
 STALE_THRESHOLD      = 600   # 10 min → red warning
+NODE_HB_TIMEOUT      = 180   # heartbeat older than this → poller considered dead
 
 
 # ── Color pair IDs ───────────────────────────────────────────────────────────
@@ -72,29 +76,53 @@ def load_db():
         return None, str(e)
 
 
-def daemon_status():
-    """Return (is_running: bool, pid: int|None)."""
+def _read_pid_host():
+    """Parse '<pid>\\n<host>' from the poller PID file. Either may be missing."""
     try:
         with open(PID_PATH) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True, pid
-    except (FileNotFoundError, ValueError):
-        return False, None
+            lines = f.read().split("\n")
+        pid = int(lines[0].strip())
+        host = lines[1].strip() if len(lines) > 1 else ""
+        return pid, host
+    except (FileNotFoundError, ValueError, IndexError):
+        return None, ""
+
+
+def daemon_status():
+    """Return (is_running, pid). Same-host → live PID is authoritative (detect death
+    immediately); different host → shared-FS heartbeat freshness (feedback C5)."""
+    pid, host = _read_pid_host()
+    if pid is not None and (not host or host == socket.gethostname()):
+        try:
+            os.kill(pid, 0)
+            return True, pid
+        except OSError:
+            return False, pid
+    try:
+        if os.path.exists(HB_PATH) and (time.time() - os.path.getmtime(HB_PATH)) < NODE_HB_TIMEOUT:
+            return True, pid
     except OSError:
-        return False, None
+        pass
+    return False, pid
 
 
 def send_sigusr1():
-    """Send SIGUSR1 to daemon to trigger immediate poll."""
-    running, pid = daemon_status()
-    if running and pid:
+    """Trigger an immediate poll. Writes the cross-node poll-request file, and also
+    SIGUSR1s the poller if it's on this host (fast path)."""
+    ok = False
+    try:
+        open(POLL_REQ, "w").close()
+        ok = True
+    except OSError:
+        pass
+    pid, host = _read_pid_host()
+    if pid is not None and (not host or host == socket.gethostname()):
         try:
             os.kill(pid, signal.SIGUSR1)
-            return True
+            ok = True
         except OSError:
             pass
-    return False
+    return ok
 
 
 def parse_updated(data):

@@ -15,13 +15,20 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+
+# Shared append-only event log (durable timing/runtime history). Imported by path
+# since libexec scripts aren't a package.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import hive_events as ev
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HIVE_DIR      = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
 QUEUE_FILE    = os.path.join(HIVE_DIR, "queue.json")
 QUEUE_LOCK    = os.path.join(HIVE_DIR, "queue.lock")
 NODE_DB       = os.path.join(HIVE_DIR, "node_monitor.json")
+NODE_PID      = os.path.join(HIVE_DIR, "node_monitor.pid")           # poller daemon: "<pid>\n<host>"
+NODE_POLL_REQ = os.path.join(HIVE_DIR, "node_monitor.poll-request")  # cross-node force-repoll
 SCHED_PID     = os.path.join(HIVE_DIR, "sched.pid")
 SCHED_LOG     = os.path.join(HIVE_DIR, "sched.log")
 SCHED_HB      = os.path.join(HIVE_DIR, "sched.heartbeat")
@@ -31,6 +38,27 @@ LOG_DIR       = os.path.join(HIVE_DIR, "logs")
 POLL_INTERVAL     = 30    # seconds between scheduler loops
 HEARTBEAT_TIMEOUT = 300   # 5 min → task considered dead
 LOG_ROLL_LINES    = 500
+
+# ── Dispatch gating (feedback C1/C2: stop dispatching into dirty/stale/unverified nodes) ──
+GPU_CLEAN_MB       = 5000   # a hold-job GPU with >5GB used is dirty (zombie / co-tenant) → skip
+NEED_MB_DEFAULT    = 0      # per-task min free MB (override via #HIVE need_mb= / --need-mb)
+NODE_DB_STALE_SECS = 1800   # node DB older than this → force a re-poll instead of trusting it
+ORPHAN_GRACE_SECS  = 90     # running task w/ no srun+heartbeat+exit older than this → crash orphan
+MAX_ATTEMPTS       = 3      # requeue cap for crash orphans (prevents infinite redispatch)
+STARVATION_CYCLES  = 3      # consecutive starved cycles before forcing a poller re-poll
+LIVE_PROBE_TIMEOUT = 20     # seconds for a single verify-before-dispatch probe
+
+# ── Walltime-aware placement (feedback C4: don't strand a long task on a dying node) ──
+# Only applies when a task carries an est_runtime_secs (explicit --est-runtime or
+# resolved from history). Without an estimate the scheduler stays walltime-blind, so
+# existing behaviour is unchanged. A node whose remaining walltime < est + margin is
+# skipped (task held PENDING with reason insufficient_walltime) rather than dispatched
+# onto a node that will expire mid-run and lose all un-checkpointed progress.
+WALLTIME_MARGIN_SECS = 600  # safety head-room above the estimate
+SQUEUE_CONFIRM_TIMEOUT = 10 # bounded squeue used to confirm a hold-job actually died
+
+# Mutable run-state for the starvation watchdog (consecutive cycles with pending but no dispatch)
+_starve_streak = 0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -96,22 +124,225 @@ def save_queue(data, lfd):
 # ── Node DB (read-only; owned by hive-daemon) ─────────────────────────────────
 
 def load_node_db():
+    """Return (jobs_dict, updated_iso). Both empty/None on error."""
     if not os.path.exists(NODE_DB):
-        return {}
+        return {}, None
     try:
         with open(NODE_DB) as f:
-            return json.load(f).get("jobs", {})
+            data = json.load(f)
+        return data.get("jobs", {}), data.get("updated")
     except (json.JSONDecodeError, OSError):
-        return {}
+        return {}, None
 
 
-def get_idle_nodes(jobs_db, used_jobids):
-    """Return [(jobid, node_info)] for idle nodes not already claimed."""
-    return [
-        (jid, info)
-        for jid, info in jobs_db.items()
-        if info.get("status") == "idle" and jid not in used_jobids
-    ]
+def _age_seconds(iso):
+    """Age of a UTC timestamp (node-DB fields: polled_at / updated, written by
+    `date -u`)."""
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except ValueError:
+        return None
+
+
+def _age_local(iso):
+    """Age of a LOCAL timestamp (queue fields: dispatched_at / started_at, written
+    by now_iso() = datetime.now()). Must NOT be compared as UTC (feedback note:
+    tz mismatch would inflate the age by the UTC offset)."""
+    if not iso:
+        return None
+    try:
+        return (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return None
+
+
+def db_gpu_mem(info):
+    """Max (mem_used, mem_total) MiB across this hold-job's GPUs from the DB."""
+    gpus = info.get("gpu", []) or []
+    used  = max((int(g.get("mem_used", 0))  for g in gpus), default=0)
+    total = max((int(g.get("mem_total", 0)) for g in gpus), default=0)
+    return used, total
+
+
+def db_time_left(info, db_updated):
+    """Live remaining walltime (secs) for a hold job, or a sentinel.
+
+    The poller writes `time_left_secs` from `squeue %L` every cycle — even when the
+    GPU probe failed and the record was carried-forward — so its measurement basis is
+    the DB's top-level `updated` stamp, NOT the per-job `polled_at` (which a
+    carried-forward record pins to its last-good poll). Returns:
+       None  — unknown (field absent / unparseable; older poller, treat as no info)
+       -1    — UNLIMITED walltime
+       >=0   — estimated seconds remaining (clamped at 0)
+    """
+    tl = info.get("time_left_secs")
+    if tl is None:
+        return None
+    try:
+        tl = int(tl)
+    except (TypeError, ValueError):
+        return None
+    if tl < 0:
+        return -1   # unlimited
+    age = _age_seconds(db_updated) or 0
+    return max(0, tl - int(age))
+
+
+def hold_job_alive(jid, jobs_db):
+    """True if hold-job `jid` is still a running SLURM allocation.
+
+    Fast path: present in the (just-loaded) node DB. Slow path (only taken when a
+    task just died, so it's rare): a bounded `squeue -j` confirm, since the node DB
+    may simply be stale. Falls back to the DB verdict if squeue can't be run.
+
+    NOTE on lock-hold: this and live_probe() run inside the QueueLock-held cycle, so a
+    cycle that must verify several uncertain nodes and reconcile a dead task can hold
+    queue.lock for tens of seconds (each call is timeout-bounded). Acceptable because
+    these paths are rare; if it ever becomes a contention problem, move verification
+    outside the lock and re-acquire only to commit the claim."""
+    if not jid:
+        return False
+    if jid in jobs_db:
+        return True
+    try:
+        out = subprocess.run(
+            ["squeue", "-h", "-j", str(jid), "-t", "R", "-o", "%i"],
+            capture_output=True, text=True, timeout=SQUEUE_CONFIRM_TIMEOUT)
+        return bool((out.stdout or "").strip())
+    except (subprocess.TimeoutExpired, OSError):
+        return jid in jobs_db
+
+
+def _duration_secs(task):
+    """Wall-clock run duration from started_at→finished_at (both local time)."""
+    t0, t1 = task.get("started_at"), task.get("finished_at")
+    if not t0 or not t1:
+        return None
+    try:
+        d = (datetime.fromisoformat(t1) - datetime.fromisoformat(t0)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    return int(d) if d >= 0 else None
+
+
+def _queued_secs(task):
+    """Queue wait before the run that finished: submitted_at→started_at (local time)."""
+    t0, t1 = task.get("submitted_at"), task.get("started_at")
+    if not t0 or not t1:
+        return None
+    try:
+        d = (datetime.fromisoformat(t1) - datetime.fromisoformat(t0)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    return int(d) if d >= 0 else None
+
+
+def _fmt_dur(secs):
+    if secs is None:
+        return "unknown"
+    if secs < 0:
+        return "unlimited"
+    secs = int(secs)
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def append_log_note(task, lines):
+    """Append banner lines to a task's log so `hive logs` / `hive wait` surface them."""
+    try:
+        with open(task["log"], "a") as f:
+            for ln in lines:
+                f.write(ln + "\n")
+    except (OSError, KeyError):
+        pass
+
+
+def request_repoll(reason):
+    """Ask the poller to refresh now instead of waiting for its 900s cycle.
+
+    The poller may live on a different node (feedback C5), so the portable path is a
+    `poll-request` file on the shared FS. SIGUSR1 is kept as a same-host fast path.
+    """
+    requested = False
+    try:
+        open(NODE_POLL_REQ, "w").close()   # touch — daemon checks it each 1s tick
+        requested = True
+    except OSError:
+        pass
+    try:
+        with open(NODE_PID) as f:
+            lines = f.read().split("\n")
+        pid = int(lines[0].strip())
+        host = lines[1].strip() if len(lines) > 1 else ""
+        if not host or host == socket.gethostname():
+            os.kill(pid, signal.SIGUSR1)
+            requested = True
+    except (OSError, ValueError, IndexError):
+        pass
+    if requested:
+        logging.warning("Requested immediate node re-poll (%s)", reason)
+
+
+def live_probe(slurm_jobid):
+    """Fast single-job GPU probe, bypassing the (possibly stale) node DB.
+
+    Used to verify-before-dispatch so one stale/failed poll can't strand a node
+    and so we never dispatch onto a node whose GPU is actually occupied
+    (feedback OPT-B / OBSERVED#2). Returns {ok, util, mem_used, mem_total}.
+    """
+    probe = ("nvidia-smi --id=0 --query-gpu=utilization.gpu,memory.used,memory.total "
+             "--format=csv,noheader,nounits 2>/dev/null")
+    try:
+        out = subprocess.run(
+            ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
+             "bash", "-c", probe],
+            capture_output=True, text=True, timeout=LIVE_PROBE_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return {"ok": False}
+    lines = [l for l in (out.stdout or "").strip().splitlines() if l.strip()]
+    if out.returncode != 0 or not lines:
+        return {"ok": False}
+    try:
+        util, used, total = [int(float(x.strip())) for x in lines[0].split(",")]
+    except (ValueError, IndexError):
+        return {"ok": False}
+    return {"ok": True, "util": util, "mem_used": used, "mem_total": total}
+
+
+def get_candidates(jobs_db, used_jobids, freed):
+    """Candidate hold-jobs for dispatch, each (jid, info, needs_verify).
+
+    Dispatchable = SLURM-allocated + plausibly free, decoupled from a single
+    `status=="idle"` check (feedback OPT-B). `idle` nodes are candidates; so are
+    `probe_failed`/`unknown` and just-freed nodes — but those carry needs_verify
+    so we live-probe before trusting them. `busy`/`warning`/`cpu` are excluded.
+    Fresh trustworthy idles are tried first (cheap, no live probe).
+    """
+    cands = []
+    for jid, info in jobs_db.items():
+        if jid in used_jobids:
+            continue
+        st = info.get("status")
+        forced = jid in freed
+        is_idle = (st == "idle")
+        is_uncertain = st in ("probe_failed", "unknown")
+        if not (is_idle or is_uncertain or forced):
+            continue
+        stale = (_age_seconds(info.get("polled_at")) or 0) > NODE_DB_STALE_SECS
+        needs_verify = bool(forced or is_uncertain or info.get("carried_forward") or stale)
+        cands.append((jid, info, needs_verify))
+    cands.sort(key=lambda c: c[2])   # False (no verify) first
+    return cands
 
 
 # ── Task dispatch ─────────────────────────────────────────────────────────────
@@ -138,12 +369,33 @@ def dispatch_task(task, slurm_jobid, node_name):
 
     started_at = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
 
+    # Remaining walltime of the hold-job at dispatch (logged so the submitting agent
+    # can see how long this node can run the task before SLURM reclaims it).
+    wt_left = task.get("node_time_left_secs")
+    wt_line = (f"echo '=== node walltime remaining at dispatch: {_fmt_dur(wt_left)} "
+               f"(then this node is reclaimed) ===' >> {log_file}\n")
+    est = task.get("est_runtime_secs")
+    est_line = ""
+    if est:
+        est_line = (f"echo '=== estimated runtime: {_fmt_dur(int(est))} "
+                    f"(source: {task.get('est_source', 'user')}) ===' >> {log_file}\n")
+    # Re-dispatch warning: a task put back on a (possibly different) node loses any
+    # in-memory/un-checkpointed progress — make that unmissable in the log.
+    rq = int(task.get("requeue_count", 0) or 0)
+    rq_line = ""
+    if rq > 0:
+        rq_line = (f"echo '=== WARNING: re-dispatch #{rq} (attempt {task.get('attempts', 0)}). "
+                   f"Previous run on another node was interrupted; this is a FRESH start — "
+                   f"prior progress is lost unless your command resumes from a checkpoint. ===' "
+                   f">> {log_file}\n")
+
     # Shell wrapper that runs on the compute node.
     # All output (including srun-level errors) goes to the task log.
     wrapper = (
         # ── Header ──────────────────────────────────────────────────────────
         f"echo '=== hive task #{task_id} started at {started_at} ===' >> {log_file}\n"
         f"echo '=== node: {node_name}  slurm_jobid: {slurm_jobid} ===' >> {log_file}\n"
+        + wt_line + est_line + rq_line +
         f"echo '=== workdir: {workdir} ===' >> {log_file}\n"
         f"echo '=== cmd: {cmd.replace(chr(10), ' ')} ===' >> {log_file}\n"
         f"echo '' >> {log_file}\n"
@@ -222,9 +474,40 @@ def check_task_status(task_id, srun_pid):
 
 # ── Main scheduler loop ───────────────────────────────────────────────────────
 
+def _has_heartbeat_file(task_id):
+    return os.path.exists(os.path.join(HEARTBEAT_DIR, str(task_id)))
+
+
+def _has_exit_file(task_id):
+    return os.path.exists(os.path.join(HEARTBEAT_DIR, f"{task_id}.exit"))
+
+
+def _is_crash_orphan(task):
+    """A 'running' task that almost certainly never actually launched: no exit
+    file, no heartbeat ever written, srun PID gone, and past the grace window.
+    These come from a scheduler killed mid-dispatch (feedback OPT-E)."""
+    tid = task["id"]
+    if _has_exit_file(tid) or _has_heartbeat_file(tid):
+        return False
+    pid = task.get("srun_pid")
+    if pid:
+        try:
+            os.kill(pid, 0)
+            return False   # srun still alive — not an orphan
+        except (ProcessLookupError, PermissionError):
+            pass
+    age = _age_local(task.get("dispatched_at") or task.get("started_at"))
+    return age is None or age > ORPHAN_GRACE_SECS
+
+
 def run_one_cycle():
-    jobs_db = load_node_db()
+    global _starve_streak
+    jobs_db, db_updated = load_node_db()
     changed = False
+
+    # Staleness guard: if the node DB is too old, don't trust it — kick the poller.
+    if (_age_seconds(db_updated) or 0) > NODE_DB_STALE_SECS:
+        request_repoll("node DB stale")
 
     with QueueLock() as lfd:
         queue = load_queue(lfd)
@@ -232,6 +515,7 @@ def run_one_cycle():
 
         # ── (1) Check running tasks ──────────────────────────────────────────
         running_jobids = set()
+        freed_jobids = set()
         for task in tasks.values():
             if task["state"] != "running":
                 continue
@@ -246,43 +530,200 @@ def run_one_cycle():
                 task["state"]       = "done" if ec == 0 else "failed"
                 task["exit_code"]   = ec
                 task["finished_at"] = now_iso()
-                running_jobids.discard(jid)
+                task["duration_secs"] = _duration_secs(task)   # run time → runtime history
+                task["queued_secs"]   = _queued_secs(task)     # wait time → feedback
+                if jid:
+                    running_jobids.discard(jid)
+                    freed_jobids.add(jid)   # event-driven: reconsider this node now
                 changed = True
-                logging.info("Task %d finished: state=%s exit=%d node=%s",
-                             task["id"], task["state"], ec, task.get("node", "?"))
+                logging.info("Task %d finished: state=%s exit=%d node=%s dur=%ss",
+                             task["id"], task["state"], ec, task.get("node", "?"),
+                             task.get("duration_secs"))
+                ev.record("finish", task=task["id"], name=task.get("name") or None,
+                          state=task["state"], exit_code=ec, node=task.get("node"),
+                          slurm_jobid=jid, run_secs=task["duration_secs"],
+                          queued_secs=task["queued_secs"])
 
             elif status == "dead":
-                task["state"]       = "failed"
-                task["exit_code"]   = -1
-                task["finished_at"] = now_iso()
-                running_jobids.discard(jid)
-                changed = True
-                logging.warning("Task %d declared dead (heartbeat timeout)", task["id"])
+                if _is_crash_orphan(task) and task.get("attempts", 0) < MAX_ATTEMPTS:
+                    # Never actually ran — requeue instead of losing it (OPT-E).
+                    # No progress to lose (heartbeat never appeared), so no checkpoint
+                    # warning here.
+                    task["attempts"]      = task.get("attempts", 0) + 1
+                    task["state"]         = "pending"
+                    task["pending_reason"] = "redispatched_after_crash"
+                    task["slurm_jobid"]   = None
+                    task["node"]          = None
+                    task["srun_pid"]      = None
+                    task["started_at"]    = None
+                    if jid:
+                        running_jobids.discard(jid)
+                    changed = True
+                    logging.warning("Task %d looked like a crash orphan — requeued "
+                                    "(attempt %d/%d)", task["id"], task["attempts"], MAX_ATTEMPTS)
+                    ev.record("requeue", task=task["id"], name=task.get("name") or None,
+                              reason="crash_orphan", attempts=task["attempts"],
+                              checkpoint_lost=False)
+                elif (jid and not hold_job_alive(jid, jobs_db)
+                        and task.get("attempts", 0) < MAX_ATTEMPTS):
+                    # INFRA failure: the task WAS running (it had a heartbeat) but its
+                    # hold-job/node is gone — the node expired or was reclaimed, not the
+                    # task's own crash. Requeue onto another live node, but the new run
+                    # CANNOT resume from where it left off (feedback C4): warn the agent
+                    # both in the queue state and, durably, in the task log.
+                    prev_node = task.get("node", "?")
+                    task["attempts"]           = task.get("attempts", 0) + 1
+                    task["requeue_count"]      = task.get("requeue_count", 0) + 1
+                    task["checkpoint_warning"] = True
+                    task["last_infra_failure"] = now_iso()
+                    task["state"]              = "pending"
+                    task["pending_reason"]     = "infra_failure_redispatch"
+                    task["slurm_jobid"]        = None
+                    task["node"]               = None
+                    task["srun_pid"]           = None
+                    task["started_at"]         = None
+                    append_log_note(task, [
+                        "",
+                        f"=== hive: node {prev_node} (hold job {jid}) was reclaimed mid-run "
+                        f"at {now_iso()} ===",
+                        f"=== hive: task #{task['id']} will be RE-DISPATCHED to another node "
+                        f"(attempt {task['attempts']}/{MAX_ATTEMPTS}). ===",
+                        "=== hive: this is NOT a checkpoint resume — earlier progress is lost "
+                        "unless your command reloads from its own checkpoint. ===",
+                        "",
+                    ])
+                    if jid:
+                        running_jobids.discard(jid)
+                    changed = True
+                    logging.warning("Task %d: node/hold-job %s reclaimed mid-run (infra "
+                                    "failure) — requeued to another node (attempt %d/%d); "
+                                    "checkpoint continuity LOST", task["id"], jid,
+                                    task["attempts"], MAX_ATTEMPTS)
+                    ev.record("requeue", task=task["id"], name=task.get("name") or None,
+                              reason="infra_failure", prev_node=prev_node, slurm_jobid=jid,
+                              attempts=task["attempts"], requeue_count=task["requeue_count"],
+                              checkpoint_lost=True)
+                else:
+                    task["state"]       = "failed"
+                    task["exit_code"]   = -1
+                    task["finished_at"] = now_iso()
+                    task["duration_secs"] = _duration_secs(task)
+                    task["queued_secs"]   = _queued_secs(task)
+                    if jid:
+                        running_jobids.discard(jid)
+                        freed_jobids.add(jid)
+                    changed = True
+                    logging.warning("Task %d declared dead (heartbeat timeout)", task["id"])
+                    ev.record("finish", task=task["id"], name=task.get("name") or None,
+                              state="failed", exit_code=-1, node=task.get("node"),
+                              slurm_jobid=jid, run_secs=task["duration_secs"],
+                              queued_secs=task["queued_secs"])
 
-        # ── (2) Dispatch pending tasks to idle nodes ─────────────────────────
-        idle_nodes = get_idle_nodes(jobs_db, running_jobids)
+        # ── (2) Dispatch pending tasks ───────────────────────────────────────
+        # Candidate nodes are tried per task with a verify-before-dispatch live
+        # probe + a GPU-clean / free-mem gate, so we never dispatch onto a dirty
+        # or actually-occupied GPU (feedback C1/C2). A reason is recorded on each
+        # task that can't be placed this cycle.
+        candidates = get_candidates(jobs_db, running_jobids, freed_jobids)
         pending = sorted(
             [t for t in tasks.values() if t["state"] == "pending"],
             key=lambda t: (-t.get("priority", 0), t["submitted_at"]),
         )
 
-        for (slurm_jobid, node_info), task in zip(idle_nodes, pending):
-            node_name = node_info.get("node", "?")
-            logging.info("Dispatching task %d → %s (slurm jobid %s)",
-                         task["id"], node_name, slurm_jobid)
-            try:
-                srun_pid = dispatch_task(task, slurm_jobid, node_name)
-            except Exception as e:
-                logging.error("Failed to dispatch task %d: %s", task["id"], e)
-                continue
+        dispatched = 0
+        for task in pending:
+            need_mb = int(task.get("need_mb") or NEED_MB_DEFAULT)
+            reason = "no_dispatchable_node"
+            placed = False
 
-            task["state"]       = "running"
-            task["slurm_jobid"] = slurm_jobid
-            task["node"]        = node_name
-            task["srun_pid"]    = srun_pid
-            task["started_at"]  = now_iso()
-            running_jobids.add(slurm_jobid)
-            changed = True
+            while candidates:
+                jid, info, needs_verify = candidates.pop(0)
+                used, total = db_gpu_mem(info)
+
+                if needs_verify:
+                    p = live_probe(jid)
+                    if not p["ok"]:
+                        reason = "probe_unverifiable"
+                        continue   # can't confirm free — skip this node this cycle
+                    used, total = p["mem_used"], p["mem_total"]
+                    # A node the DB called idle but that is actually occupied:
+                    if p["util"] >= 5 and used >= 500:
+                        reason = "node_busy_on_verify"
+                        continue
+
+                if used > GPU_CLEAN_MB:
+                    reason = "gpu_dirty"          # zombie / co-tenant memory resident
+                    continue
+                if total and need_mb and (total - used) < need_mb:
+                    reason = "waiting_for_mem"
+                    continue
+
+                # Walltime gate (only when the task carries a runtime estimate — see
+                # WALLTIME_MARGIN_SECS): never place a long task on a node that will be
+                # reclaimed mid-run. -1 (unlimited) and None (unknown / older poller)
+                # never block.
+                node_left = db_time_left(info, db_updated)
+                est = task.get("est_runtime_secs")
+                if est and node_left is not None and node_left >= 0 \
+                        and node_left < (int(est) + WALLTIME_MARGIN_SECS):
+                    reason = "insufficient_walltime"
+                    logging.info("Task %d skips %s: node walltime %s < est %s + margin",
+                                 task["id"], info.get("node", "?"),
+                                 _fmt_dur(node_left), _fmt_dur(int(est)))
+                    continue
+
+                node_name = info.get("node", "?")
+                logging.info("Dispatching task %d → %s (slurm jobid %s, used=%dMiB, "
+                             "node_walltime=%s)", task["id"], node_name, jid, used,
+                             _fmt_dur(node_left))
+                # Crash-safe: persist the claim BEFORE launching the srun step so a
+                # scheduler killed mid-dispatch can't orphan a step (feedback OPT-E).
+                task["state"]        = "running"
+                task["slurm_jobid"]  = jid
+                task["node"]         = node_name
+                task["srun_pid"]     = None
+                task["started_at"]   = now_iso()
+                task["dispatched_at"] = now_iso()
+                task["node_time_left_secs"] = node_left
+                task.pop("pending_reason", None)
+                save_queue(queue, lfd)
+                try:
+                    srun_pid = dispatch_task(task, jid, node_name)
+                except Exception as e:
+                    logging.error("Failed to dispatch task %d: %s", task["id"], e)
+                    task["state"] = "pending"
+                    task["slurm_jobid"] = task["node"] = task["srun_pid"] = None
+                    task["started_at"] = None
+                    save_queue(queue, lfd)
+                    reason = "dispatch_error"
+                    placed = True   # consumed the candidate; stop trying for this task
+                    break
+                task["srun_pid"] = srun_pid
+                running_jobids.add(jid)
+                changed = True
+                dispatched += 1
+                placed = True
+                ev.record("dispatch", task=task["id"], name=task.get("name") or None,
+                          node=node_name, slurm_jobid=jid,
+                          node_time_left_secs=node_left,
+                          est_runtime_secs=task.get("est_runtime_secs"),
+                          requeue_count=task.get("requeue_count", 0) or None)
+                break
+
+            if not placed:
+                if task.get("pending_reason") != reason:
+                    task["pending_reason"] = reason
+                    changed = True
+
+        # ── (3) Starvation watchdog ──────────────────────────────────────────
+        if pending and dispatched == 0:
+            _starve_streak += 1
+            if _starve_streak >= STARVATION_CYCLES:
+                request_repoll(f"starvation: {len(pending)} pending, 0 dispatched "
+                               f"for {_starve_streak} cycles")
+                _starve_streak = 0
+        else:
+            _starve_streak = 0
 
         if changed:
             save_queue(queue, lfd)
