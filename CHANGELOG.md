@@ -69,6 +69,22 @@
   holds the task PENDING (`waiting_for_mem`) until a node has it free.
 - **`docs/status_model.md`** — authoritative node-status & dispatch-gating reference.
 
+### Safety
+- **`hive pool release` now requires interactive human confirmation.** Releasing
+  allocated nodes is irreversible (you re-enter the SLURM queue), so it **refuses to run
+  non-interactively** (no TTY → an agent/script can never release nodes) and otherwise
+  requires typing `release`. There is intentionally **no `--yes`/`--force`** and it must
+  never be blanket-/"always"-authorized.
+
+### Fixed (correctness — zombie srun masking finished tasks, found during the live soak)
+- **A reclaimed task is no longer stuck `running` forever.** `check_task_status` /
+  `_is_crash_orphan` used `os.kill(srun_pid, 0)` for liveness, but an exited-and-unreaped
+  `srun` becomes a `<defunct>` zombie that still answers kill-0 — so when a node was
+  reclaimed, the zombie kept the task "alive" and the infra-failure requeue never fired
+  (observed: 3 tasks stuck after their evc104 hold jobs ended). The scheduler now reaps
+  exited children each cycle (`os.waitpid(WNOHANG)`) and uses a zombie-aware `_pid_alive`
+  (reads `/proc/<pid>/stat`, treats state `Z` as dead).
+
 ### Fixed (multi-instance safety — found via live multi-node test)
 - **`daemon stop`/`restart` sweep is now `HIVE_DIR`-scoped**: the stale-daemon cleanup
   (`pgrep -f hive-daemon`, kill >60s old) previously killed **all** hive-daemon

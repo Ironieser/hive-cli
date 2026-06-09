@@ -58,8 +58,10 @@ hive pool add highgpu            # named preset
 hive pool add ~/hold.slurm       # direct script path
 hive pool add --count 2 --time 12:00:00
 hive pool add --no-validate ...  # skip the sbatch --test-only pre-flight check
-hive pool release --idle         # scancel all IDLE hold jobs (⚠️ see rules below)
-hive pool release <JOBID>        # scancel one specific hold job
+hive pool release --idle         # scancel all IDLE hold jobs — ⚠️ INTERACTIVE-ONLY
+hive pool release <JOBID>        # scancel one hold job — ⚠️ INTERACTIVE-ONLY
+#   release REQUIRES a human to confirm at a TTY (type 'release'); it REFUSES to run
+#   non-interactively and has no --yes/--force. Agents cannot release nodes — ask the user.
 hive pool config                 # show presets + flag any SLURM-rejected ones (✓/✗)
 ```
 

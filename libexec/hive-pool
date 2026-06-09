@@ -144,6 +144,41 @@ def cmd_add(args):
             print(f"  {C_RED}✗{C_RESET} {result.stderr.strip()}", file=sys.stderr)
 
 
+def _confirm_release(targets):
+    """Hard authorization gate for releasing (scancel-ing) allocated nodes.
+
+    Releasing is IRREVERSIBLE — the node returns to the SLURM queue and may take a long
+    time to re-acquire — so it must always be a deliberate, human-confirmed action:
+      * refuses outright in any NON-interactive context (no TTY) — an agent/script can
+        never release nodes unattended;
+      * otherwise requires the user to type the exact word 'release'.
+    There is intentionally NO --yes/--force flag and this must never be blanket-/"always"-
+    authorized — every release is confirmed individually.
+    """
+    desc = ", ".join(targets)
+    if not sys.stdin.isatty():
+        print(f"{C_RED}Refusing to release nodes: this requires interactive human "
+              f"confirmation.{C_RESET}", file=sys.stderr)
+        print(f"  Would scancel hold job(s): {desc}", file=sys.stderr)
+        print("  `hive pool release` permanently gives back allocated GPU nodes (you re-enter",
+              file=sys.stderr)
+        print("  the SLURM queue). Run it yourself in a terminal and confirm at the prompt.",
+              file=sys.stderr)
+        print("  (By design there is no --yes/--force, and it must not be 'always'-allowed.)",
+              file=sys.stderr)
+        sys.exit(2)
+    print(f"{C_YELLOW}⚠  About to RELEASE (scancel) {len(targets)} hold job(s): {desc}{C_RESET}")
+    print("   This is IRREVERSIBLE — the node(s) go back to the SLURM queue and you'll have")
+    print("   to wait to re-acquire them.")
+    try:
+        ans = input("   Type 'release' to confirm (anything else aborts): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    if ans != "release":
+        print("Aborted — nothing released.")
+        sys.exit(1)
+
+
 def cmd_release(args):
     if args.idle:
         idle_ids = load_idle_jobids()
@@ -151,6 +186,7 @@ def cmd_release(args):
             print("No IDLE nodes found in node_monitor.json.")
             print("Run 'hive poll' first to refresh node status.")
             return
+        _confirm_release(idle_ids)
         print(f"Cancelling {len(idle_ids)} IDLE hold job(s): {', '.join(idle_ids)}")
         for jid in idle_ids:
             result = subprocess.run(["scancel", jid], capture_output=True, text=True)
@@ -160,6 +196,7 @@ def cmd_release(args):
                 print(f"  {C_RED}✗{C_RESET} scancel {jid}: {result.stderr.strip()}")
     else:
         jid = str(args.jobid)
+        _confirm_release([jid])
         result = subprocess.run(["scancel", jid], capture_output=True, text=True)
         if result.returncode == 0:
             print(f"{C_GREEN}✓{C_RESET} Cancelled job {jid}")

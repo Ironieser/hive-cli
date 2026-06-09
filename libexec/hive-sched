@@ -161,6 +161,42 @@ def _age_local(iso):
         return None
 
 
+def _pid_alive(pid):
+    """True only if `pid` is a LIVE (non-zombie) process.
+
+    A dead srun child we never reaped becomes a <defunct> zombie that STILL answers
+    os.kill(pid, 0) — so a plain kill-0 check reports a finished task as "alive" forever
+    and the reclaim/requeue path never fires (observed in production: a reclaimed node's
+    srun zombie kept 3 tasks stuck `running`). We additionally read /proc/<pid>/stat and
+    treat state 'Z' (zombie) as dead. comm may contain spaces/parens, so split after the
+    final ')'.
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except (OSError, IndexError):
+        return True   # can't read state → assume alive (conservative)
+
+
+def _reap_children():
+    """Reap any exited srun children so they don't linger as <defunct> zombies (which
+    would otherwise mask finished tasks via os.kill — see _pid_alive). Non-blocking."""
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+    except ChildProcessError:
+        pass
+
+
 def db_gpu_mem(info):
     """Max (mem_used, mem_total) MiB across this hold-job's GPUs from the DB."""
     gpus = info.get("gpu", []) or []
@@ -461,13 +497,10 @@ def check_task_status(task_id, srun_pid):
         if age < HEARTBEAT_TIMEOUT:
             return "alive"
 
-    # No heartbeat (or stale) — check if srun is still alive
-    if srun_pid:
-        try:
-            os.kill(srun_pid, 0)
-            return "alive"   # process exists, maybe just starting
-        except (ProcessLookupError, PermissionError):
-            pass
+    # No heartbeat (or stale) — check if srun is still a LIVE process (a zombie srun
+    # answers kill-0 but is really dead, so use _pid_alive, not a bare os.kill).
+    if srun_pid and _pid_alive(srun_pid):
+        return "alive"   # process exists, maybe just starting
 
     return "dead"
 
@@ -490,18 +523,15 @@ def _is_crash_orphan(task):
     if _has_exit_file(tid) or _has_heartbeat_file(tid):
         return False
     pid = task.get("srun_pid")
-    if pid:
-        try:
-            os.kill(pid, 0)
-            return False   # srun still alive — not an orphan
-        except (ProcessLookupError, PermissionError):
-            pass
+    if pid and _pid_alive(pid):
+        return False   # srun still a live process — not an orphan
     age = _age_local(task.get("dispatched_at") or task.get("started_at"))
     return age is None or age > ORPHAN_GRACE_SECS
 
 
 def run_one_cycle():
     global _starve_streak
+    _reap_children()   # clear exited srun zombies so liveness checks stay truthful
     jobs_db, db_updated = load_node_db()
     changed = False
 

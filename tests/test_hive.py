@@ -98,6 +98,15 @@ chk("duration_secs", hs._duration_secs(
     {"started_at": "2026-06-07T10:00:00", "finished_at": "2026-06-07T11:30:00"}) == 5400)
 chk("fmt_dur", hs._fmt_dur(5400) == "1h30m" and hs._fmt_dur(-1) == "unlimited")
 
+print("== unit: _pid_alive (zombie-aware liveness) ==")
+import subprocess as _sp
+chk("live self is alive", hs._pid_alive(os.getpid()) is True)
+chk("nonexistent pid is dead", hs._pid_alive(2**31 - 1) is False)
+chk("None is dead", hs._pid_alive(None) is False)
+_z = _sp.Popen(["true"]); time.sleep(0.3)   # exited but unreaped → <defunct> zombie
+chk("zombie child treated as DEAD (not alive)", hs._pid_alive(_z.pid) is False)
+_z.wait()
+
 print("== event log: record / done_runs / compaction ==")
 open(ev.EVENTS_FILE, "w").close()
 ev.record("finish", task=1, name="bench", state="done", run_secs=120, queued_secs=2)
