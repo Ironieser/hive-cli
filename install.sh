@@ -102,9 +102,11 @@ for f in node_monitor.json node_monitor.pid node_monitor.log; do
         info "Migrated: ${old} → ${new}"
     fi
 done
-# Stale pid from old daemon is now invalid — remove it
+# Remove the PID file ONLY if its daemon is genuinely dead. Read just the first line:
+# the file is the 2-line cluster-singleton format "<pid>\n<host>", so `cat` would feed
+# "<pid>\n<host>" to kill -0 (always fails) and wrongly delete a *live* poller's pid file.
 if [[ -f "${HIVE_DIR}/node_monitor.pid" ]]; then
-    pid=$(cat "${HIVE_DIR}/node_monitor.pid" 2>/dev/null || true)
+    pid=$(head -1 "${HIVE_DIR}/node_monitor.pid" 2>/dev/null || true)
     if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
         rm -f "${HIVE_DIR}/node_monitor.pid"
         info "Removed stale PID file"
