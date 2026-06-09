@@ -506,6 +506,8 @@ def cmd_submit(args):
     if est_secs:
         print(f"  runtime estimate: {fmt_elapsed(est_secs)} (source: {est_source}) — "
               f"scheduler will avoid nodes with < estimate + 10m walltime left")
+    print(f"{C_DIM}  ↻ on node reclaim this is auto-requeued & RE-RUN from scratch — make the "
+          f"command resumable (checkpoint / skip already-done outputs).{C_RESET}")
 
     # Auto-start scheduler daemon if not running
     if not is_sched_running():

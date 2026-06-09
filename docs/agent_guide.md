@@ -218,9 +218,25 @@ Check what nodes can offer with the **LEFT** column of `hive nodes`, and see you
 history with `hive stats [NAME]`.
 
 > ⚠ **A node reclaimed mid-run does NOT resume your process.** hive auto-requeues the
-> task onto another node, but it restarts from scratch. You'll see a `⚠` in
-> `hive wait`, a `(re-disp xN)` tag in `hive list`, and a banner in the task log. Make
-> long jobs checkpoint-and-resume so a re-dispatch picks up where it left off.
+> task onto another node and **re-runs the command from scratch** (up to 3×) — it cannot
+> resume a live process. You'll see a `⚠` in `hive wait`, a `(re-disp xN)` tag in
+> `hive list`, and a banner in the task log. So make the command **resumable** before you
+> submit:
+>
+> - **Training** — checkpoint periodically; on start, load the latest checkpoint
+>   (`--resume`/auto-resume) instead of starting from epoch 0.
+> - **Inference / batch jobs** — write outputs **incrementally** and make the run
+>   **idempotent**: on start, skip inputs that already have outputs (e.g. check the output
+>   dir or a manifest), so a re-run only processes what's missing and never duplicates work.
+>
+> ```bash
+> # resumable inference pattern: process only items without an output, append-safe
+> hive submit --name infer --est-runtime auto \
+>   "python run_infer.py --in shard.jsonl --out out/ --skip-existing"
+> ```
+>
+> A task whose **own command** crashes (node still alive) is marked `failed` and is **not**
+> retried — only genuine node/infra loss triggers a requeue.
 
 ### Monitor the queue
 

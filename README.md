@@ -163,9 +163,14 @@ hive surfaces this loudly:
 - `hive list` tags it `(re-disp xN)`;
 - the task log gets a banner.
 
-**Make long jobs checkpoint-and-resume**, and pass `--est-runtime` so the scheduler
-avoids placing them on a soon-expiring node in the first place. A task whose *own*
-command crashes (node still alive) is marked `failed` and **not** retried.
+**Design every long job to be resumable**, and pass `--est-runtime` so the scheduler
+avoids placing it on a soon-expiring node in the first place:
+
+- **Training** — checkpoint periodically; load the latest checkpoint on start (`--resume`).
+- **Inference / batch** — write outputs incrementally and make the run **idempotent**:
+  on start, skip inputs that already have outputs, so a re-run only does what's missing.
+
+A task whose *own* command crashes (node still alive) is marked `failed` and **not** retried.
 
 ### Keeping the queue tidy
 

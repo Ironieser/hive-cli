@@ -2,6 +2,23 @@
 
 Manage pre-allocated GPU nodes on a SLURM cluster. Submit experiments to the task queue; the scheduler auto-assigns them to idle nodes.
 
+> ## ⚠ Before you submit: make the job RESUMABLE
+> Pool nodes can be reclaimed at any time. If a node is reclaimed **while your task is
+> running**, hive automatically requeues the task onto another node and **re-runs the
+> command from scratch** (up to 3 attempts) — it cannot resume a live process. So design
+> every long job to continue where it left off:
+> - **Training** → checkpoint periodically and **load the latest checkpoint on start**
+>   (e.g. `--resume`/`auto_resume`). A re-run must reload, not restart from epoch 0.
+> - **Inference / batch jobs** → write results **incrementally** and on start **skip
+>   inputs already completed** (idempotent: re-running must not redo or duplicate done work,
+>   e.g. check the output dir / a manifest and process only what's missing).
+> - Pass **`--est-runtime <dur>`** so the scheduler won't place the job on a node whose
+>   remaining walltime is too short — reducing the chance of a mid-run reclaim.
+>
+> hive surfaces a re-dispatch in `hive wait` (a `⚠` line), `hive list` (`(re-disp xN)`),
+> and the task log banner. A task whose **own command** crashes (node still alive) is
+> marked `failed` and is **not** retried.
+
 ---
 
 ## Quick Command Reference
@@ -50,6 +67,62 @@ hive pool config                 # show presets + flag any SLURM-rejected ones (
 a malformed script fails once with a clear message (not N times), and hold-job
 stdout is redirected to `~/.hive/pool-logs/` instead of dumping `slurm-<id>.out`
 into your cwd.
+
+---
+
+## `hive submit` — how to submit a job (do this every time)
+
+`hive submit "<command>" [flags]` queues a command; the scheduler runs it on an idle GPU
+via `srun --overlap`. **Because a job can be auto-requeued and re-run from scratch
+(see the ⚠ box at top), only submit commands that are safe to re-run.** Recommended recipe:
+
+1. **Make the command resumable / idempotent** (the most important step):
+   - training → save checkpoints + load the latest on start;
+   - inference/batch → write outputs incrementally + skip inputs already done.
+2. **`--name <NAME>`** — groups runtime history (enables `--est-runtime auto` and `hive stats`).
+3. **`--est-runtime <dur|auto>`** — so it's placed on a node with enough remaining walltime.
+4. **`--need-mb <MiB>`** — for big models, wait for a card with that much free memory.
+5. **Capture the id and wait**, branching on the exit code.
+
+```bash
+ID=$(hive submit --name myrun --est-runtime 2h \
+      "python run.py --out out/ --resume --skip-existing" | grep -oP '#\K\d+')
+hive wait "$ID" --pending-timeout 1800
+# exit codes:  0 = done   1 = failed   75 = never dispatched   130 = cancelled
+```
+
+### Copy-paste templates
+
+**Training** (checkpoint → resume):
+```bash
+hive submit --name train_v1 --est-runtime auto \
+  "python train.py --config v1.yaml --output_dir runs/v1 --resume"
+# run.py MUST: checkpoint periodically into runs/v1, and on start load the latest
+# checkpoint if one exists (so a re-run continues instead of restarting from epoch 0).
+```
+
+**Inference / batch** (idempotent, skip already-done):
+```bash
+hive submit --name infer_v1 --est-runtime 1h \
+  "python infer.py --in data/shard.jsonl --out out/v1 --skip-existing"
+# infer.py MUST: write per-item outputs into out/v1, and on start process ONLY items
+# whose output is missing — never redo or duplicate completed items.
+```
+
+### Flags (all optional except the command)
+| Flag | Meaning |
+|---|---|
+| `--name NAME` / `-n` | label + history key (for `--est-runtime auto`, `hive stats`) |
+| `--est-runtime DUR` | `2h` / `90m` / `1-12:00:00` / seconds / `auto`; enables walltime-aware placement |
+| `--need-mb MiB` | hold PENDING until a GPU has this much free memory (avoid OOM) |
+| `--workdir DIR` / `-w` | working dir on the node (default: cwd at submit) |
+| `--priority N` / `-p` | higher dispatches first (default 0; negatives as `-p=-5`) |
+
+### Pre-submit checklist
+- [ ] Re-running the exact command is safe (no duplicated/corrupted outputs)?
+- [ ] It **resumes** (loads checkpoint / skips done) rather than restarting from zero?
+- [ ] `--name` set, and `--est-runtime` given (or `auto`)?
+- [ ] Large model → `--need-mb` set?
 
 ---
 
