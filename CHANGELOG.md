@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-09
+
 ### Added (walltime-aware scheduling + checkpoint-loss notification — feedback C4)
 - **Node remaining walltime tracked end-to-end**: the poller now records each hold
   job's `time_left_secs` (from `squeue %L`) into `node_monitor.json`, and `hive nodes`
