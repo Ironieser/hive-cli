@@ -76,8 +76,12 @@ case "$subcommand" in
         py="$(_resolve_python)"
         exec "$py" "${HIVE_LIBEXEC}/hive-pool" "$@"
         ;;
+    feedback)
+        py="$(_resolve_python)"
+        exec "$py" "${HIVE_LIBEXEC}/hive-feedback" "$@"
+        ;;
     # ── Queue shortcuts (hive submit → hive queue submit, etc.) ──────────────
-    submit|wait|list|ls|cancel|logs|rm)
+    submit|wait|list|ls|cancel|logs|rm|stats|prune)
         py="$(_resolve_python)"
         exec "$py" "${HIVE_LIBEXEC}/hive-queue" "$subcommand" "$@"
         ;;
@@ -108,14 +112,19 @@ case "$subcommand" in
     daemon   start|stop|restart|status|logs
     poll                      Trigger immediate node poll
     submit   "cmd"|job.hive   Submit to task queue (shortcut for queue submit)
+                              (--est-runtime 2h|auto → walltime-aware scheduling)
     wait     ID               Block until task done, print log, exit $?
     list                      Show task queue (shortcut for queue list)
     logs     ID [-f]          Show / follow task log
     cancel   ID               Cancel pending or running task
-    queue    submit|list|wait|cancel|logs|rm|daemon
+    stats    [NAME]           Completed-task runtime history (for --est-runtime)
+    prune    [--older-than D] Drop old terminal tasks from the queue (history kept)
+    queue    submit|list|wait|cancel|logs|rm|stats|prune|daemon
                               Full task queue interface
     pool     add|release|init|config
                               Manage node pool (sbatch hold jobs / scancel)
+    feedback "text" | submit|list|show|triage
+                              File / manage feedback for the hive-cli repo
 
   Examples:
     hive jobs -a              Show all users' jobs

@@ -132,7 +132,7 @@ squeue -u $USER     # confirm the hold job appears (state: R or PD)
 
 ```bash
 hive daemon start
-# daemon probes all hold jobs every 120s via srun --overlap
+# daemon probes all hold jobs every 900s via srun --overlap
 # results written to ~/.hive/node_monitor.json (shared across all nodes via Lustre/NFS)
 ```
 
@@ -202,9 +202,41 @@ hive queue submit train_v1.hive
 hive queue submit --workdir /path/to/project "python eval.py"
 hive queue submit --priority 10 "urgent_experiment.sh"   # higher priority runs first
 hive queue submit --name my-run "python train.py"
+hive queue submit --need-mb 40000 "python train_big.py"  # hold until 40 GB GPU free
+hive queue submit --name train --est-runtime 2h "python train.py"     # walltime-aware
+hive queue submit --name train --est-runtime auto "python train.py"   # estimate from history
 ```
 
 The task enters `PENDING` state and starts within ≤30s once an IDLE node is available.
+
+#### Long jobs: runtime estimate + checkpointing
+
+If a job runs for hours, give it `--est-runtime` (e.g. `2h`, `90m`, or `auto` to use the
+P90 of past runs with the same `--name`). The scheduler then won't place it on a node
+whose remaining walltime is below the estimate + 10 min — avoiding a mid-run eviction.
+Check what nodes can offer with the **LEFT** column of `hive nodes`, and see your own
+history with `hive stats [NAME]`.
+
+> ⚠ **A node reclaimed mid-run does NOT resume your process.** hive auto-requeues the
+> task onto another node and **re-runs the command from scratch** (up to 3×) — it cannot
+> resume a live process. You'll see a `⚠` in `hive wait`, a `(re-disp xN)` tag in
+> `hive list`, and a banner in the task log. So make the command **resumable** before you
+> submit:
+>
+> - **Training** — checkpoint periodically; on start, load the latest checkpoint
+>   (`--resume`/auto-resume) instead of starting from epoch 0.
+> - **Inference / batch jobs** — write outputs **incrementally** and make the run
+>   **idempotent**: on start, skip inputs that already have outputs (e.g. check the output
+>   dir or a manifest), so a re-run only processes what's missing and never duplicates work.
+>
+> ```bash
+> # resumable inference pattern: process only items without an output, append-safe
+> hive submit --name infer --est-runtime auto \
+>   "python run_infer.py --in shard.jsonl --out out/ --skip-existing"
+> ```
+>
+> A task whose **own command** crashes (node still alive) is marked `failed` and is **not**
+> retried — only genuine node/infra loss triggers a requeue.
 
 ### Monitor the queue
 
@@ -256,7 +288,19 @@ TASK_ID=$(hive queue submit "python eval.py" | grep -oP '#\K\d+')
 hive queue wait $TASK_ID
 # blocks until DONE/FAILED/CANCELLED
 # prints the full log when done
-# exits with the task's exit code ($? = 0 for success, non-zero for failure, 130 for cancelled)
+# also prints a measured timing line: ✓ task #N done · queued 4s · ran 12m · on evcX
+# exits with the task's exit code: 0 success · 1 failure · 130 cancelled
+```
+
+`hive wait` also tells you **why** a task is stuck instead of waiting blind: it prints the
+`pending_reason` (and a ⚠ for `insufficient_walltime`, which may never clear on its own).
+Use `--pending-timeout SEC` so an agent never blocks forever on an unschedulable task —
+it exits **75** if the task hasn't dispatched in time:
+
+```bash
+hive queue wait $TASK_ID --pending-timeout 600 || {
+  [ $? -eq 75 ] && echo "never dispatched — add a longer-walltime node or lower --est-runtime"
+}
 ```
 
 This is the recommended pattern for agent workflows that need to chain steps:
@@ -274,9 +318,15 @@ hive queue submit "python eval.py --checkpoint results/v1/best.pt"
 ### Clean up completed tasks
 
 ```bash
-hive queue rm 3          # remove a DONE/FAILED/CANCELLED task record
+hive queue rm 3          # remove one DONE/FAILED/CANCELLED task record
 hive queue cancel 6      # cancel PENDING or RUNNING task
+hive prune --dry-run     # preview bulk cleanup of old terminal tasks
+hive prune --older-than 7d   # drop terminal tasks finished >7d ago (never touches active)
 ```
+
+`queue.json` is the live queue; pruning it is safe because the durable runtime/timing
+history lives in `~/.hive/events.jsonl` (the source for `hive stats` and
+`--est-runtime auto`). Pruned task logs are kept unless you pass `--logs`.
 
 ---
 
@@ -368,7 +418,7 @@ if os.path.exists(log_path):
 ```
 ~/.hive/
 ├── pool_config.json       # your preset sbatch scripts (local only, not in git)
-├── node_monitor.json      # live node state (updated every 120s by daemon)
+├── node_monitor.json      # live node state (updated every 900s by daemon)
 ├── node_monitor.pid       # daemon PID
 ├── node_monitor.log       # daemon log (rolling 500 lines)
 ├── queue.json             # task queue DB

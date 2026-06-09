@@ -8,14 +8,26 @@ USER="${USER:-$(whoami)}"
 HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
 DB_DIR="$HIVE_DIR"
 DB_FILE="${HIVE_DIR}/node_monitor.json"
-DB_TMP="${DB_FILE}.tmp"
+DB_TMP="${DB_FILE}.$$.tmp"          # PID-scoped so concurrent writers don't clobber (feedback OPT-C)
+DB_LOCK="${DB_FILE}.lock"
 PID_FILE="${DB_DIR}/node_monitor.pid"
 LOG_FILE="${DB_DIR}/node_monitor.log"
+# Cluster-singleton coordination over the shared FS (feedback C5): hostname-tagged
+# PID + a heartbeat so any node sees a poller is alive, plus request files for
+# cross-node force-repoll / stop (SIGUSR1 only reaches a same-node poller).
+NODE_HB="${DB_DIR}/node_monitor.heartbeat"
+POLL_REQ="${DB_DIR}/node_monitor.poll-request"
+STOP_REQ="${DB_DIR}/node_monitor.stop-request"
+HB_EVERY=30                 # write heartbeat roughly every 30s
 POLL_INTERVAL=900
+_LIBEXEC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+DBPOST_BIN="${_LIBEXEC}/hive-dbpost"
+
+write_node_heartbeat() { date -Iseconds > "$NODE_HB" 2>/dev/null || true; }
 
 # ── signal handling ───────────────────────────────────────────────────────────
 SIGUSR1_RECEIVED=0
-trap 'log "Received SIGTERM/SIGINT, exiting."; rm -f "$PID_FILE"; exit 0' TERM INT
+trap 'log "Received SIGTERM/SIGINT, exiting."; rm -f "$PID_FILE" "$NODE_HB"; exit 0' TERM INT
 trap 'SIGUSR1_RECEIVED=1' USR1
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -80,9 +92,34 @@ json_escape() {
     printf '%s' "$s"
 }
 
+slurm_time_to_secs() {
+    # SLURM TimeLeft (%L): [D-]HH:MM:SS / HH:MM:SS / MM:SS / UNLIMITED / N/A.
+    # Emits a JSON token (no quotes): integer seconds, -1 for UNLIMITED, or null.
+    local t="$1"
+    case "$t" in
+        UNLIMITED|unlimited|INFINITE|infinite) printf '%s' '-1'; return ;;
+        ''|N/A|n/a|INVALID|NOT_SET)           printf 'null';     return ;;
+    esac
+    local days=0
+    if [[ "$t" == *-* ]]; then days="${t%%-*}"; t="${t#*-}"; fi
+    local IFS=':'; local -a p; read -ra p <<< "$t"
+    local h=0 m=0 s=0
+    if (( ${#p[@]} == 3 )); then
+        h=$(( 10#${p[0]:-0} )); m=$(( 10#${p[1]:-0} )); s=$(( 10#${p[2]:-0} ))
+    elif (( ${#p[@]} == 2 )); then
+        m=$(( 10#${p[0]:-0} )); s=$(( 10#${p[1]:-0} ))
+    elif (( ${#p[@]} == 1 )); then
+        s=$(( 10#${p[0]:-0} ))
+    else
+        printf 'null'; return
+    fi
+    days=$(( 10#${days:-0} ))
+    printf '%s' "$(( days*86400 + h*3600 + m*60 + s ))"
+}
+
 # ── probe a single job ────────────────────────────────────────────────────────
 probe_job() {
-    local jobid="$1" node="$2" partition="$3" elapsed_raw="$4"
+    local jobid="$1" node="$2" partition="$3" elapsed_raw="$4" time_left_secs="${5:-null}"
     local outfile="${POLL_TMPDIR}/${jobid}.json"
     local polled_at
     polled_at=$(date -u '+%Y-%m-%dT%H:%M:%S')
@@ -92,9 +129,20 @@ probe_job() {
     local probe_cmd
     probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
-    local raw
+    # Run probe; retry once on transient failure (empty / non-zero / no ---PS---
+    # marker). Distinguishes probe failure from a genuinely idle GPU (feedback OPT-A).
+    local raw rc
     raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
-        bash -c "$probe_cmd" 2>/dev/null)
+        bash -c "$probe_cmd" 2>/dev/null); rc=$?
+    if [[ $rc -ne 0 || -z "$raw" || "$raw" != *"---PS---"* ]]; then
+        sleep 1
+        raw=$(timeout 30 srun --jobid="$jobid" --overlap -n1 --mem=0 \
+            bash -c "$probe_cmd" 2>/dev/null); rc=$?
+    fi
+    local probe_failed=0
+    if [[ $rc -ne 0 || -z "$raw" || "$raw" != *"---PS---"* ]]; then
+        probe_failed=1
+    fi
 
     local in_ps=0
     local gpu_json="" ps_json=""
@@ -142,7 +190,9 @@ probe_job() {
     done <<< "$raw"
 
     local status
-    if (( max_gpu_total == 0 )); then
+    if (( probe_failed )); then
+        status="probe_failed"
+    elif (( max_gpu_total == 0 )); then
         status="cpu"
     elif (( max_gpu_util >= 5 || max_gpu_mem >= 500 )); then
         status="busy"
@@ -159,6 +209,7 @@ probe_job() {
   "processes": [${ps_json}],
   "status": "${status}",
   "gpu_idle_since": null,
+  "time_left_secs": ${time_left_secs},
   "polled_at": "${polled_at}"
 }
 EOF
@@ -168,10 +219,22 @@ EOF
 do_poll() {
     POLL_TMPDIR="/tmp/hive_daemon_$$_$(date +%s)"
     mkdir -p "$DB_DIR" "$POLL_TMPDIR"
+    write_node_heartbeat   # refresh liveness at cycle entry (cross-node singleton)
+
+    # Serialize node-DB writers (feedback OPT-C): if a manual `hive poll` or another
+    # daemon instance holds the lock, skip this cycle rather than racing the mv.
+    exec 9>"$DB_LOCK"
+    if ! flock -n 9; then
+        log "Node DB locked by another poll — skipping this cycle."
+        rm -rf "$POLL_TMPDIR"
+        return
+    fi
     log "Poll cycle starting"
 
+    # %L = TimeLeft (remaining walltime); %j (job name, last col) is only used to
+    # filter cursor_ssh_proxy, then stripped. Order: id|node|part|elapsed|left|name.
     local squeue_out
-    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%j" 2>/dev/null \
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%j" 2>/dev/null \
         | grep -v cursor_ssh_proxy \
         | sed 's/|[^|]*$//')   # strip job name column after filtering
 
@@ -182,12 +245,13 @@ do_poll() {
         printf '{\n  "updated": "%s",\n  "jobs": {}\n}\n' "$updated" > "$DB_TMP"
         mv "$DB_TMP" "$DB_FILE"
         rm -rf "$POLL_TMPDIR"
+        exec 9>&-   # release node-DB lock (do not hold it across the sleep)
         log "DB written (empty): $DB_FILE"
         return
     fi
 
     local job_ids=()
-    declare -A JOB_NODE JOB_PART JOB_ELAPSED
+    declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT
 
     # 先把 squeue 结果全部读入数组，避免 while read 的 stdin 被后台 srun 消耗
     local -a squeue_lines=()
@@ -196,16 +260,17 @@ do_poll() {
     done <<< "$squeue_out"
 
     for line in "${squeue_lines[@]}"; do
-        IFS='|' read -r jobid node partition elapsed <<< "$line"
+        IFS='|' read -r jobid node partition elapsed timeleft <<< "$line"
         jobid="${jobid// /}"; node="${node// /}"
-        partition="${partition// /}"; elapsed="${elapsed// /}"
+        partition="${partition// /}"; elapsed="${elapsed// /}"; timeleft="${timeleft// /}"
         [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
         job_ids+=("$jobid")
         JOB_NODE["$jobid"]="$node"
         JOB_PART["$jobid"]="$partition"
         JOB_ELAPSED["$jobid"]="$elapsed"
-        log "Probing job $jobid on $node ($partition) elapsed=$elapsed ..."
-        probe_job "$jobid" "$node" "$partition" "$elapsed" </dev/null &
+        JOB_TIMELEFT["$jobid"]="$(slurm_time_to_secs "$timeleft")"
+        log "Probing job $jobid on $node ($partition) elapsed=$elapsed left=${timeleft:-?} ..."
+        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" </dev/null &
     done
 
     # Wait up to 35s for all probes
@@ -243,7 +308,9 @@ do_poll() {
   "job_elapsed": "$(json_escape "$elapsed_fmt")",
   "gpu": [],
   "processes": [],
-  "status": "unknown",
+  "status": "probe_failed",
+  "gpu_idle_since": null,
+  "time_left_secs": ${JOB_TIMELEFT[$jid]:-null},
   "polled_at": "${polled_at}"
 }
 FBEOF
@@ -257,8 +324,20 @@ FBEOF
         printf '  }\n}\n'
     } > "$DB_TMP"
 
+    # Preserve the previous DB so hive-dbpost can apply warning timers and
+    # carry-forward last-good state for probe_failed jobs.
+    local OLD_DB_CONTENT_FILE="${POLL_TMPDIR}/old_db.json"
+    [[ -f "$DB_FILE" ]] && cp "$DB_FILE" "$OLD_DB_CONTENT_FILE" || touch "$OLD_DB_CONTENT_FILE"
+
     mv "$DB_TMP" "$DB_FILE"
+
+    # Shared post-processing (identical to hive-poll — feedback OPT-A).
+    if [[ -x "$DBPOST_BIN" ]]; then
+        python3 "$DBPOST_BIN" "$DB_FILE" "$OLD_DB_CONTENT_FILE" 2>/dev/null || true
+    fi
+
     rm -rf "$POLL_TMPDIR"
+    exec 9>&-   # release node-DB lock (do not hold it across the sleep)
     log "DB written: $DB_FILE  (${#job_ids[@]} jobs)"
 }
 
@@ -266,20 +345,34 @@ FBEOF
 main() {
     mkdir -p "$DB_DIR"
 
-    # Write PID file
-    echo $$ > "$PID_FILE"
-    log "hive-daemon started (PID $$, interval=${POLL_INTERVAL}s)"
+    # Write PID file WITH hostname (mirrors sched.pid) so other nodes can tell where
+    # the single poller lives; clear any stale stop-request from a prior instance.
+    printf '%s\n%s\n' "$$" "$(hostname)" > "$PID_FILE"
+    rm -f "$STOP_REQ"
+    write_node_heartbeat
+    log "hive-daemon started (PID $$, host $(hostname), interval=${POLL_INTERVAL}s)"
 
     # Immediate first poll
     do_poll
 
     while true; do
-        # Sleep in 1s increments to catch SIGUSR1 quickly
+        # Sleep in 1s increments to catch SIGUSR1 + cross-node request files quickly
         local slept=0
         SIGUSR1_RECEIVED=0
         while (( slept < POLL_INTERVAL )); do
             sleep 1
             slept=$(( slept + 1 ))
+            (( slept % HB_EVERY == 0 )) && write_node_heartbeat
+            if [[ -f "$STOP_REQ" ]]; then
+                log "stop-request file seen — exiting."
+                rm -f "$STOP_REQ" "$PID_FILE" "$NODE_HB"
+                exit 0
+            fi
+            if [[ -f "$POLL_REQ" ]]; then
+                log "poll-request file seen — triggering immediate poll"
+                rm -f "$POLL_REQ"
+                break
+            fi
             if (( SIGUSR1_RECEIVED )); then
                 log "SIGUSR1 received — triggering immediate poll"
                 break

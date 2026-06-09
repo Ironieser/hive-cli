@@ -28,40 +28,90 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
 # ── daemon helpers ────────────────────────────────────────────────────────────
 
-daemon_pid() {
+# Cluster-singleton coordination (feedback C5): the poller may run on ANY node, so
+# liveness can't use a host-local `kill -0`. Mirror hive-sched: a hostname-tagged PID
+# file + a shared-FS heartbeat. Any node sees "a poller is alive somewhere" and won't
+# start a second one.
+NODE_HB="${NODE_HB:-${HIVE_DIR}/node_monitor.heartbeat}"
+STOP_REQ="${STOP_REQ:-${HIVE_DIR}/node_monitor.stop-request}"
+NODE_HB_TIMEOUT="${NODE_HB_TIMEOUT:-180}"   # heartbeat older than this → poller dead
+
+daemon_pid() {   # echo stored PID (first line); no kill-gate (may be a remote host)
     [[ -f "$PID_FILE" ]] || return 1
-    local pid
-    pid=$(cat "$PID_FILE" 2>/dev/null)
+    local pid; pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null)
     [[ -z "$pid" ]] && return 1
-    kill -0 "$pid" 2>/dev/null || return 1
     echo "$pid"
 }
 
+daemon_host() {  # echo stored hostname (second line), empty if absent
+    [[ -f "$PID_FILE" ]] || return 1
+    sed -n '2p' "$PID_FILE" 2>/dev/null
+}
+
 daemon_running() {
-    daemon_pid > /dev/null 2>&1
+    local pid host
+    pid=$(daemon_pid 2>/dev/null)
+    host=$(daemon_host 2>/dev/null)
+    # If the poller is recorded on THIS host, the live PID is authoritative — detect a
+    # killed daemon immediately instead of trusting a stale-but-recent heartbeat from
+    # the dead process (otherwise it looks alive for up to NODE_HB_TIMEOUT).
+    if [[ -n "$pid" && ( -z "$host" || "$host" == "$(hostname)" ) ]]; then
+        kill -0 "$pid" 2>/dev/null && return 0 || return 1
+    fi
+    # Different (or unknown) host: rely on the shared-FS heartbeat freshness.
+    if [[ -f "$NODE_HB" ]]; then
+        local mtime now age
+        mtime=$(stat -c %Y "$NODE_HB" 2>/dev/null || stat -f %m "$NODE_HB" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        age=$(( now - mtime ))
+        (( age < NODE_HB_TIMEOUT )) && return 0
+    fi
+    return 1
 }
 
 daemon_start() {
-    # Use PID file as the single source of truth.
-    # pgrep is NOT used here — probe_job subshells also show as "hive-daemon"
-    # in pgrep output, making instance-count unreliable.
-    local pid
-    pid=$(daemon_pid 2>/dev/null)
-    if [[ -n "$pid" ]]; then
-        return 0  # already running, nothing to do
-    fi
     mkdir -p "$(dirname "$PID_FILE")"
+    # Atomic start mutex (same class as the scheduler / feedback C5): when several
+    # agents auto-start the poller at once, a check-then-start race could spawn
+    # duplicates. flock serializes check+start so only one wins.
+    local lock_fd
+    exec {lock_fd}>"${HIVE_DIR}/node_monitor.start.lock"
+    if ! flock -n "$lock_fd"; then
+        exec {lock_fd}>&-
+        return 0  # another start in progress
+    fi
+    if daemon_running; then
+        flock -u "$lock_fd"; exec {lock_fd}>&-
+        return 0  # a poller is already alive (possibly on another node)
+    fi
     nohup "$DAEMON_BIN" >> "$LOG_FILE" 2>&1 &
     local newpid=$!
-    echo "$newpid" > "$PID_FILE"
-    echo -e "  ${GREEN}Starting monitor daemon (PID $newpid)...${NC}"
+    printf '%s\n%s\n' "$newpid" "$(hostname)" > "$PID_FILE"   # daemon re-stamps this itself
+    date -Iseconds > "$NODE_HB" 2>/dev/null || true          # publish liveness immediately
+    flock -u "$lock_fd"; exec {lock_fd}>&-
+    echo -e "  ${GREEN}Starting monitor daemon (PID $newpid on $(hostname))...${NC}"
 }
 
 daemon_stop() {
-    local pid; pid=$(daemon_pid 2>/dev/null)
-    if [[ -z "$pid" ]]; then
-        echo -e "  ${DIM}Daemon not running (per PID file).${NC}"
-        rm -f "$PID_FILE"
+    local pid host; pid=$(daemon_pid 2>/dev/null); host=$(daemon_host 2>/dev/null)
+
+    if ! daemon_running; then
+        echo -e "  ${DIM}Daemon not running.${NC}"
+        rm -f "$PID_FILE" "$NODE_HB"
+    elif [[ -n "$host" && "$host" != "$(hostname)" ]]; then
+        # Remote poller — can't signal across nodes. Ask it to exit via a stop-request
+        # file (it checks every tick); it also self-exits within one heartbeat window.
+        : > "$STOP_REQ"
+        echo -e "  ${YELLOW}Daemon runs on ${BOLD}$host${NC}${YELLOW} (PID $pid). Wrote stop-request; waiting...${NC}"
+        local waited=0
+        while daemon_running && (( waited < 15 )); do sleep 1; waited=$(( waited + 1 )); done
+        if daemon_running; then
+            echo -e "  ${DIM}Still alive after ${waited}s — it will exit within one heartbeat, or ssh $host to kill PID $pid.${NC}"
+        else
+            echo -e "  ${GREEN}Remote daemon on $host stopped.${NC}"
+            rm -f "$PID_FILE" "$NODE_HB"
+        fi
+        return 0   # don't run the same-host sweep against a remote daemon
     else
         kill -TERM "$pid" 2>/dev/null
         local waited=0
@@ -75,15 +125,23 @@ daemon_stop() {
         else
             echo -e "  ${GREEN}Daemon (PID $pid) stopped.${NC}"
         fi
-        rm -f "$PID_FILE"
+        rm -f "$PID_FILE" "$NODE_HB"
     fi
 
-    # Sweep: kill any stale hive-daemon main processes (running > 60s).
+    # Sweep: kill any stale hive-daemon main processes ON THIS HOST (running > 60s)
+    # that belong to THIS hive instance (same HIVE_DIR). A daemon for a *different*
+    # HIVE_DIR on the same host is a separate cluster-singleton, not our zombie —
+    # scope by /proc/<pid>/environ so we never kill another instance's poller.
     # Probe subshells also appear as "hive-daemon" in pgrep but complete in < 30s,
-    # so the elapsed-time filter reliably targets only lingering daemon instances.
+    # so the elapsed-time filter reliably targets only lingering local daemon instances.
     local stale_pids=()
     while read -r spid; do
         [[ "$spid" == "$pid" ]] && continue   # already handled above
+        local spid_hd
+        spid_hd=$(tr '\0' '\n' < "/proc/${spid}/environ" 2>/dev/null \
+                  | sed -n 's/^HIVE_DIR=//p' | head -1)
+        [[ -z "$spid_hd" ]] && spid_hd="${HOME}/.hive"   # daemon's default when env unset
+        [[ "$spid_hd" != "$HIVE_DIR" ]] && continue       # different instance — leave it
         local elapsed
         elapsed=$(ps -o etimes= -p "$spid" 2>/dev/null | tr -d ' ')
         [[ -n "$elapsed" && "$elapsed" -gt 60 ]] && stale_pids+=("$spid")
@@ -106,7 +164,10 @@ show_daemon_footer() {
     printf "  %s\n" "$SEP"
 
     if daemon_running; then
-        local pid; pid=$(daemon_pid)
+        local pid host host_str
+        pid=$(daemon_pid); host=$(daemon_host)
+        host_str=""
+        [[ -n "$host" ]] && host_str=" on $host"
         # Try to get next poll time from last log entry
         local last_poll_epoch=""
         if [[ -f "$LOG_FILE" ]]; then
@@ -118,7 +179,7 @@ show_daemon_footer() {
         fi
 
         # Read actual poll interval from daemon startup log line
-        local poll_interval=120
+        local poll_interval=900
         if [[ -f "$LOG_FILE" ]]; then
             local interval_str
             interval_str=$(grep "hive-daemon started" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oP 'interval=\K[0-9]+')
@@ -137,7 +198,7 @@ show_daemon_footer() {
             next_str="unknown"
         fi
 
-        printf "  ${DIM}daemon: ${GREEN}${BOLD}RUNNING${NC}${DIM} (PID $pid)${NC}  ${DIM}│  next poll: %s  │  log: %s${NC}\n" \
+        printf "  ${DIM}daemon: ${GREEN}${BOLD}RUNNING${NC}${DIM} (PID $pid$host_str)${NC}  ${DIM}│  next poll: %s  │  log: %s${NC}\n" \
             "$next_str" "$LOG_FILE"
     else
         printf "  ${DIM}daemon: ${RED}${BOLD}STOPPED${NC}${DIM}  │  run ${BOLD}hive daemon start${NC}${DIM} to start  │  log: %s${NC}\n" \
@@ -199,6 +260,38 @@ def is_job_stale(polled_at):
     except Exception:
         return False
 
+def _updated_age():
+    try:
+        ts = datetime.fromisoformat(updated)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
+    except Exception:
+        return 0
+
+UPD_AGE = _updated_age()
+
+def fmt_left(secs):
+    # Remaining hold-job walltime; time_left_secs was captured at `updated`, so we
+    # subtract the DB's age. None (older poller) → "—"; -1 → unlimited.
+    if secs is None:
+        return "—"
+    try:
+        secs = int(secs)
+    except Exception:
+        return "—"
+    if secs < 0:
+        return "inf"
+    secs = max(0, secs - UPD_AGE)
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m, _ = divmod(r, 60)
+    if d:
+        return f"{d}d{h}h"
+    if h:
+        return f"{h}h{m}m"
+    return f"{m}m"
+
 jobs = data.get("jobs", {})
 for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
     j = jobs[jobid]
@@ -240,12 +333,13 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
         task_cmd = task_cmd[:54] + "…"
 
     stale_flag = "1" if is_job_stale(polled_at) else "0"
+    left = fmt_left(j.get("time_left_secs"))
 
     # task_cmd MUST be last: bash IFS=$'\t' read collapses consecutive tabs
     # (tab is IFS whitespace), so an empty task_cmd field would be swallowed.
     # Putting it last lets the final read variable capture "" correctly.
     fields = "\t".join([jobid, node, part, elapsed, status,
-                        str(gpu_util), mem_str, stale_flag, task_cmd])
+                        str(gpu_util), mem_str, left, stale_flag, task_cmd])
     print(f"JOB\t{fields}")
 PYEOF
 
@@ -301,7 +395,7 @@ show_table() {
     echo ""
 
     local SEP
-    SEP=$(printf '%0.s─' {1..83})
+    SEP=$(printf '%0.s─' {1..91})
 
     printf "  "
     print_col "$BOLD" "JOBID"   10
@@ -311,14 +405,15 @@ show_table() {
     print_col "$BOLD" "STATUS"  6
     print_col "$BOLD" "GPU%"    5
     print_col "$BOLD" "MEM"     9
+    print_col "$BOLD" "LEFT"    8
     print_col "$BOLD" "TASK"    0 ""
     printf "${NC}\n"
     printf "  %s\n" "$SEP"
 
-    local n_busy=0 n_cpu=0 n_idle=0
+    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0
 
     for row in "${rows[@]}"; do
-        IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str job_stale task_cmd <<< "$row"
+        IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str left job_stale task_cmd <<< "$row"
 
         local status_upper status_color
         if [[ "$status" == "busy" ]]; then
@@ -330,9 +425,11 @@ show_table() {
         elif [[ "$status" == "warning" ]]; then
             status_upper="WARN ";   status_color="${YELLOW}${BOLD}"
             n_busy=$(( n_busy + 1 ))
-        elif [[ "$status" == "unknown" ]]; then
-            status_upper="?????";   status_color="${DIM}"
-            n_idle=$(( n_idle + 1 ))
+        elif [[ "$status" == "probe_failed" || "$status" == "unknown" ]]; then
+            # Probe could not run — NOT idle. Counted separately so the summary
+            # doesn't conflate "GPU free" with "we couldn't tell" (feedback OPT-J).
+            status_upper="PFAIL";   status_color="${RED}${DIM}"
+            n_pfail=$(( n_pfail + 1 ))
         else
             status_upper="IDLE";    status_color="${YELLOW}${DIM}"
             n_idle=$(( n_idle + 1 ))
@@ -371,24 +468,37 @@ show_table() {
         print_col "$status_color" "$status_upper" 6
         print_col "$gpu_color"   "$gpu_disp"    5
         print_col ""             "$mem_str"     9
+        # Warn-color the remaining walltime when a node is close to expiry.
+        local left_color=""
+        case "$left" in
+            —|inf) left_color="$DIM" ;;
+            *m)    [[ "$left" != *h* && "$left" != *d* ]] && left_color="$RED" ;;
+        esac
+        print_col "$left_color"  "$left"        8
         print_col "$task_color"  "$task_text"   0 ""
         echo ""
     done
 
     printf "  %s\n" "$SEP"
-    printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   cpu: ${CYAN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}${BOLD}   total: %d${NC}\n" \
-        "$n_busy" "$n_cpu" "$n_idle" "$(( n_busy + n_cpu + n_idle ))"
+    local summary
+    summary=$(printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   cpu: ${CYAN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}" \
+        "$n_busy" "$n_cpu" "$n_idle")
+    (( n_pfail > 0 )) && summary+="$(printf "${BOLD}   probe-fail: ${RED}%d${NC}" "$n_pfail")"
+    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_cpu + n_idle + n_pfail ))")"
+    printf "%s\n" "$summary"
 }
 
 # ── subcommand: status ────────────────────────────────────────────────────────
 cmd_status() {
     echo ""
     if daemon_running; then
-        local pid; pid=$(daemon_pid)
-        local start_time uptime_str=""
-        start_time=$(ps -o lstart= -p "$pid" 2>/dev/null | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
-        local elapsed_secs
-        elapsed_secs=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || echo "")
+        local pid host; pid=$(daemon_pid); host=$(daemon_host)
+        local start_time uptime_str="" elapsed_secs=""
+        # ps only works on the host the daemon actually runs on.
+        if [[ -z "$host" || "$host" == "$(hostname)" ]]; then
+            start_time=$(ps -o lstart= -p "$pid" 2>/dev/null | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+            elapsed_secs=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || echo "")
+        fi
         if [[ -n "$elapsed_secs" && "$elapsed_secs" =~ ^[0-9]+$ ]]; then
             local d=$(( elapsed_secs / 86400 ))
             local h=$(( (elapsed_secs % 86400) / 3600 ))
@@ -409,6 +519,7 @@ cmd_status() {
 
         printf "  ${BOLD}daemon:${NC}     ${GREEN}RUNNING${NC}\n"
         printf "  ${BOLD}PID:${NC}        %s\n" "$pid"
+        [[ -n "$host" ]] && printf "  ${BOLD}host:${NC}       %s\n" "$host"
         [[ -n "$start_time" ]] && printf "  ${BOLD}started:${NC}    %s\n" "$start_time"
         [[ -n "$uptime_str" ]] && printf "  ${BOLD}uptime:${NC}     %s\n" "$uptime_str"
         [[ -n "$last_poll" ]] && printf "  ${BOLD}last poll:${NC}  %s\n" "$last_poll"

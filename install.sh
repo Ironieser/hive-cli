@@ -19,24 +19,29 @@ title() { echo -e "\n${BOLD}$*${NC}"; }
 
 # ── 1. Clone or update ────────────────────────────────────────────────────────
 title "1. Installing hive-cli"
-if [[ -d "${INSTALL_DIR}/.git" ]]; then
-    info "Updating existing installation at ${INSTALL_DIR}..."
-    # Reset any untracked/modified files that would block pull, then update
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${SCRIPT_DIR}" != "${INSTALL_DIR}" && -f "${SCRIPT_DIR}/hive" && -d "${SCRIPT_DIR}/libexec" ]]; then
+    # Running from a local checkout that ISN'T the install dir → deploy THIS code.
+    # (Takes precedence over a git update so local/unpushed changes actually install;
+    # excludes .git and gitignored scratch so we don't clobber the install dir's repo.)
+    info "Installing from local checkout: ${SCRIPT_DIR}"
+    mkdir -p "$INSTALL_DIR"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete --exclude '.git' --filter=':- .gitignore' \
+              "${SCRIPT_DIR}/" "${INSTALL_DIR}/"
+    else
+        # Fallback: copy tracked top-level entries (no .git)
+        for _item in "${SCRIPT_DIR}"/* "${SCRIPT_DIR}"/.gitignore; do
+            [[ -e "$_item" ]] && cp -r "$_item" "${INSTALL_DIR}/"
+        done
+    fi
+elif [[ -d "${INSTALL_DIR}/.git" ]]; then
+    info "Updating existing installation at ${INSTALL_DIR} from origin..."
     git -C "$INSTALL_DIR" fetch origin
     git -C "$INSTALL_DIR" reset --hard origin/main
 else
-    # If running from a local checkout, copy instead of clone
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [[ -f "${SCRIPT_DIR}/hive" && -d "${SCRIPT_DIR}/libexec" ]]; then
-        info "Installing from local checkout: ${SCRIPT_DIR}"
-        if [[ "${SCRIPT_DIR}" != "${INSTALL_DIR}" ]]; then
-            mkdir -p "$INSTALL_DIR"
-            cp -r "${SCRIPT_DIR}/." "${INSTALL_DIR}/"
-        fi
-    else
-        info "Cloning from ${REPO_URL}..."
-        git clone "$REPO_URL" "$INSTALL_DIR"
-    fi
+    info "Cloning from ${REPO_URL}..."
+    git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
 # ── 2. Make executables + ensure data files present ──────────────────────────
@@ -97,9 +102,11 @@ for f in node_monitor.json node_monitor.pid node_monitor.log; do
         info "Migrated: ${old} → ${new}"
     fi
 done
-# Stale pid from old daemon is now invalid — remove it
+# Remove the PID file ONLY if its daemon is genuinely dead. Read just the first line:
+# the file is the 2-line cluster-singleton format "<pid>\n<host>", so `cat` would feed
+# "<pid>\n<host>" to kill -0 (always fails) and wrongly delete a *live* poller's pid file.
 if [[ -f "${HIVE_DIR}/node_monitor.pid" ]]; then
-    pid=$(cat "${HIVE_DIR}/node_monitor.pid" 2>/dev/null || true)
+    pid=$(head -1 "${HIVE_DIR}/node_monitor.pid" 2>/dev/null || true)
     if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
         rm -f "${HIVE_DIR}/node_monitor.pid"
         info "Removed stale PID file"
