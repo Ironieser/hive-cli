@@ -126,8 +126,14 @@ probe_job() {
     local elapsed_fmt
     elapsed_fmt=$(fmt_elapsed_slurm "$elapsed_raw")
 
+    # Enumerate ALL of the hold-job's GPUs (no --id=0). SLURM cgroup device isolation
+    # already scopes nvidia-smi to this job's GPUs (renumbered 0..N-1), so this returns
+    # exactly the job's own cards — one line for a 1-GPU job (unchanged), N for a multi-
+    # GPU job. compute-apps is deduped by PID (a process spanning >1 GPU is listed once);
+    # the /proc/<pid>/cgroup filter still scopes processes to this job. KEEP IN SYNC with
+    # hive-poll (the probe body is intentionally duplicated; the parse/post-processing is shared).
     local probe_cmd
-    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
+    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | sort -t, -k1,1 -u | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
     # Run probe; retry once on transient failure (empty / non-zero / no ---PS---
     # marker). Distinguishes probe failure from a genuinely idle GPU (feedback OPT-A).

@@ -42,6 +42,9 @@ LOG_ROLL_LINES    = 500
 # ── Dispatch gating (feedback C1/C2: stop dispatching into dirty/stale/unverified nodes) ──
 GPU_CLEAN_MB       = 5000   # a hold-job GPU with >5GB used is dirty (zombie / co-tenant) → skip
 NEED_MB_DEFAULT    = 0      # per-task min free MB (override via #HIVE need_mb= / --need-mb)
+DEFAULT_TASK_GPUS  = 1      # GPUs a task sees when it doesn't say (#HIVE gpus= / --gpus).
+                            # Must match hive-queue's DEFAULT_TASK_GPUS: tasks queued by an
+                            # older hive carry no "gpus" key and are read with this default.
 NODE_DB_STALE_SECS = 1800   # node DB older than this → force a re-poll instead of trusting it
 ORPHAN_GRACE_SECS  = 90     # running task w/ no srun+heartbeat+exit older than this → crash orphan
 MAX_ATTEMPTS       = 3      # requeue cap for crash orphans (prevents infinite redispatch)
@@ -329,14 +332,40 @@ def request_repoll(reason):
         logging.warning("Requested immediate node re-poll (%s)", reason)
 
 
+def _max_gpu(lines):
+    """Max (util, mem_used, mem_total) across nvidia-smi GPU csv lines, each
+    'utilization,memory.used,memory.total'. Returns None if no line parses.
+
+    Phase-1 multi-GPU: live_probe enumerates all the hold-job's GPUs and the verify
+    gate treats the node as ONE slot — busy/dirty if ANY GPU is busy/dirty (max). This
+    is conservative until per-GPU scheduling (Phase 2) can target a specific free GPU.
+    """
+    util = used = total = 0
+    parsed = False
+    for ln in lines:
+        parts = ln.split(",")
+        if len(parts) < 3:
+            continue
+        try:
+            u, mu, mt = (int(float(x.strip())) for x in parts[:3])
+        except ValueError:
+            continue
+        util, used, total = max(util, u), max(used, mu), max(total, mt)
+        parsed = True
+    return (util, used, total) if parsed else None
+
+
 def live_probe(slurm_jobid):
     """Fast single-job GPU probe, bypassing the (possibly stale) node DB.
 
     Used to verify-before-dispatch so one stale/failed poll can't strand a node
     and so we never dispatch onto a node whose GPU is actually occupied
-    (feedback OPT-B / OBSERVED#2). Returns {ok, util, mem_used, mem_total}.
+    (feedback OPT-B / OBSERVED#2). Enumerates ALL the hold-job's GPUs (no --id=0;
+    cgroup isolation scopes nvidia-smi to the job's own cards) and aggregates with
+    max, so a node with any busy/dirty GPU is rejected. Returns {ok, util, mem_used,
+    mem_total}.
     """
-    probe = ("nvidia-smi --id=0 --query-gpu=utilization.gpu,memory.used,memory.total "
+    probe = ("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
              "--format=csv,noheader,nounits 2>/dev/null")
     try:
         out = subprocess.run(
@@ -348,10 +377,10 @@ def live_probe(slurm_jobid):
     lines = [l for l in (out.stdout or "").strip().splitlines() if l.strip()]
     if out.returncode != 0 or not lines:
         return {"ok": False}
-    try:
-        util, used, total = [int(float(x.strip())) for x in lines[0].split(",")]
-    except (ValueError, IndexError):
+    agg = _max_gpu(lines)
+    if agg is None:
         return {"ok": False}
+    util, used, total = agg
     return {"ok": True, "util": util, "mem_used": used, "mem_total": total}
 
 
@@ -360,8 +389,8 @@ def get_candidates(jobs_db, used_jobids, freed):
 
     Dispatchable = SLURM-allocated + plausibly free, decoupled from a single
     `status=="idle"` check (feedback OPT-B). `idle` nodes are candidates; so are
-    `probe_failed`/`unknown` and just-freed nodes — but those carry needs_verify
-    so we live-probe before trusting them. `busy`/`warning`/`cpu` are excluded.
+    `probe_failed`/`unknown`/`warning` and just-freed nodes — but those carry
+    needs_verify so we live-probe before trusting them. `busy`/`cpu` are excluded.
     Fresh trustworthy idles are tried first (cheap, no live probe).
     """
     cands = []
@@ -371,7 +400,13 @@ def get_candidates(jobs_db, used_jobids, freed):
         st = info.get("status")
         forced = jid in freed
         is_idle = (st == "idle")
-        is_uncertain = st in ("probe_failed", "unknown")
+        # `warning` is uncertain, not busy: it means "GPU looked quiet but we're
+        # inside the busy→idle grace window". Treating it as a hard skip stranded
+        # nodes permanently whenever the grace timer failed to clear (feedback
+        # #10); including it here also lets a node_monitor.json written by an
+        # older hive self-heal without hand-editing. needs_verify is always set
+        # for it, so live_probe() rejects any node that is genuinely busy.
+        is_uncertain = st in ("probe_failed", "unknown", "warning")
         if not (is_idle or is_uncertain or forced):
             continue
         stale = (_age_seconds(info.get("polled_at")) or 0) > NODE_DB_STALE_SECS
@@ -425,6 +460,39 @@ def dispatch_task(task, slurm_jobid, node_name):
                    f"prior progress is lost unless your command resumes from a checkpoint. ===' "
                    f">> {log_file}\n")
 
+    # ── GPU visibility ────────────────────────────────────────────────────────
+    # SLURM's cgroup already scopes the step to the hold-job's own GPUs, renumbered
+    # 0..N-1 — verified on multi-tenant nodes, so we never need to widen it. But a
+    # hold job may own MORE GPUs than the task asked for, and a framework that
+    # auto-parallelizes over every visible device (HF Trainer → nn.DataParallel)
+    # then crashes at step 0 (feedback #8: task 6862 on a gpu:2 hold job).
+    #
+    # So NARROW, never widen: keep the first N entries of whatever SLURM handed the
+    # step. Subsetting the existing value (rather than hardcoding indices) means we
+    # cannot invent a device the job doesn't own, and it works whether SLURM gives
+    # indices or UUIDs. If CUDA_VISIBLE_DEVICES is unset (CPU-only hold job) we
+    # leave it alone. The resulting visibility is logged so a device-count surprise
+    # is one line in the log instead of a 40-minute mystery.
+    want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
+    if want_gpus > 0:
+        gpu_line = (
+            # Log the visibility SLURM handed us *before* narrowing — that is the line
+            # that diagnoses a device-count surprise ("hold job gave [0,1]" is the whole
+            # story behind a DataParallel crash). SLURM_STEP_GPUS is a physical INDEX
+            # list, not a count, so it is deliberately not used as one here.
+            f'_HIVE_CVD_ALL="${{CUDA_VISIBLE_DEVICES:-<unset>}}"\n'
+            f'if [ -n "${{CUDA_VISIBLE_DEVICES:-}}" ]; then\n'
+            f'  export CUDA_VISIBLE_DEVICES=$(echo "$CUDA_VISIBLE_DEVICES" | cut -d, -f1-{want_gpus})\n'
+            f'fi\n'
+            f'echo "=== gpus: requested {want_gpus}, visible=[${{CUDA_VISIBLE_DEVICES:-<unset>}}]'
+            f' (hold job provided [$_HIVE_CVD_ALL]) ===" >> {log_file}\n'
+        )
+    else:
+        gpu_line = (
+            f'export CUDA_VISIBLE_DEVICES=""\n'
+            f'echo "=== gpus: requested 0 — all GPUs hidden ===" >> {log_file}\n'
+        )
+
     # Shell wrapper that runs on the compute node.
     # All output (including srun-level errors) goes to the task log.
     wrapper = (
@@ -441,6 +509,7 @@ def dispatch_task(task, slurm_jobid, node_name):
         f"  echo 1 > {exit_file}\n"
         f"  exit 1\n"
         f"fi\n"
+        + gpu_line +
         # ── Heartbeat process (disowned to suppress bash "Terminated" noise) ───
         f"( while true; do date -Iseconds > {hb_file}; sleep 30; done ) &\n"
         f"_HB_PID=$!\n"
@@ -663,12 +732,21 @@ def run_one_cycle():
         dispatched = 0
         for task in pending:
             need_mb = int(task.get("need_mb") or NEED_MB_DEFAULT)
+            want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
             reason = "no_dispatchable_node"
             placed = False
 
             while candidates:
                 jid, info, needs_verify = candidates.pop(0)
                 used, total = db_gpu_mem(info)
+
+                # GPU-count gate: a task asking for N GPUs must land on a hold job
+                # that actually owns N. Older DB records (no per-GPU array) report 0
+                # and stay unrestricted, so walltime-blind/legacy behaviour is kept.
+                have_gpus = len(info.get("gpu") or [])
+                if have_gpus and want_gpus > have_gpus:
+                    reason = "insufficient_gpus"
+                    continue
 
                 if needs_verify:
                     p = live_probe(jid)

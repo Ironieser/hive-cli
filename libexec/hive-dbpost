@@ -10,8 +10,13 @@ daemon disagreed — see feedback OPT-A / SESSION#1).
 Two transforms, applied per job:
 
 1. busy→idle WARNING grace timer (`gpu_idle_since`): a job that had a real model
-   loaded (GPU mem ≥500MB) and then went quiet is held as `busy` for WARN_SECS
+   loaded (GPU mem ≥500MB) and then went quiet is held as `warning` for WARN_SECS
    before flipping to a true `idle`, so a brief GPU dip doesn't churn the table.
+   `warning` is a TRANSIENT state — once the grace expires the job must return to
+   `idle` and `gpu_idle_since` must be cleared, or the node is stranded forever
+   (the scheduler skips `warning`). The scheduler additionally treats `warning` as
+   verify-before-dispatch rather than a hard skip, so the grace window costs
+   display churn only, never throughput.
 
 2. CARRY-FORWARD on probe failure: a job whose probe just failed
    (`status == "probe_failed"`) keeps its last *good* state (idle/busy/cpu) if that
@@ -98,12 +103,27 @@ def main():
             old_max_mem = max((g.get("mem_used", 0) for g in old_job.get("gpu", [])),
                               default=0)
             if old_since is not None:
-                job["gpu_idle_since"] = old_since
-                job["status"] = "warning" if (now - old_since >= WARN_SECS) else "busy"
+                if now - old_since >= WARN_SECS:
+                    # Grace expired and the GPU is STILL quiet → a true `idle`
+                    # again, and the timer is cleared so the next busy→idle
+                    # transition can re-arm it.
+                    #
+                    # This used to flip to `warning` and keep `gpu_idle_since`
+                    # forever, so this branch re-entered every poll and the job
+                    # was pinned at `warning` for good. get_candidates()
+                    # excludes `warning`, so any hold job that finished one task
+                    # and sat idle >WARN_SECS was permanently evicted from the
+                    # dispatch pool — surviving daemon restarts because the
+                    # state lives in node_monitor.json (feedback #10/#9/#6/#5).
+                    job["gpu_idle_since"] = None
+                    job["status"] = "idle"
+                else:
+                    job["gpu_idle_since"] = old_since
+                    job["status"] = "warning"
                 changed = True
             elif old_status in ("busy", "warning") and old_max_mem >= 500:
                 job["gpu_idle_since"] = now
-                job["status"] = "busy"
+                job["status"] = "warning"
                 changed = True
             else:
                 if job.get("gpu_idle_since") is not None:

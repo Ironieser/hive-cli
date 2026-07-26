@@ -12,7 +12,7 @@ allocations, and out-of-band contention all collapsed into `idle`/`busy`
 |--------|---------|-------------|---------------|
 | `idle` | GPU allocated, not in use | util < 5% **and** mem < 500 MiB | **yes** (subject to the GPU-clean / free-mem gate) |
 | `busy` | GPU actively used by a job | util ≥ 5% **or** mem ≥ 500 MiB | no |
-| `warning` | was busy, GPU went quiet < grace window | mem dropped to ~0 after a model was loaded | no (held as busy for `WARN_SECS`=180s) |
+| `warning` | was busy, GPU went quiet < grace window | mem dropped to ~0 after a model was loaded | only after a live verify-probe |
 | `cpu` | no GPU allocated to this job | `mem_total == 0`, probe succeeded | no (no GPU to run on) |
 | `probe_failed` | the `srun --overlap` probe could **not** run | none — empty / non-zero / no `---PS---` marker, after one retry | only after a live verify-probe |
 | `unknown` | legacy alias for a failed probe (pre-v0.4.0 DBs) | none | treated like `probe_failed` |
@@ -20,6 +20,12 @@ allocations, and out-of-band contention all collapsed into `idle`/`busy`
 Extra fields a record may carry:
 
 - `gpu_idle_since` — epoch when the busy→idle grace timer started (drives `warning`).
+  **`warning` is transient, never terminal**: once `WARN_SECS` elapses and the GPU is
+  still quiet, the job returns to `idle` and this field is cleared so the next
+  busy→idle transition can re-arm it. (Before v0.4.1 the timer was carried forward but
+  never cleared, pinning the job at `warning` for good; since the scheduler skipped
+  `warning`, any hold job that finished one task was permanently evicted from the
+  dispatch pool — see feedback #10.)
 - `carried_forward: true` — this record's `status`/`gpu` were **reused from the last
   good poll** because the latest probe failed; `polled_at` keeps the last-good stamp
   and `probe_failed_at` records the failed attempt. Held up to `CARRY_MAX_AGE`=1800s.
@@ -39,8 +45,11 @@ the scheduler treats as *verify before trusting*, not *blocked*.
 
 Dispatchability is **decoupled from a single `status=="idle"` check**:
 
-1. **Candidates** = `idle` nodes + uncertain ones (`probe_failed`/`unknown`/
-   `carried_forward`/stale) + just-freed nodes. `busy`/`warning`/`cpu` excluded.
+1. **Candidates** = `idle` nodes + uncertain ones (`probe_failed`/`unknown`/`warning`/
+   `carried_forward`/stale) + just-freed nodes. `busy`/`cpu` excluded. `warning` counts
+   as *uncertain*, not busy — it always carries `needs_verify`, so the live probe below
+   decides. This also lets a DB written by an older hive (stuck at `warning`) self-heal
+   without hand-editing `node_monitor.json`.
 2. **Verify-before-dispatch**: uncertain/stale/just-freed candidates get a fast live
    `nvidia-smi` probe (`srun --overlap`) right before dispatch. Fresh trustworthy
    `idle` nodes skip this (cheap).

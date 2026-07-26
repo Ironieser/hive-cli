@@ -154,8 +154,16 @@ Supported `#HIVE` directives:
 | `name` | — | Label shown in `hive list`; also the key for runtime history (`hive stats`, `--est-runtime auto`) |
 | `need_mb` | 0 | Min **free** GPU memory (MiB) required before dispatch. The scheduler keeps the task PENDING (reason `waiting_for_mem`) until a pool GPU has at least this much free — use it for large models to avoid OOM-on-startup. |
 | `est_runtime` | — | Estimated runtime: `2h`, `90m`, `1-12:00:00`, raw seconds, or `auto` (P90 of this name's history). The scheduler won't place the task on a node whose remaining walltime < estimate + 10 min (reason `insufficient_walltime`). |
+| `gpus` | 1 | How many GPUs the task may see. A hold job can own several; hive hides the extras via `CUDA_VISIBLE_DEVICES` so frameworks don't auto-parallelize over cards you never asked for (HF Trainer wraps the model in `nn.DataParallel` when it sees >1 and can crash at step 0). Set `gpus=2` for genuine multi-GPU work — the task then only places on a hold job that owns ≥2 GPUs (reason `insufficient_gpus`). |
 
-CLI flags `--workdir`, `--priority`, `--name`, `--need-mb`, `--est-runtime` override the file's directives.
+CLI flags `--workdir`, `--priority`, `--name`, `--need-mb`, `--est-runtime`, `--gpus` override the file's directives.
+
+Every task log records what it actually got, so a device-count surprise is one line
+instead of a mid-run crash:
+
+```
+=== gpus: requested 1, visible=[0] (hold job provided [0,1]) ===
+```
 
 The scheduler also refuses to dispatch onto a GPU with **>5 GB already in use**
 (a zombie process or an out-of-band co-tenant), marking such a task PENDING with
@@ -239,6 +247,7 @@ it hasn't dispatched yet (no more guessing from `squeue`):
 | `node_busy_on_verify` | A node looked idle but a live probe found it occupied |
 | `probe_unverifiable` | Could not confirm a node is free (transient `srun` failure) |
 | `insufficient_walltime` | No node has enough remaining walltime for this task's `est_runtime` + 10 min — `hive pool add --time …` or lower the estimate |
+| `insufficient_gpus` | No hold job owns as many GPUs as the task's `gpus=N` — add a multi-GPU hold job (`--gres=gpu:N`) or lower `gpus` |
 | `redispatched_after_crash` | Was requeued after a scheduler restart found no running step (never ran — no progress lost) |
 | `infra_failure_redispatch` | The node was reclaimed **mid-run**; requeued to another node. ⚠ The new run starts fresh — progress is lost unless your command checkpoints. Shown as `(re-disp xN)` in the NODE column. |
 

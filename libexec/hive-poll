@@ -109,8 +109,11 @@ probe_job() {
 
     # Probe command: nvidia-smi via srun --overlap.
     #
-    # GPU stats (utilization/memory) use --id=0, which relies on SLURM cgroup device
-    # isolation (set at job allocation time) to scope to this job's GPU.
+    # GPU stats (utilization/memory) enumerate ALL the job's GPUs (no --id=0). SLURM
+    # cgroup device isolation (set at job allocation time) already scopes nvidia-smi to
+    # this job's GPUs, renumbered 0..N-1 — so this returns exactly the job's own cards:
+    # one line for a 1-GPU job (unchanged), N lines for a multi-GPU job. The status logic
+    # below takes the max across them (busy if ANY GPU is busy).
     #
     # Process filtering uses /proc/<pid>/cgroup to check job ownership.
     # CUDA_VISIBLE_DEVICES is unreliable under concurrent srun --overlap steps (multiple
@@ -118,9 +121,12 @@ probe_job() {
     # --query-compute-apps can return PIDs from other jobs' GPUs. The fix: after getting
     # PIDs from compute-apps, verify each PID's /proc/<pid>/cgroup contains
     # /job_<SLURM_JOB_ID>/ — this is set by the kernel at job allocation and is immune
-    # to concurrent step launches.
+    # to concurrent step launches. compute-apps is deduped by PID (sort -u on the pid
+    # field) so a process spanning >1 GPU is listed once.
+    #
+    # KEEP IN SYNC with hive-daemon's probe_cmd (the probe body is intentionally duplicated).
     local probe_cmd
-    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
+    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | sort -t, -k1,1 -u | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
     # Run the probe; retry once on a transient failure (empty output, non-zero
     # exit, or missing ---PS--- marker = srun never executed our command). This

@@ -83,7 +83,12 @@ into `<repo>/feedback/inbox/` for the repo-owning agent to triage (see `feedback
 - `hive-dbpost` carries a `probe_failed` job forward to its last-good state (flagged
   `carried_forward`) for up to 30 min, so one transient probe miss doesn't drop a node.
 - A `busy→idle` transition first becomes `warning` (held in `gpu_idle_since`) before
-  flipping to `idle`, so brief GPU dips don't churn the table.
+  flipping to `idle`, so brief GPU dips don't churn the table. **`warning` is transient,
+  never terminal** — when the grace expires, `hive-dbpost` must set `idle` *and clear
+  `gpu_idle_since`*, or the job re-enters that branch every poll and is pinned at
+  `warning` for good. The scheduler treats `warning` as *uncertain* (verify-before-
+  dispatch), not as `busy`, so a stale DB self-heals and the grace window never costs
+  throughput. Never make `warning` a hard skip in `get_candidates()` (feedback #10).
 - **Scheduler dispatch is gated, not status-blind.** `hive-sched` only dispatches onto a
   GPU with ≤ 5 GB used (`GPU_CLEAN_MB`) and ≥ the task's `need_mb` free; uncertain nodes
   get a live verify-probe first; a starvation watchdog SIGUSR1s the poller after 3
@@ -96,6 +101,17 @@ into `<repo>/feedback/inbox/` for the repo-owning agent to triage (see `feedback
   placed on a node expiring within `est + WALLTIME_MARGIN_SECS`; a task *without* an
   estimate stays walltime-blind, so existing behaviour is unchanged. `-1`=unlimited and
   `null`=unknown never block.
+- **GPU visibility is narrowed, never widened.** SLURM's cgroup already scopes an
+  `srun --overlap` step to the hold-job's own GPUs, renumbered `0..N-1` — verified on
+  multi-tenant nodes, so hive never needs `--gres`/`--gpu-bind` on the step. But a hold
+  job may own *more* GPUs than the task wants, and a framework that auto-parallelizes
+  over every visible device then crashes (feedback #8). So the dispatch wrapper keeps
+  only the first `gpus` entries of whatever SLURM handed it (`cut -d, -f1-N` on
+  `CUDA_VISIBLE_DEVICES`) — subsetting the existing value, so it can never name a device
+  the job doesn't own, and it works for index *or* UUID form. Default `gpus`=1; a task
+  asking for N only places on a hold job with ≥N GPUs (`insufficient_gpus`).
+  `DEFAULT_TASK_GPUS` is duplicated in `hive-queue` and `hive-sched` — keep them equal,
+  since tasks queued by an older hive carry no `gpus` key and are read with the default.
 - **Infra failure ≠ self-crash.** A dead `running` task whose hold-job is **gone**
   (confirmed by `squeue -j`) is requeued to another node (`requeue_count`++,
   `checkpoint_warning`, log banner, `hive wait` ⚠) — the new run starts fresh. A dead
@@ -140,7 +156,7 @@ Keep the rest of the repo cluster-agnostic.
 ## Task model
 
 `hive queue submit` accepts either a raw command string or a `.hive` script. `.hive`
-files use `#HIVE key=value` directives (`workdir`, `priority`, `name`, `need_mb`)
+files use `#HIVE key=value` directives (`workdir`, `priority`, `name`, `need_mb`, `gpus`)
 analogous to `#SBATCH`. Task states: `pending → running → done|failed|cancelled`.
 Pending tasks carry a scheduler-set `pending_reason` (surfaced in the `hive list` NODE
 column) explaining why they haven't dispatched. Logs land in

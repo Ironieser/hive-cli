@@ -410,7 +410,7 @@ show_table() {
     printf "${NC}\n"
     printf "  %s\n" "$SEP"
 
-    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0
+    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0 n_warn=0
 
     for row in "${rows[@]}"; do
         IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str left job_stale task_cmd <<< "$row"
@@ -423,8 +423,12 @@ show_table() {
             status_upper="CPU  ";   status_color="${CYAN}${BOLD}"
             n_cpu=$(( n_cpu + 1 ))
         elif [[ "$status" == "warning" ]]; then
+            # busy→idle grace window: GPU already looks free but we hold it for
+            # WARN_SECS before calling it idle. Counted separately, NOT as busy —
+            # folding it into busy hid a pool-wide wedge behind a plausible
+            # "busy: 18" when only 11 nodes were working (feedback #10).
             status_upper="WARN ";   status_color="${YELLOW}${BOLD}"
-            n_busy=$(( n_busy + 1 ))
+            n_warn=$(( n_warn + 1 ))
         elif [[ "$status" == "probe_failed" || "$status" == "unknown" ]]; then
             # Probe could not run — NOT idle. Counted separately so the summary
             # doesn't conflate "GPU free" with "we couldn't tell" (feedback OPT-J).
@@ -483,8 +487,9 @@ show_table() {
     local summary
     summary=$(printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   cpu: ${CYAN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}" \
         "$n_busy" "$n_cpu" "$n_idle")
+    (( n_warn > 0 ))  && summary+="$(printf "${BOLD}   warn: ${YELLOW}%d${NC}" "$n_warn")"
     (( n_pfail > 0 )) && summary+="$(printf "${BOLD}   probe-fail: ${RED}%d${NC}" "$n_pfail")"
-    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_cpu + n_idle + n_pfail ))")"
+    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_cpu + n_idle + n_pfail + n_warn ))")"
     printf "%s\n" "$summary"
 }
 

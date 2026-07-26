@@ -112,6 +112,7 @@ hive queue daemon start|stop|status|logs               # 管理调度器（submi
 #HIVE name=train-v1        # 也是运行时长历史的键（hive stats / --est-runtime auto）
 #HIVE need_mb=25000        # 可选：派发前要求的最小空闲显存 (MiB)
 #HIVE est_runtime=2h       # 可选：运行时长估计 → 不会派发到快过期的节点
+#HIVE gpus=1               # 可选：任务可见的 GPU 数（默认 1，多余的卡会被隐藏）
 
 python train.py --config exp/v1.yaml
 ```

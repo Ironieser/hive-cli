@@ -96,6 +96,7 @@ hive queue daemon start|stop|status|logs               # manage the scheduler (a
 #HIVE name=my-experiment   # also the key for runtime history (hive stats / --est-runtime auto)
 #HIVE need_mb=25000        # optional: min free GPU MiB before dispatch
 #HIVE est_runtime=2h       # optional: runtime estimate → won't place on a soon-expiring node
+#HIVE gpus=1               # optional: GPUs the task may see (default 1; extras are hidden)
 
 python train.py --config exp/v1.yaml
 ```

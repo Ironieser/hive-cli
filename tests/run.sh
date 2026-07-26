@@ -37,8 +37,21 @@ a=("$@"); for i in "${!a[@]}"; do [[ "${a[$i]}" == "bash" ]] && exec "${a[@]:$i}
 EOF
 cat > "$TMP/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
+# compute-apps: no GPU processes in the mock cluster
 [[ "$*" == *"--query-compute-apps"* ]] && exit 0
-[[ "$*" == *"--query-gpu"* ]] && { echo "0, 10, 81920"; exit 0; }; exit 0
+# query-gpu: the daemon/poll probe asks for 'index,...' (4 fields, ALL the job's GPUs) —
+# emit a 2-GPU node (GPU0 idle, GPU1 busy) so the poller proves it now sees BOTH cards
+# (the old --id=0 probe would have missed GPU1). The sched live_probe asks without
+# 'index' (util,used,total) — keep that single + idle/clean so dispatch tests still place.
+if [[ "$*" == *"--query-gpu"* ]]; then
+  if [[ "$*" == *"index"* ]]; then
+    printf '0, 0, 10, 81920\n1, 85, 40000, 81920\n'
+  else
+    echo "0, 10, 81920"
+  fi
+  exit 0
+fi
+exit 0
 EOF
 chmod +x "$TMP/bin/"*
 
@@ -56,9 +69,16 @@ echo "[poll] bash poller records remaining walltime"
 "$PY" - <<'PY' || fail=1
 import json, os
 d = json.load(open(os.environ['HIVE_DIR'] + '/node_monitor.json'))
-tl = d['jobs']['700']['time_left_secs']
-assert tl == 72000, tl
+j = d['jobs']['700']
+assert j['time_left_secs'] == 72000, j['time_left_secs']
 print("  [OK] time_left_secs=72000 parsed from squeue %L (20:00:00)")
+# Phase-1 multi-GPU: the poller enumerates ALL the job's GPUs (not just --id=0) and the
+# job status is busy if ANY GPU is busy. The mock node has GPU0 idle + GPU1 busy.
+gpu = j.get('gpu', [])
+assert len(gpu) == 2, gpu
+assert {g['index'] for g in gpu} == {0, 1}, gpu
+assert j['status'] == 'busy', j['status']
+print("  [OK] poller sees BOTH GPUs (idx 0,1); node busy because GPU1 is busy")
 PY
 smoke() { if "$@" >/dev/null 2>&1; then echo "  [OK] $label"; else echo "  [FAIL] $label"; fail=1; fi; }
 label="submit --est-runtime"; smoke "$PY" "$REPO/libexec/hive-queue" submit "true" --name reg --est-runtime 30m

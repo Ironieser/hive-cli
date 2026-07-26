@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`warning` was a terminal node state → hold jobs permanently evicted from dispatch
+  (feedback #10, dups #9/#6/#5).** `hive-dbpost` armed the busy→idle grace timer but
+  never cleared `gpu_idle_since`, so the same branch re-entered every poll and pinned
+  the job at `warning` for good; `hive-sched.get_candidates()` skipped `warning`, so any
+  hold job that finished one task and sat idle >180 s stopped receiving work — surviving
+  daemon restarts, because the state lives in `node_monitor.json`. Observed live as 7
+  hold jobs with completely free GPUs while 20 tasks waited on `no_dispatchable_node`.
+  The grace now expires back to `idle` with the timer cleared, and the scheduler treats
+  `warning` as *uncertain* (verify-before-dispatch) rather than busy — which also lets a
+  DB written by an older hive self-heal without hand-editing.
+- **`hive nodes` counted `warning` as `busy`**, so a wedged pool still reported a
+  plausible `busy: 18` when only 11 nodes were working. It's now its own `warn:` count.
+
+### Added
+- **`#HIVE gpus=N` / `--gpus N`** — how many GPUs a task may see, default **1**
+  (feedback #8). A hold job can own several GPUs; handing all of them to a task that
+  never asked made HF Trainer wrap the model in `nn.DataParallel` and die at step 0
+  (`Expected all tensors to be on the same device, cuda:1 vs cuda:0`) after ~40 min of
+  setup. The dispatch wrapper now keeps only the first N entries of the
+  `CUDA_VISIBLE_DEVICES` SLURM handed the step — narrowing, never widening, so it can't
+  name a device the hold job doesn't own. Multi-GPU is opt-in and gated: a task asking
+  for N only places on a hold job that owns ≥N GPUs (new reason `insufficient_gpus`).
+  Note this is a **behaviour change** for workloads that relied on seeing every GPU of a
+  multi-GPU hold job — declare `#HIVE gpus=2` for those.
+- **Task logs record actual GPU visibility** —
+  `=== gpus: requested 1, visible=[0] (hold job provided [0,1]) ===` — turning a
+  device-count surprise into one line instead of a mid-run mystery.
+
+### Notes
+- Investigated and **disproved** feedback #8's stated root cause (that `srun --overlap`
+  steps don't inherit the hold-job's per-GPU cgroup and see the whole node). Measured on
+  7 hold jobs across 2 partitions and 3 multi-tenant nodes: every step saw exactly its
+  own card, with `SLURM_STEP_GPUS` matching `scontrol`'s allocated `IDX`. The real cause
+  was a hold job submitted with `--gres=gpu:2`. No `--gres`/`--exact`/`--gpu-bind` flag
+  is needed on the dispatch step.
+
 ## [0.4.0] - 2026-06-09
 
 ### Added (walltime-aware scheduling + checkpoint-loss notification — feedback C4)
