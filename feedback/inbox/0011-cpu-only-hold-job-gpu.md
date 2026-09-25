@@ -2,15 +2,15 @@
 id: 11
 title: 调度器应按显存过滤槽位：CPU-only 的 hold job 会持续吃掉 GPU 任务
 severity: medium
-status: triaged
+status: done
 tags: []
 submitter: si384883
 hive_version: 0.4.0
 task_ids: []
 created: 2026-07-28T04:01:19
-updated: 2026-09-25T06:53:37
+updated: 2026-09-25T07:29:18
 source: cli
-triage_note: cpu status is already excluded from get_candidates; live_probe on a no-GPU job fails (probe_unverifiable). Root cause of the observed dispatch unclear (stale idle reading?). Fold into node-health quarantine work.
+triage_note: Fixed by the verify probe: a hold job with no visible GPU never passes nvidia-smi+CUDA verify, so it can't receive a GPU task.
 ---
 
 调度器应按显存过滤槽位：CPU-only 的 hold job 会持续吃掉 GPU 任务

@@ -243,6 +243,7 @@ class NodeTop:
         self.last_refresh = 0.0        # time.monotonic of last file read
         self.rows         = []         # sorted [(job_id, job_data), ...]
         self.jobid_to_task = {}        # slurm_jobid → running hive task
+        self.quarantined = set()       # physical nodes in hive health quarantine
 
         init_colors()
         curses.curs_set(0)
@@ -262,6 +263,14 @@ class NodeTop:
             if self.cursor >= len(self.rows):
                 self.cursor = max(0, len(self.rows) - 1)
 
+        # Quarantined nodes (hive health)
+        self.quarantined = set()
+        try:
+            with open(os.path.join(HIVE_DIR, "node_health.json")) as _hf:
+                self.quarantined = {n for n, r in json.load(_hf).get("nodes", {}).items()
+                                    if r.get("state") == "quarantined"}
+        except Exception:
+            pass
         # Load queue: build slurm_jobid → task map for running hive tasks
         self.jobid_to_task = {}
         try:
@@ -412,6 +421,8 @@ class NodeTop:
                 # (same rule as hive nodes — feedback #4/#7/#17/#32).
                 if status in ("IDLE", "WARNING", "PROBE_FAILED", "UNKNOWN"):
                     status = "CLAIMED"
+            if node in self.quarantined and status not in ("BUSY", "CLAIMED"):
+                status = "QUAR"
 
             task_cmd_short = short_cmd(task_cmd, task_w)
 
@@ -440,6 +451,8 @@ class NodeTop:
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY) | curses.A_BOLD)
                 elif status == "CLAIMED":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY))
+                elif status == "QUAR":
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_STALE) | curses.A_BOLD)
                 elif status == "WARNING":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_WARN) | curses.A_BOLD | curses.A_BLINK)
                 elif status == "CPU":

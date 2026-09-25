@@ -198,7 +198,9 @@ multi["gpu"] = [{"index": 0, "util": 0,  "mem_used": 10,    "mem_total": 81920},
                 {"index": 1, "util": 90, "mem_used": 40000, "mem_total": 81920}]
 wdb({"700": multi})
 wq({"30": task(30, name="m", est=300)})
+os.environ["MOCK_LIVE_GPU"] = "0, 10, 81920\\n0, 40000, 81920"   # live probe sees GPU1 dirty (memory resident, no util)
 hs.run_one_cycle()
+os.environ.pop("MOCK_LIVE_GPU", None)
 chk("2-GPU node with one dirty GPU held as gpu_dirty (not dispatched)",
     rq()["30"]["state"] == "pending" and rq()["30"].get("pending_reason") == "gpu_dirty")
 
@@ -335,9 +337,17 @@ chk("estimate-less task behind it dispatches", rq()["63"]["state"] in ("running"
 dirty = node("d", 72000); dirty["gpu"][0]["mem_used"] = 20000
 wdb({"700": dirty})
 wq({"64": task(64, name="x"), "65": task(65, name="y")})
+os.environ["MOCK_LIVE_GPU"] = "0, 20000, 81920"
 hs.run_one_cycle()
+os.environ.pop("MOCK_LIVE_GPU", None)
 chk("dirty node rejected for every task (node-level)",
     rq()["64"].get("pending_reason") == "gpu_dirty" and rq()["65"].get("pending_reason") in ("gpu_dirty", "no_dispatchable_node"))
+
+stale_dirty = node("sd", 72000); stale_dirty["gpu"][0]["mem_used"] = 30000   # DB says dirty
+wdb({"700": stale_dirty}); wq({"66": task(66, name="sd")})
+hs.run_one_cycle(); time.sleep(0.4)                                         # live probe: clean
+chk("every dispatch is live-verified: a stale-dirty DB no longer blocks a now-clean card",
+    rq()["66"]["state"] in ("running", "done"))
 
 print("== regression: timestamps are tz-safe (feedback #31) ==")
 # The scheduler, poller and each agent's shell can run under different TZs. A task's
@@ -394,6 +404,109 @@ print("== regression: hold_job_alive confirms with squeue even when the node DB 
 chk("jid listed in a stale DB but gone from squeue -> not alive",
     hs.hold_job_alive("2001", {"2001": node("stale", 100)}) is False)
 chk("jid squeue reports running -> alive", hs.hold_job_alive("700", {}) is True)
+
+print("== node health: self-maintained quarantine list (feedback #13/#15/#16/#20/#28/#29/#30) ==")
+hh = SourceFileLoader("hive_health", os.path.join(LIB, "hive_health.py")).load_module()
+def reset_health():
+    try: os.remove(hh.HEALTH_FILE)
+    except FileNotFoundError: pass
+reset_health()
+chk("CUDA probe parser: ok / fail / unknown",
+    hh.parse_cuda_probe(["0, 10, 81920", "CUDA_PROBE ok"]) == ("ok", "")
+    and hh.parse_cuda_probe(["CUDA_PROBE fail cuCtxCreate=999"]) == ("fail", "cuCtxCreate=999")
+    and hh.parse_cuda_probe(["garbage"])[0] == "unknown")
+_lp = os.path.join(hs.LOG_DIR, "sig.log")
+open(_lp, "w").write("x\n" * 50 + "torch.AcceleratorError: CUDA error: CUDA-capable device(s) is/are busy or unavailable\n")
+chk("log tail classifier finds the CUDA-init signature", hh.classify_log_tail(_lp) is not None)
+open(_lp, "w").write("Traceback\nKeyError: 'foo'\n")
+chk("...and ignores an ordinary crash", hh.classify_log_tail(_lp) is None)
+
+# (1) agent report -> quarantined -> scheduler never picks its hold jobs
+data = hh.load(); hh.quarantine(data, "badnode", "agent says CUDA init dies", "agent", reporter="t"); hh.save(data)
+wdb({"700": node("badnode", 72000), "701": node("goodnode", 72000)})
+chk("quarantined node's hold job is not a candidate",
+    [c[0] for c in hs.get_candidates({"700": node("badnode", 72000), "701": node("goodnode", 72000)},
+                                     set(), set(), hh.quarantined_nodes())] == ["701"])
+wq({"100": task(100, name="q")})
+hs.run_one_cycle(); time.sleep(0.4)
+chk("task dispatches to the healthy node instead", rq()["100"].get("node") == "goodnode")
+wdb({"700": node("badnode", 72000)})
+wq({"101": task(101, name="q2")})
+hs.run_one_cycle()
+chk("only quarantined nodes left -> pending_reason node_quarantined",
+    rq()["101"].get("pending_reason") == "node_quarantined")
+
+# (2) periodic check: after HEALTH_CHECK_SECS, HEALTH_OK_STREAK healthy probes release it
+r0 = hh.load()["nodes"]["badnode"]
+chk("a freshly reported node is probed in the very next cycle", r0.get("last_result") == "ok")
+data = hh.load(); rec = data["nodes"]["badnode"]
+rec["last_check"] = 0; rec["until"] = 0; rec["ok_streak"] = 0; hh.save(data)
+hs.run_one_cycle()                                   # probe #1 (stubbed ok)
+r1 = hh.load()["nodes"]["badnode"]
+chk("first healthy probe recorded, still quarantined (needs a streak)",
+    r1["ok_streak"] == 1 and r1["state"] == "quarantined")
+r1["last_check"] = 0; d = hh.load(); d["nodes"]["badnode"] = r1; hh.save(d)
+hs.run_one_cycle()                                   # probe #2
+r2 = hh.load()["nodes"]["badnode"]
+chk("second healthy probe releases the node automatically", r2["state"] == "ok")
+chk("release event recorded", any(e["event"] == "release" and e.get("node") == "badnode" for e in ev.iter_events()))
+time.sleep(0.4)
+chk("released node receives the pending task", rq()["101"]["state"] in ("running", "done"))
+
+# (3) a failed probe re-arms the hold instead of releasing
+data = hh.load(); hh.quarantine(data, "badnode", "again", "agent"); data["nodes"]["badnode"]["last_check"] = 0; hh.save(data)
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE fail cuCtxCreate=999'"
+wq({})
+hs.run_one_cycle()
+r3 = hh.load()["nodes"]["badnode"]
+chk("failed periodic probe keeps quarantine and bumps strikes",
+    r3["state"] == "quarantined" and r3["ok_streak"] == 0 and r3["strikes"] >= 1)
+
+# (4) verify-before-dispatch: CUDA context fails on an IDLE-looking node -> quarantined at once
+reset_health()
+wdb({"700": node("evc43", 72000)})
+wq({"110": task(110, name="v")})
+hs.run_one_cycle()
+chk("verify probe CUDA failure -> pending_reason cuda_unavailable_on_verify",
+    rq()["110"].get("pending_reason") == "cuda_unavailable_on_verify")
+chk("...and the node is quarantined immediately", "evc43" in hh.quarantined_nodes())
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE ok'"
+
+# (5) two fast failures with a CUDA signature -> auto quarantine + the tripping task is requeued
+reset_health()
+wdb({"700": node("evc50", 72000)})
+def fast_fail(tid):
+    lp = os.path.join(hs.LOG_DIR, f"task-{tid}.log")
+    open(lp, "w").write("loading...\nRuntimeError: CUDA unknown error - this may be due to an incorrectly set up environment\n")
+    t = task(tid, name="ff", state="running", jid="700", node="evc50", st=loc(-20), dispatched=loc(-20))
+    t["started_ts"] = t["dispatched_ts"] = time.time() - 20
+    open(os.path.join(hs.HEARTBEAT_DIR, f"{tid}.exit"), "w").write("1")
+    return t
+wq({"120": fast_fail(120)})
+hs.run_one_cycle()
+h1 = hh.load()["nodes"].get("evc50", {})
+chk("first fast CUDA-signature failure = 1 strike, not yet quarantined",
+    rq()["120"]["state"] == "failed" and h1.get("strikes") == 1 and h1.get("state") != "quarantined")
+wq({"121": fast_fail(121)})
+hs.run_one_cycle()
+h2 = hh.load()["nodes"]["evc50"]
+chk("second strike quarantines the node", h2["state"] == "quarantined")
+chk("the task that tripped it is requeued (pending, attempt 1, requeue event)",
+    rq()["121"]["state"] == "pending" and rq()["121"].get("attempts") == 1
+    and any(e["event"] == "requeue" and e.get("reason") == "node_quarantined" and e["task"] == 121
+            for e in ev.iter_events()))
+# a slow failure or a non-CUDA crash never counts
+reset_health()
+t = fast_fail(122); t["started_ts"] = t["dispatched_ts"] = time.time() - 900
+wq({"122": t}); hs.run_one_cycle()
+chk("a failure after FAST_FAIL_SECS is not a strike", not hh.load()["nodes"].get("evc50", {}).get("strikes"))
+# success clears strikes
+data = hh.load(); hh.strike(data, "evc50", "x"); hh.save(data)
+t = task(123, name="okk", state="running", jid="700", node="evc50", st=loc(-20)); t["started_ts"] = time.time() - 20
+open(os.path.join(hs.HEARTBEAT_DIR, "123.exit"), "w").write("0")
+wq({"123": t}); hs.run_one_cycle()
+chk("a successful task on the node clears its strikes", hh.load()["nodes"]["evc50"]["strikes"] == 0)
+reset_health()
 
 print("== integration: history_estimate from event log (P90) ==")
 open(ev.EVENTS_FILE, "w").close()

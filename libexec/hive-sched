@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 # since libexec scripts aren't a package.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import hive_events as ev
+import hive_health as hh   # self-maintained bad-node (quarantine) list
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HIVE_DIR      = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
@@ -50,7 +51,11 @@ NODE_DB_STALE_SECS = 1800   # node DB older than this → force a re-poll instea
 ORPHAN_GRACE_SECS  = 90     # running task w/ no srun+heartbeat+exit older than this → crash orphan
 MAX_ATTEMPTS       = 3      # requeue cap for crash orphans (prevents infinite redispatch)
 STARVATION_CYCLES  = 3      # consecutive starved cycles before forcing a poller re-poll
-LIVE_PROBE_TIMEOUT = 20     # seconds for a single verify-before-dispatch probe
+LIVE_PROBE_TIMEOUT = 45     # verify-before-dispatch probe: srun + python startup (CUDA probe)
+VERIFY_EVERY_DISPATCH = True  # live-probe (memory + CUDA context) before EVERY dispatch, not
+                              # only for uncertain nodes: the DB can be a poll cycle stale
+                              # (feedback #14) and nvidia-smi can't see a CUDA-init fault
+                              # (feedback #13/#15/#16/#28/#29) — only a real context can.
 
 # ── Walltime-aware placement (feedback C4: don't strand a long task on a dying node) ──
 # Only applies when a task carries an est_runtime_secs (explicit --est-runtime or
@@ -386,7 +391,8 @@ def live_probe(slurm_jobid):
     mem_total}.
     """
     probe = ("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
-             "--format=csv,noheader,nounits 2>/dev/null")
+             "--format=csv,noheader,nounits 2>/dev/null; "
+             f"echo {hh.CUDA_MARKER}; " + hh.cuda_probe_shell())
     try:
         out = subprocess.run(
             ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
@@ -394,18 +400,27 @@ def live_probe(slurm_jobid):
             capture_output=True, text=True, timeout=LIVE_PROBE_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError):
         return {"ok": False}
-    lines = [l for l in (out.stdout or "").strip().splitlines() if l.strip()]
+    raw = (out.stdout or "")
+    gpu_part, _, cuda_part = raw.partition(hh.CUDA_MARKER)
+    lines = [l for l in gpu_part.strip().splitlines() if l.strip()]
     if out.returncode != 0 or not lines:
         return {"ok": False}
     agg = _max_gpu(lines)
     if agg is None:
         return {"ok": False}
     util, used, total = agg
-    return {"ok": True, "util": util, "mem_used": used, "mem_total": total}
+    # The CUDA verdict rides in the same srun step: `fail` means creating a context on
+    # the hold job's GPU failed (co-tenant / broken node), `unknown` means the probe
+    # couldn't run (no python / libcuda) and is never treated as a fault.
+    cuda, cuda_detail = hh.parse_cuda_probe(cuda_part.splitlines())
+    return {"ok": True, "util": util, "mem_used": used, "mem_total": total,
+            "cuda": cuda, "cuda_detail": cuda_detail}
 
 
-def get_candidates(jobs_db, used_jobids, freed):
+def get_candidates(jobs_db, used_jobids, freed, quarantined=frozenset()):
     """Candidate hold-jobs for dispatch, each (jid, info, needs_verify).
+
+    Hold jobs on a `quarantined` physical node (hive health) are never candidates.
 
     Dispatchable = SLURM-allocated + plausibly free, decoupled from a single
     `status=="idle"` check (feedback OPT-B). `idle` nodes are candidates; so are
@@ -416,6 +431,8 @@ def get_candidates(jobs_db, used_jobids, freed):
     cands = []
     for jid, info in jobs_db.items():
         if jid in used_jobids:
+            continue
+        if info.get("node") in quarantined:
             continue
         st = info.get("status")
         forced = jid in freed
@@ -644,6 +661,9 @@ def run_one_cycle():
     with QueueLock() as lfd:
         queue = load_queue(lfd)
         tasks = queue.get("tasks", {})
+        health = hh.load()
+        health_changed = False
+        quarantined = hh.quarantined_nodes(health)
 
         # ── (1) Check running tasks ──────────────────────────────────────────
         running_jobids = set()
@@ -705,6 +725,51 @@ def run_one_cycle():
                           state=task["state"], exit_code=ec, node=task.get("node"),
                           slurm_jobid=jid, run_secs=task["duration_secs"],
                           queued_secs=task["queued_secs"])
+
+                # ── Node health feedback (hive_health) ───────────────────────
+                node_name = task.get("node")
+                dur = task.get("duration_secs")
+                if ec == 0 and node_name:
+                    health_changed |= hh.clear_strikes(health, node_name)
+                elif (node_name and dur is not None and dur < hh.FAST_FAIL_SECS):
+                    sig = hh.classify_log_tail(task.get("log", ""))
+                    if sig:
+                        # Fast death with a CUDA-init signature: a strike against the
+                        # NODE, not the command. Two strikes quarantine it, and the task
+                        # that tripped the wire is given another node (it never got past
+                        # init, so nothing is lost).
+                        health_changed = True
+                        tripped = hh.strike(health, node_name, f"task {task['id']}: {sig}")
+                        logging.warning("Task %d died in %ss on %s with a CUDA-init fault "
+                                        "(%s) — strike %d%s", task["id"], dur, node_name, sig,
+                                        health["nodes"][node_name]["strikes"],
+                                        "; node QUARANTINED" if tripped else "")
+                        if tripped:
+                            quarantined.add(node_name)
+                            ev.record("quarantine", node=node_name, source="auto",
+                                      task=task["id"], reason=sig)
+                            if task.get("attempts", 0) < MAX_ATTEMPTS:
+                                task["attempts"]       = task.get("attempts", 0) + 1
+                                task["state"]          = "pending"
+                                task["pending_reason"] = "node_quarantined_redispatch"
+                                task["slurm_jobid"]    = None
+                                task["node"]           = None
+                                task["srun_pid"]       = None
+                                task["started_at"] = task["started_ts"] = task["dispatched_ts"] = None
+                                task["finished_at"] = task["finished_ts"] = None
+                                task["exit_code"]      = None
+                                append_log_note(task, [
+                                    "",
+                                    f"=== hive: {node_name} quarantined after repeated CUDA-init "
+                                    f"failures; task #{task['id']} will be RE-DISPATCHED to another "
+                                    f"node (attempt {task['attempts']}/{MAX_ATTEMPTS}). ===",
+                                    "",
+                                ])
+                                freed_jobids.discard(jid)
+                                ev.record("requeue", task=task["id"],
+                                          name=task.get("name") or None,
+                                          reason="node_quarantined", prev_node=node_name,
+                                          attempts=task["attempts"], checkpoint_lost=False)
 
             elif status == "dead":
                 if _is_crash_orphan(task) and task.get("attempts", 0) < MAX_ATTEMPTS:
@@ -786,12 +851,37 @@ def run_one_cycle():
                               slurm_jobid=jid, run_secs=task["duration_secs"],
                               queued_secs=task["queued_secs"])
 
+        # ── (1b) Periodic health checks of quarantined nodes ─────────────────
+        # Re-probe each quarantined node (through one of its hold jobs that isn't
+        # running a task) every HEALTH_CHECK_SECS; HEALTH_OK_STREAK healthy probes
+        # release it, a failed probe re-arms the hold. This is what keeps the
+        # bad-node list self-maintaining instead of a manual blacklist.
+        now = time.time()
+        for node_name, rec in list(health.get("nodes", {}).items()):
+            if not hh.due_for_check(rec, now):
+                continue
+            jid = next((j for j, i in jobs_db.items()
+                        if i.get("node") == node_name and j not in running_jobids), None)
+            if jid is None:
+                hh.record_check(health, node_name, None, "no_hold_job")
+                health_changed = True
+                continue
+            verdict, detail = hh.cuda_probe(jid)
+            outcome = hh.record_check(health, node_name, verdict, detail)
+            health_changed = True
+            logging.info("Health check %s via %s: %s %s%s", node_name, jid, verdict, detail,
+                         f" → {outcome}" if outcome else "")
+            if outcome == "released":
+                quarantined.discard(node_name)
+                ev.record("release", node=node_name, source="auto", detail=detail)
+
         # ── (2) Dispatch pending tasks ───────────────────────────────────────
         # Candidate nodes are tried per task with a verify-before-dispatch live
         # probe + a GPU-clean / free-mem gate, so we never dispatch onto a dirty
         # or actually-occupied GPU (feedback C1/C2). A reason is recorded on each
         # task that can't be placed this cycle.
-        candidates = get_candidates(jobs_db, running_jobids, freed_jobids)
+        candidates = get_candidates(jobs_db, running_jobids, freed_jobids, quarantined)
+        n_quarantined_jobs = sum(1 for i in jobs_db.values() if i.get("node") in quarantined)
         pending = sorted(
             [t for t in tasks.values() if t["state"] == "pending"],
             key=lambda t: (-t.get("priority", 0), t["submitted_at"]),
@@ -801,7 +891,10 @@ def run_one_cycle():
         for task in pending:
             need_mb = int(task.get("need_mb") or NEED_MB_DEFAULT)
             want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
-            reason = "no_dispatchable_node"
+            # If the only reason nothing is dispatchable is that the pool's nodes are
+            # quarantined, say so instead of the generic reason.
+            reason = "node_quarantined" if (not candidates and n_quarantined_jobs) \
+                else "no_dispatchable_node"
             placed = False
 
             # `candidates` is shared by every pending task this cycle. A NODE-level
@@ -829,7 +922,7 @@ def run_one_cycle():
                     i += 1
                     continue
 
-                if needs_verify:
+                if needs_verify or VERIFY_EVERY_DISPATCH:
                     p = live_probe(jid)
                     if not p["ok"]:
                         reason = "probe_unverifiable"
@@ -840,6 +933,24 @@ def run_one_cycle():
                     if p["util"] >= 5 and used >= 500:
                         reason = "node_busy_on_verify"
                         candidates.pop(i)      # node-level
+                        continue
+                    if p.get("cuda") == "fail":
+                        # nvidia-smi says free, but a CUDA context can't be created:
+                        # co-tenant outside our cgroup or a broken node. No user code
+                        # involved, so this alone quarantines the node (hive health).
+                        node_name = info.get("node", "?")
+                        reason = "cuda_unavailable_on_verify"
+                        candidates.pop(i)      # node-level
+                        if node_name not in quarantined:
+                            hh.quarantine(health, node_name,
+                                          f"CUDA probe failed on verify: {p.get('cuda_detail')}",
+                                          "verify")
+                            quarantined.add(node_name)
+                            health_changed = True
+                            logging.warning("Node %s QUARANTINED: CUDA context creation failed "
+                                            "on verify (%s)", node_name, p.get("cuda_detail"))
+                            ev.record("quarantine", node=node_name, source="verify",
+                                      reason=p.get("cuda_detail"))
                         continue
                     # Verified clean: keep the live reading so the next task doesn't
                     # pay for another srun probe on the same node this cycle.
@@ -915,6 +1026,9 @@ def run_one_cycle():
                 if task.get("pending_reason") != reason:
                     task["pending_reason"] = reason
                     changed = True
+
+        if health_changed:
+            hh.save(health)
 
         # ── (3) Starvation watchdog ──────────────────────────────────────────
         if pending and dispatched == 0:

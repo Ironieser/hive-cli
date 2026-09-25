@@ -51,7 +51,10 @@ Two **independent background daemons**, each reading/writing JSON state under `~
 2. **Task scheduler** — `libexec/hive-sched` (30s loop). Reads `queue.json` +
    `node_monitor.json`, dispatches `pending` tasks via `srun --overlap`, and tracks
    liveness via heartbeat files under `~/.hive/heartbeat/`. Managed through
-   `hive queue daemon` / `hive-queue` (the user-facing CLI).
+   `hive queue daemon` / `hive-queue` (the user-facing CLI). It also owns the node
+   health list (`libexec/hive_health.py`, user-facing `hive health`): verify-probe CUDA
+   failures and fast CUDA-signature task failures quarantine a node; periodic probes
+   release it.
 
 The two daemons communicate **only** through `node_monitor.json` — the scheduler never
 polls SLURM directly. It trusts the poller's DB for *fresh, idle* nodes, but for
@@ -113,6 +116,15 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   CLI only signals directly when `sched.pid`'s host is the local host.
 - **Everything user-controlled in the dispatch wrapper is `shlex.quote`d** (cmd in the
   header, workdir, log/heartbeat paths). The command line itself runs verbatim.
+- **Node health is a separate, self-maintained list** (`libexec/hive_health.py`,
+  `~/.hive/node_health.json`, keyed by physical node). Every dispatch is live-verified
+  (`VERIFY_EVERY_DISPATCH`) with memory *and* a real CUDA-context probe; `fail`
+  quarantines the node, `unknown` (no python/libcuda) **never** counts as a fault. Fast
+  task failures count as strikes only with a CUDA-init signature in the log
+  (`CUDA_FAULT_PATTERNS`) — keep those specific so a buggy command can't blacklist a
+  node. The scheduler re-probes quarantined nodes and releases them itself; don't add a
+  static blacklist. Offline tests stub the probe via `HIVE_CUDA_PROBE_CMD` (the mock
+  cluster has no GPU) and the live reading via `MOCK_LIVE_GPU`.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

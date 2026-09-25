@@ -80,6 +80,10 @@ case "$subcommand" in
         py="$(_resolve_python)"
         exec "$py" "${HIVE_LIBEXEC}/hive-feedback" "$@"
         ;;
+    health)
+        py="$(_resolve_python)"
+        exec "$py" "${HIVE_LIBEXEC}/hive-health" "$@"
+        ;;
     # ── Queue shortcuts (hive submit → hive queue submit, etc.) ──────────────
     submit|wait|list|ls|cancel|logs|rm|stats|prune)
         py="$(_resolve_python)"
@@ -125,6 +129,9 @@ case "$subcommand" in
                               Manage node pool (sbatch hold jobs / scancel)
     feedback "text" | submit|list|show|triage
                               File / manage feedback for the hive-cli repo
+    health   [list]|report NODE|check NODE|clear NODE
+                              Bad-node quarantine list (self-maintained; agents
+                              report a node, the scheduler re-probes + releases it)
 
   Examples:
     hive jobs -a              Show all users' jobs

@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+- **Self-maintained bad-node list (`hive health`)** — feedback #13/#15/#16/#20/#23/#28/
+  #29/#30: evc43/evc50 read IDLE (free memory, no processes) yet every task placed there
+  died at CUDA init within a minute. nvidia-smi cannot see that; only creating a real CUDA
+  context can. hive now keeps `~/.hive/node_health.json`, keyed by physical node:
+  - **Verify-before-dispatch creates a CUDA context** (stdlib `ctypes` → `libcuda`, no
+    torch needed) inside the same `srun --overlap` step as the memory read. A failure
+    quarantines the node immediately (`pending_reason=cuda_unavailable_on_verify`);
+    `unknown` (no python / libcuda) never counts as a fault. Verified live: healthy node
+    → ok, evc43 → `cuCtxCreate=999`.
+  - **Every dispatch is now live-verified**, not only uncertain nodes, so a stale poll can
+    no longer place a task on a card a co-tenant filled since (feedback #14).
+  - **Auto-quarantine from task outcomes**: a task that fails within 180 s with a
+    CUDA-init signature in its log (`CUDA-capable device(s) is/are busy or unavailable`,
+    `CUDA unknown error`, …) is a *strike* against the node; two strikes quarantine it and
+    the task that tripped it is requeued elsewhere. A successful task clears strikes.
+    Ordinary crashes and slow failures never count.
+  - **Agents can seed it**: `hive health report <node> --reason …` quarantines at once.
+  - **It heals itself**: the scheduler re-probes each quarantined node every 10 min
+    through one of its hold jobs and releases it after 2 consecutive healthy probes
+    (after a 1 h minimum hold); a failed probe re-arms it. `hive health check <node>`
+    runs the probe now, `hive health clear <node>` releases manually.
+  - `hive nodes` / `hive top` show quarantined nodes as **QUAR**; pending tasks that have
+    only quarantined nodes left report `node_quarantined`.
+
 ### Fixed
 - **Feedback filed through the installed copy was invisible and about to be deleted.**
   `hive feedback` resolved its storage relative to the script, so agents running

@@ -133,6 +133,13 @@ queue.json               # task queue (hive-queue / hive-sched, flock on queue.l
 #   cancel_requested   set by `hive cancel` from a node other than the scheduler's; the
 #                      scheduler kills the srun step and marks the task cancelled.
 
+node_health.json         # self-maintained bad-node list (hive_health.py / `hive health`)
+{ "nodes": { "evc43": { "state": "quarantined", "reason": "...", "source": "verify|auto|agent|manual",
+             "since": <epoch>, "until": <epoch>, "strikes": 2, "ok_streak": 0,
+             "last_check": <epoch>, "last_result": "fail: cuCtxCreate=999", "history": [...] } } }
+# keyed by PHYSICAL node; written under queue.lock by hive-sched (verify/strike/periodic
+# probe) and `hive health`; read by nodes/top (QUAR). See docs/status_model.md.
+
 events.jsonl             # durable append-only task lifecycle log (hive_events.py)
 {"ts":"…","t":1780000000.0,"event":"submit",  "task":5,"name":"train","est_runtime_secs":7200}
 {"ts":"…","event":"dispatch","task":5,"node":"evc23","slurm_jobid":"584954","node_time_left_secs":45000}

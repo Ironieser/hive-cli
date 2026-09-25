@@ -40,6 +40,28 @@ Extra fields a record may carry:
   top-level `updated`, not per-job `polled_at`. `-1` = unlimited, `null`/absent =
   unknown (older poller). Drives the walltime gate below and the `hive nodes` LEFT col.
 
+## Node health / quarantine (`hive health`, `libexec/hive_health.py`)
+
+Separate from per-hold-job `status`, hive keeps a per-**physical-node** health list in
+`~/.hive/node_health.json`. A node is `quarantined` when creating a real CUDA context on
+it fails — the failure mode nvidia-smi cannot see (co-tenant outside our cgroup, broken
+driver state; feedback #13/#15/#16/#20/#28/#29/#30). Hold jobs on a quarantined node are
+never dispatch candidates. Entry points:
+
+| Trigger | Effect |
+|---|---|
+| verify-before-dispatch CUDA probe returns `fail` | quarantine now (`source=verify`) |
+| task fails < `FAST_FAIL_SECS`=180 s with a CUDA-init signature in its log | +1 strike; `STRIKES_TO_QUARANTINE`=2 → quarantine (`source=auto`), tripping task requeued (`node_quarantined_redispatch`) |
+| `hive health report NODE` | quarantine now (`source=agent`) |
+| successful task on the node | strikes reset |
+| periodic probe every `HEALTH_CHECK_SECS`=600 s (through a hold job with no running task) | `HEALTH_OK_STREAK`=2 consecutive `ok` after `QUARANTINE_MIN_SECS`=3600 s → released; `fail` → re-armed; `unknown` → ignored |
+| `hive health clear NODE` | released (`source=manual`) |
+
+The probe is stdlib-only (`ctypes` → `libcuda.so.1`: `cuInit`, `cuCtxCreate`,
+`cuMemAlloc`) and runs inside `srun --overlap` under the hold job's cgroup, so it sees
+exactly what a task would. `unknown` (no python / no libcuda) is never a fault.
+`HIVE_CUDA_PROBE_CMD` overrides the probe snippet (offline tests).
+
 ## Key rule
 
 **A probe failure is never reported as `cpu` or `busy`.** Doing so silently removed
@@ -56,9 +78,12 @@ Dispatchability is **decoupled from a single `status=="idle"` check**:
    as *uncertain*, not busy — it always carries `needs_verify`, so the live probe below
    decides. This also lets a DB written by an older hive (stuck at `warning`) self-heal
    without hand-editing `node_monitor.json`.
-2. **Verify-before-dispatch**: uncertain/stale/just-freed candidates get a fast live
-   `nvidia-smi` probe (`srun --overlap`) right before dispatch. Fresh trustworthy
-   `idle` nodes skip this (cheap).
+2. **Verify-before-dispatch — every dispatch** (`VERIFY_EVERY_DISPATCH`): one
+   `srun --overlap` step reads `nvidia-smi` memory/util *and* creates a CUDA context
+   right before placing a task. The live reading overrides the DB (a stale-dirty DB no
+   longer blocks a now-clean card, and a stale-idle DB no longer places onto a card a
+   co-tenant filled since — feedback #14). Verified-clean nodes are cached for the rest
+   of the cycle. `cuda=fail` → `cuda_unavailable_on_verify` + node quarantined.
 3. **GPU-clean / free-mem gate**: skip any candidate with > `GPU_CLEAN_MB`=5000 MiB
    resident (zombie process or out-of-band co-tenant), or with less than the task's
    `need_mb` free. The task stays PENDING with a `pending_reason`.
@@ -111,9 +136,10 @@ and fall back to parsing `*_at` in the reader's zone. `events.jsonl` lines carry
 ## `pending_reason` values
 
 `no_dispatchable_node`, `waiting_for_mem`, `gpu_dirty`, `node_busy_on_verify`,
-`probe_unverifiable`, `insufficient_walltime`, `redispatched_after_crash`,
-`infra_failure_redispatch`, `dispatch_error`. Shown in the NODE column of `hive list`
-for pending tasks.
+`probe_unverifiable`, `cuda_unavailable_on_verify`, `node_quarantined`,
+`node_quarantined_redispatch`, `insufficient_walltime`, `insufficient_gpus`,
+`redispatched_after_crash`, `infra_failure_redispatch`, `dispatch_error`. Shown in the
+NODE column of `hive list` for pending tasks.
 
 ## Runtime estimate, history & timing feedback
 

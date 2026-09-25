@@ -48,6 +48,8 @@ cat > "$TMP/bin/nvidia-smi" <<'EOF'
 if [[ "$*" == *"--query-gpu"* ]]; then
   if [[ "$*" == *"index"* ]]; then
     printf '0, 0, 10, 81920\n1, 85, 40000, 81920\n'
+  elif [[ -n "${MOCK_LIVE_GPU:-}" ]]; then
+    printf '%b\n' "$MOCK_LIVE_GPU"        # tests set this to simulate a dirty/busy live reading
   else
     echo "0, 10, 81920"
   fi
@@ -59,6 +61,8 @@ chmod +x "$TMP/bin/"*
 
 export PATH="$TMP/bin:$PATH"
 export HIVE_DIR="$TMP/hive"
+# The mock cluster has no GPU: stub the CUDA-context probe as healthy (tests flip it).
+export HIVE_CUDA_PROBE_CMD="echo 'CUDA_PROBE ok'"
 export USER="${USER:-tester}"
 # pretend a scheduler runs elsewhere so `submit` doesn't autostart a real one
 date -Iseconds > "$TMP/hive/sched.heartbeat"

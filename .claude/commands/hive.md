@@ -53,6 +53,12 @@ hive queue rm <ID>        # delete one done/failed/cancelled record
 hive prune --dry-run      # preview which old terminal tasks would be dropped
 hive prune --older-than 7d# trim old terminal tasks (history kept in events.jsonl)
 
+# Node health (bad-node quarantine — self-maintained)
+hive health                      # list quarantined / recently-checked nodes
+hive health report evc43 -r "tasks die at CUDA init"   # quarantine now; hive re-probes & releases it
+hive health check evc43          # create a real CUDA context there right now (ok / fail)
+hive health clear evc43          # release manually
+
 # Pool management
 hive pool add                    # sbatch a new hold job (default preset)
 hive pool add highgpu            # named preset
@@ -251,6 +257,9 @@ it hasn't dispatched yet (no more guessing from `squeue`):
 | `probe_unverifiable` | Could not confirm a node is free (transient `srun` failure) |
 | `insufficient_walltime` | No node has enough remaining walltime for this task's `est_runtime` + 10 min — `hive pool add --time …` or lower the estimate |
 | `insufficient_gpus` | No hold job owns as many GPUs as the task's `gpus=N` — add a multi-GPU hold job (`--gres=gpu:N`) or lower `gpus` |
+| `cuda_unavailable_on_verify` | The pre-dispatch probe could not create a CUDA context on the node (co-tenant / broken node); the node is now quarantined — `hive health` |
+| `node_quarantined` | Every remaining pool node is quarantined — `hive health`, `hive pool add` |
+| `node_quarantined_redispatch` | This task died at CUDA init on a node that just got quarantined; it will be re-run elsewhere (nothing was lost) |
 | `redispatched_after_crash` | Was requeued after a scheduler restart found no running step (never ran — no progress lost) |
 | `infra_failure_redispatch` | The node was reclaimed **mid-run**; requeued to another node. ⚠ The new run starts fresh — progress is lost unless your command checkpoints. Shown as `(re-disp xN)` in the NODE column. |
 
@@ -268,9 +277,20 @@ under an hour) so you can see how long a node can run before SLURM reclaims it.
 
 `hive nodes` STATUS values: `BUSY` (GPU in use), `CLAIM` (a hive task is RUNNING on this
 hold job but its GPU isn't hot yet — cold import / model load; the slot is taken), `IDLE`,
-`WARN` (was busy, GPU went quiet, grace window), `PFAIL` (probe failed), `CPU` (no GPU).
-Only `IDLE` (and, after a live verify, `WARN`/`PFAIL`) can receive new tasks, so
-`CLAIM`/`BUSY` rows plus `no_dispatchable_node` on pending tasks is normal, not a bug.
+`WARN` (was busy, GPU went quiet, grace window), `PFAIL` (probe failed), `CPU` (no GPU),
+`QUAR` (node quarantined by `hive health`: CUDA context creation fails there; no dispatch
+until it passes the periodic probe). Only `IDLE` (and, after a live verify, `WARN`/`PFAIL`)
+can receive new tasks, so `CLAIM`/`BUSY` rows plus `no_dispatchable_node` on pending tasks
+is normal, not a bug.
+
+**Bad nodes.** Before every dispatch hive creates a real CUDA context on the target
+GPU; if that fails the node is quarantined automatically, and a task that dies within
+3 min with `CUDA-capable device(s) is/are busy or unavailable` / `CUDA unknown error`
+in its log counts as a strike (2 strikes → quarantine, the task is re-run elsewhere).
+If you still see a node killing tasks at CUDA init, run
+`hive health report <node> --reason "..."` — hive stops using it immediately, re-probes
+it every 10 min and releases it by itself once two probes pass. Do not `scancel` the hold
+job for this; the node, not the job, is at fault.
 
 ---
 
@@ -462,3 +482,5 @@ Reports land in the maintainer's checkout (`hive feedback list` prints the dir);
 | Task FAILED immediately | `hive logs <id>` — check top lines | srun error or bad workdir |
 | `hive submit` returns error | run `hive queue daemon status` | Scheduler may have crashed |
 | Node shows `PFAIL` | `hive poll` | Probe failed (srun contention) or hold job expired; scheduler still verifies & may carry forward the last-good state |
+| Node shows `QUAR` | `hive health` | CUDA context creation fails there; auto-released after 2 healthy probes, or `hive health clear` |
+| Tasks die at CUDA init on one node | `hive health check <node>` | `hive health report <node>` if it isn't quarantined yet |

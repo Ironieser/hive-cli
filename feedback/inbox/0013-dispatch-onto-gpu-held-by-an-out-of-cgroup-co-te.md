@@ -2,15 +2,15 @@
 id: 13
 title: Dispatch onto GPU held by an out-of-cgroup co-tenant: memory-based gpu_dirty check is blind to it
 severity: high
-status: triaged
+status: done
 tags: [scheduler, dispatch, probe]
 submitter: si384883
 hive_version: 0.4.0
 task_ids: [7600, 7602]
 created: 2026-07-30T15:58:15
-updated: 2026-09-25T06:53:37
+updated: 2026-09-25T07:29:18
 source: cli
-triage_note: Node-health theme: co-tenant / broken node (evc43, evc50) accepts dispatch, CUDA init fails. Needs squeue -w foreign-job detection + auto-quarantine after N fast failures (ROADMAP C4). Not fixed yet.
+triage_note: Fixed: hive health — verify-before-dispatch creates a real CUDA context (ctypes/libcuda) and quarantines the node on failure (evc43 verified: cuCtxCreate=999); fast task failures with a CUDA-init log signature strike the node (2 → quarantine + requeue); periodic probes release it. hive health report/check/clear.
 ---
 
 ## Symptom
