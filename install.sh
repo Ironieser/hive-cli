@@ -139,15 +139,27 @@ fi
 
 # ── 7. Install Claude Code skill (optional) ──────────────────────────────────
 title "6. Claude Code skill"
-CLAUDE_CMD_DIR="${HOME}/.claude/commands"
-SKILL_SRC="${INSTALL_DIR}/.claude/commands/hive.md"
-SKILL_DST="${CLAUDE_CMD_DIR}/hive.md"
-if [[ -f "$SKILL_SRC" ]]; then
-    mkdir -p "$CLAUDE_CMD_DIR"
-    cp "$SKILL_SRC" "$SKILL_DST"
-    info "Installed skill: ${SKILL_DST}  (invoke as /hive in Claude Code)"
+# Standard skill layout: SKILL.md (frontmatter + short body, always loaded when the
+# skill triggers) + references/ (read on demand). Installed to ~/.claude/skills/hive/.
+SKILL_SRC_DIR="${INSTALL_DIR}/.claude/skills/hive"
+SKILL_DST_DIR="${HOME}/.claude/skills/hive"
+if [[ -f "${SKILL_SRC_DIR}/SKILL.md" ]]; then
+    mkdir -p "$SKILL_DST_DIR"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "${SKILL_SRC_DIR}/" "${SKILL_DST_DIR}/"
+    else
+        rm -rf "${SKILL_DST_DIR:?}"/* && cp -r "${SKILL_SRC_DIR}/." "${SKILL_DST_DIR}/"
+    fi
+    info "Installed skill: ${SKILL_DST_DIR}/SKILL.md  (+references; invoke as /hive in Claude Code)"
 else
-    warn "Skill file not found in install dir — skipping"
+    warn "Skill dir not found in install dir — skipping"
+fi
+# The pre-v0.4.1 skill was a single slash-command file. Having both would surface two
+# /hive entries, so park the old one (renamed, not deleted, in case it was customised).
+OLD_SKILL="${HOME}/.claude/commands/hive.md"
+if [[ -f "$OLD_SKILL" ]]; then
+    mv "$OLD_SKILL" "${OLD_SKILL}.pre-skill.bak"
+    warn "Moved old slash-command skill to ${OLD_SKILL}.pre-skill.bak (superseded by ~/.claude/skills/hive/)"
 fi
 
 # ── 8. PATH reminder ─────────────────────────────────────────────────────────

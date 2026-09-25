@@ -569,6 +569,10 @@ def cmd_submit(args):
 # ── List ──────────────────────────────────────────────────────────────────────
 
 DONE_HIDE_DAYS_DEFAULT = 7   # default window: hide terminal tasks finished > N days ago
+LIST_LIMIT_DEFAULT     = 10  # ...and show at most this many of them. `hive list` is run by
+                             # agents many times per session; 7 days of history was 250+
+                             # lines / 33 KB per call, all of it landing in their context.
+                             # Active tasks are always shown in full.
 
 
 def _date_label(d):
@@ -592,6 +596,9 @@ def cmd_list(args):
     filter_state = args.state.lower() if args.state else None
     show_all     = getattr(args, "all", False)
     days         = getattr(args, "days", None) or DONE_HIDE_DAYS_DEFAULT
+    limit        = getattr(args, "limit", None)
+    if limit is None:
+        limit = 0 if show_all else LIST_LIMIT_DEFAULT   # --all lifts the cap; --limit 0 too
 
     # ── Windowing: keep active (running/pending) always; hide terminal tasks
     # finished more than `days` ago unless --all / --state is set. ────────────────
@@ -627,6 +634,12 @@ def cmd_list(args):
     # Terminal newest-first; group by finish date below.
     terminal.sort(key=lambda t: (task_finished_dt(t) or datetime.min, t["id"]),
                   reverse=True)
+    terminal_total = len(terminal)
+    capped = 0
+    if limit and terminal_total > limit:
+        capped = terminal_total - limit
+        terminal = terminal[:limit]
+    tasks = active + terminal
 
     # For PENDING tasks the NODE column is empty, so we reuse it to show *why* the
     # task hasn't dispatched (set by the scheduler — feedback OBSERVED#8 / SESSION#8).
@@ -683,15 +696,16 @@ def cmd_list(args):
     r = sum(1 for t in tasks if t["state"] == "running")
     p = sum(1 for t in tasks if t["state"] == "pending")
     if filter_state:
-        scope = f"queue · filter={filter_state} · {len(tasks)} shown"
+        scope = f"queue · filter={filter_state} · {len(tasks)} of {terminal_total or len(tasks)} shown"
     elif show_all:
-        scope = f"queue · {r} running · {p} pending · all history ({len(terminal)} terminal)"
+        scope = f"queue · {r} running · {p} pending · all history ({terminal_total} terminal)"
     else:
-        scope = f"queue · {r} running · {p} pending"
-        if cutoff is not None:
-            scope += f" · since {cutoff.strftime('%m-%d')} (last {days}d)"
-        if hidden_count:
-            scope += f" · {hidden_count} older hidden (--all)"
+        scope = (f"queue · {r} running · {p} pending · {len(terminal)} of {terminal_total} "
+                 f"finished in last {days}d shown")
+    if capped:
+        scope += f" · +{capped} more (--limit N)"
+    if hidden_count and not show_all:
+        scope += f" · {hidden_count} older (--all)"
     print(f"{C_BOLD}{scope}{C_RESET}")
 
     print(f"{C_BOLD}{header}{C_RESET}")
@@ -714,8 +728,8 @@ def cmd_list(args):
     print()
     sched_status = f"{C_GREEN}running{C_RESET}" if is_sched_running() else f"{C_RED}stopped{C_RESET}"
     footer = f"  {C_DIM}scheduler: {sched_status}"
-    if hidden_count:
-        footer += f"  ·  +{hidden_count} older hidden (hive list --all)"
+    if capped or hidden_count:
+        footer += f"  ·  +{capped + hidden_count} more: hive list --limit N | --all | --state S"
     footer += C_RESET
     print(footer)
 
@@ -775,21 +789,45 @@ def cmd_cancel(args):
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 
+LOG_FULL_MAX_LINES = 200   # print a log whole up to this many lines...
+LOG_TAIL_DEFAULT   = 100   # ...otherwise only its last N (agents read logs into context)
+
+
+def print_log(log_file, tail=None, full=False, task_id=None):
+    """Print a task log without flooding the caller's context. Whole file when it is
+    short (≤ LOG_FULL_MAX_LINES) or `full`; otherwise the last `tail` lines with a
+    one-line pointer to the rest. The header (first 8 lines: node, cmd, gpus…) is kept
+    when tailing since it is what makes a tail interpretable."""
+    try:
+        with open(log_file, errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        print(f"(cannot read log: {e})")
+        return
+    n = len(lines)
+    if full or tail == 0 or n <= max(LOG_FULL_MAX_LINES, tail or 0):
+        sys.stdout.write("".join(lines))
+        return
+    tail = tail or LOG_TAIL_DEFAULT
+    head = [ln for ln in lines[:8] if ln.startswith("===")]
+    body = lines[-tail:]
+    omitted = n - len(head) - len(body)
+    sys.stdout.write("".join(head))
+    ref = f"hive logs {task_id} --full" if task_id is not None else "--full"
+    print(f"{C_DIM}… {omitted} lines omitted ({n} total) — {ref}, or -n N for a longer tail …{C_RESET}")
+    sys.stdout.write("".join(body))
+
+
 def cmd_logs(args):
     task_id = str(args.id)
     queue = load_queue()
     task = queue["tasks"].get(task_id)
     # A pruned task is gone from queue.json, but its log file (deterministic path) may
     # still be on disk — fall back to it so `hive logs` keeps working after a prune.
-    if not task:
-        fallback = os.path.join(LOG_DIR, f"task-{task_id}.log")
-        if os.path.exists(fallback):
-            subprocess.run(["tail", "-f", fallback] if args.follow else ["cat", fallback])
-            return
+    log_file = (task or {}).get("log") or os.path.join(LOG_DIR, f"task-{task_id}.log")
+    if not task and not os.path.exists(log_file):
         print(f"Task #{task_id} not found.", file=sys.stderr)
         sys.exit(1)
-
-    log_file = task.get("log", os.path.join(LOG_DIR, f"task-{task_id}.log"))
     if not os.path.exists(log_file):
         print(f"No log file yet for task #{task_id}.")
         if task["state"] == "pending":
@@ -802,7 +840,7 @@ def cmd_logs(args):
         except KeyboardInterrupt:
             pass
     else:
-        subprocess.run(["cat", log_file])
+        print_log(log_file, tail=args.tail, full=args.full, task_id=task_id)
 
 
 
@@ -915,13 +953,16 @@ def cmd_wait(args):
           + (f" · {detail}" if detail else "")
           + (f" · on {node}" if node != "—" else ""), flush=True)
 
-    # Print log
+    # Print the log — tail only, by default. `hive wait` is the agent's blocking call;
+    # dumping a 2,500-line training log into its context at every completion was the
+    # single biggest source of context bloat. The header + last lines carry the verdict.
     if not no_log:
         log_file = task.get("log", os.path.join(LOG_DIR, f"task-{task_id}.log"))
         if os.path.exists(log_file):
             print()
             print(f"{C_DIM}{'─'*60}{C_RESET}")
-            subprocess.run(["cat", log_file])
+            print_log(log_file, tail=getattr(args, "log_lines", None),
+                      full=getattr(args, "full_log", False), task_id=task_id)
             print(f"{C_DIM}{'─'*60}{C_RESET}")
         else:
             print("(no log file found)")
@@ -1134,6 +1175,9 @@ def build_parser():
                          f"(default {DONE_HIDE_DAYS_DEFAULT}); active tasks always shown")
     pl.add_argument("--all", "-a", action="store_true",
                     help="Show all tasks regardless of age (grouped by date)")
+    pl.add_argument("--limit", "-l", type=int, metavar="N",
+                    help=f"Show at most N finished tasks (default {LIST_LIMIT_DEFAULT}; "
+                         f"0 = no cap). Active tasks are always shown")
 
     # cancel
     pc = sub.add_parser("cancel", help="Cancel a pending or running task")
@@ -1144,6 +1188,10 @@ def build_parser():
     pg.add_argument("id", type=int, metavar="ID")
     pg.add_argument("-f", "--follow", action="store_true",
                     help="Follow log output (tail -f)")
+    pg.add_argument("-n", "--tail", type=int, metavar="N",
+                    help=f"Print only the last N lines (default: whole log if ≤ "
+                         f"{LOG_FULL_MAX_LINES} lines, else last {LOG_TAIL_DEFAULT})")
+    pg.add_argument("--full", action="store_true", help="Print the whole log regardless of length")
 
     # rm
     pr = sub.add_parser("rm", help="Remove a finished/cancelled task from queue")
@@ -1177,6 +1225,11 @@ def build_parser():
                     help="Poll interval in seconds (default: 5)")
     pw.add_argument("--no-log", action="store_true",
                     help="Don't print log on completion")
+    pw.add_argument("--log-lines", type=int, default=40, metavar="N", dest="log_lines",
+                    help="On completion print only the last N log lines (default 40; "
+                         "short logs are printed whole)")
+    pw.add_argument("--full-log", action="store_true", dest="full_log",
+                    help="On completion print the whole log")
     pw.add_argument("--pending-timeout", type=float, default=0, metavar="SEC",
                     dest="pending_timeout",
                     help="If the task stays PENDING (never dispatches) longer than SEC, "

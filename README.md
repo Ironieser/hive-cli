@@ -75,10 +75,10 @@ hive submit job.hive                                     # submit a .hive script
 hive submit --priority 10 --name train "python train.py"  # higher priority dispatches first (default 0)
 hive submit --need-mb 40000 "python train_big.py"       # hold until ≥40 GB GPU mem is free
 hive submit --est-runtime 2h "python train.py"          # runtime estimate → walltime-aware (or 'auto')
-hive list                                               # queue: active first, history grouped by date
-hive list --days 14   |   --all   |   --state running   # widen window / show all / filter
-hive logs 3 -f                                          # follow a task's log
-hive wait 3                                             # block until done → print log, exit task's code
+hive list                                               # queue: active tasks + last 10 finished
+hive list --limit 50  |  --all  |  --state failed       # more history / everything / filter
+hive logs 3 -n 100    |  --full  |  -f                  # tail / whole log / follow
+hive wait 3                                             # block until done → print log TAIL, exit task's code
 hive wait 3 --pending-timeout 600                       # give up (exit 75) if it never dispatches
 hive stats [NAME]                                       # completed-run durations (min/median/P90/max)
 hive cancel 3                                           # cancel a pending/running task

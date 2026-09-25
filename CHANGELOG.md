@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed (agent context frugality)
+- **`hive list` shows active tasks plus at most 10 finished ones** (`--limit N`,
+  `--limit 0`/`--all` for everything; the cap also applies with `--state`). The default
+  7-day view had grown to 250+ lines / 33 KB per call, all of it landing in every
+  agent's context. The scope line states how many rows are hidden and how to see them.
+- **`hive wait` prints a log tail, not the whole log**: header + last 40 lines
+  (`--log-lines N`, `--full-log`, `--no-log`). One completion had dumped 2,500 lines
+  into an agent's context.
+- **`hive logs` tails long logs**: whole file up to 200 lines, otherwise header + last 100
+  with an omission notice (`-n N`, `--full`). `-f` unchanged.
+- **Skill rewritten in the standard layout**: `.claude/skills/hive/SKILL.md` (123 lines:
+  the submit→wait loop, resumability, context-frugal commands, pending reasons, rules)
+  + `references/{cli,troubleshooting,state}.md` read on demand — replacing the 486-line
+  single-file slash command. `install.sh` installs it to `~/.claude/skills/hive/` and
+  renames an old `~/.claude/commands/hive.md` to `*.pre-skill.bak`.
+
 ### Added
 - **Self-maintained bad-node list (`hive health`)** — feedback #13/#15/#16/#20/#23/#28/
   #29/#30: evc43/evc50 read IDLE (free memory, no processes) yet every task placed there

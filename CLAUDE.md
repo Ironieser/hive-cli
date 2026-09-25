@@ -13,7 +13,7 @@ loops. There is no build step; it is a set of executable scripts symlinked onto 
 
 ```bash
 bash install.sh                 # install to ~/.local/share/hive-cli, symlink hive→~/bin,
-                                # copy Claude skill to ~/.claude/commands/hive.md
+                                # install Claude skill to ~/.claude/skills/hive/
 ./hive <subcommand>             # run directly from the checkout (no install needed)
 ./hive help                     # full subcommand list
 ```
@@ -201,4 +201,12 @@ column) explaining why they haven't dispatched. Logs land in
 - User-facing strings mix English and Simplified Chinese (`hive-jobs` help is zh-CN);
   match the surrounding file. README has a `README_zh.md` counterpart.
 - `docs/architecture.md` documents the data flow and JSON schemas; update it when the
-  daemon/DB contract changes. The bundled Claude skill lives at `.claude/commands/hive.md`.
+  daemon/DB contract changes. The bundled Claude skill is `.claude/skills/hive/SKILL.md`
+  (short, always loaded when it triggers) + `references/{cli,troubleshooting,state}.md`
+  (read on demand). Keep SKILL.md under ~150 lines; put detail in references. Every
+  user-facing behaviour change must be reflected there — other agents learn hive from it.
+- **CLI output is sized for agent context.** `hive list` caps finished rows
+  (`LIST_LIMIT_DEFAULT`), `hive wait` prints a log *tail* (`--log-lines`, default 40),
+  `hive logs` tails logs over `LOG_FULL_MAX_LINES` (`-n` / `--full`). A 7-day history
+  was 250+ lines and a `hive wait` once dumped 2,500 lines into an agent's context.
+  Don't add unbounded output paths.

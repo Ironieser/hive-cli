@@ -15,7 +15,7 @@ This guide is written for **AI coding agents** (Claude Code, Cursor, etc.) runni
 
 ## Claude Code Skill
 
-hive-cli ships a Claude Code skill at `.claude/commands/hive.md`. It is installed automatically by `install.sh` to `~/.claude/commands/hive.md`.
+hive-cli ships a Claude Code skill at `.claude/skills/hive/` (`SKILL.md` + `references/`). It is installed automatically by `install.sh` to `~/.claude/skills/hive/` (old single-file `~/.claude/commands/hive.md` installs are renamed `*.pre-skill.bak`). Manual install: `cp -r ~/.local/share/hive-cli/.claude/skills/hive ~/.claude/skills/`. Original note: `~/.claude/commands/hive.md`.
 
 Once installed, invoke it in any Claude Code session with:
 
@@ -34,8 +34,8 @@ The skill contains actionable instructions for Claude: exact commands to run, cr
 To install the skill manually without running `install.sh`:
 
 ```bash
-mkdir -p ~/.claude/commands
-cp ~/.local/share/hive-cli/.claude/commands/hive.md ~/.claude/commands/hive.md
+mkdir -p ~/.claude/skills
+cp -r ~/.local/share/hive-cli/.claude/skills/hive ~/.claude/skills/
 ```
 
 ---

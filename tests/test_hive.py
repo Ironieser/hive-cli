@@ -508,6 +508,36 @@ wq({"123": t}); hs.run_one_cycle()
 chk("a successful task on the node clears its strikes", hh.load()["nodes"]["evc50"]["strikes"] == 0)
 reset_health()
 
+print("== context frugality: hive list cap, log tailing ==")
+import io, contextlib, argparse as _ap
+def _capture(fn, *a):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(*a)
+    return buf.getvalue()
+many = {str(i): dict(task(i, name=f"d{i}", state="done"), finished_at=loc(-i), finished_ts=time.time() - i,
+                     started_at=loc(-i - 5), started_ts=time.time() - i - 5, exit_code=0, duration_secs=5)
+        for i in range(200, 230)}
+many["300"] = task(300, name="active")            # pending: always shown
+wq(many)
+out = _capture(hq.cmd_list, _ap.Namespace(state=None, all=False, days=None, limit=None))
+rows = [l for l in out.splitlines() if l.strip().startswith(tuple("0123456789"))]
+chk("hive list shows all active + at most LIST_LIMIT_DEFAULT finished rows",
+    len(rows) == 1 + hq.LIST_LIMIT_DEFAULT and "+20 more" in out)
+out_all = _capture(hq.cmd_list, _ap.Namespace(state=None, all=True, days=None, limit=None))
+chk("--all lifts the cap", sum(1 for l in out_all.splitlines() if l.strip().startswith(tuple("0123456789"))) == 31)
+out_l = _capture(hq.cmd_list, _ap.Namespace(state="done", all=False, days=None, limit=3))
+chk("--limit N applies to --state filters too",
+    sum(1 for l in out_l.splitlines() if l.strip().startswith(tuple("0123456789"))) == 3)
+_big = os.path.join(hs.LOG_DIR, "big.log")
+open(_big, "w").write("=== hive task #1 started ===\n=== cmd: x ===\n" + "".join(f"line {i}\n" for i in range(1000)) + "=== finished exit_code=0 ===\n")
+out = _capture(hq.print_log, _big, None, False, 1)
+chk("long log is tailed (header kept + omission notice + last lines)",
+    out.startswith("=== hive task #1") and "lines omitted" in out and out.rstrip().endswith("exit_code=0 ===")
+    and len(out.splitlines()) <= hq.LOG_TAIL_DEFAULT + 4)
+chk("short log printed whole", _capture(hq.print_log, os.path.join(hs.LOG_DIR, "task-90.log"), None, False, 90).count("lines omitted") == 0)
+chk("--full prints everything", len(_capture(hq.print_log, _big, None, True, 1).splitlines()) == 1003)
+
 print("== integration: history_estimate from event log (P90) ==")
 open(ev.EVENTS_FILE, "w").close()
 for d in (600, 900, 1200):
