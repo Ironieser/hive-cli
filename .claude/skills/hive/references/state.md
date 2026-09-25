@@ -26,6 +26,7 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 
 ## Task fields worth knowing
 
+- `owner`: agent / project tag from `--owner` / `#HIVE owner=` / `$HIVE_OWNER` (may be empty).
 - `state`: `pending → running → done | failed | cancelled`; `pending_reason` while pending;
   `cancel_requested` on a running task the scheduler is about to stop.
 - **Timestamps: use the epoch fields** `submitted_ts`, `started_ts`, `dispatched_ts`,

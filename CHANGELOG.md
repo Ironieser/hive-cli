@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+- **Owner tag**: `hive submit --owner NAME` / `#HIVE owner=` / `$HIVE_OWNER` records which
+  agent or project a task belongs to. `hive list --owner NAME` filters; a session with
+  `$HIVE_OWNER` set sees only its own tasks by default (`--owner all` for everyone, which
+  adds an OWNER column). `hive nodes` / `hive top` show `[owner]` in the TASK column.
+  Several agents share one queue; this is how each finds its tasks again.
+
 ### Changed (agent context frugality)
 - **`hive list` shows active tasks plus at most 10 finished ones** (`--limit N`,
   `--limit 0`/`--all` for everything; the cap also applies with `--state`). The default

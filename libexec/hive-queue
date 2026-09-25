@@ -268,7 +268,7 @@ def parse_hive_file(path):
     Lines starting with #HIVE key=value set metadata.
     Remaining non-comment lines form the command.
 
-    Returns dict with keys: cmd, workdir, priority, name, need_mb, gpus, est_runtime
+    Returns dict with keys: cmd, workdir, priority, name, owner, need_mb, gpus, est_runtime
     """
     meta = {}
     cmd_lines = []
@@ -299,6 +299,8 @@ def parse_hive_file(path):
             pass
     if "name" in meta:
         result["name"] = meta["name"]
+    if "owner" in meta:
+        result["owner"] = meta["owner"]
     if "need_mb" in meta:
         try:
             result["need_mb"] = int(meta["need_mb"])
@@ -470,6 +472,14 @@ def cmd_submit(args):
     if args.name:
         spec["name"] = args.name
 
+    # Owner tag: who/what this task belongs to (an agent name, a project, a campaign).
+    # Several agents share one queue, so each needs to find its own tasks again:
+    # --owner > #HIVE owner= > $HIVE_OWNER (export once per agent session).
+    if getattr(args, "owner", None):
+        spec["owner"] = args.owner
+    elif "owner" not in spec and os.environ.get("HIVE_OWNER"):
+        spec["owner"] = os.environ["HIVE_OWNER"].strip()
+
     if getattr(args, "need_mb", None) is not None:
         spec["need_mb"] = args.need_mb
 
@@ -526,6 +536,7 @@ def cmd_submit(args):
             "cmd":          spec["cmd"],
             "workdir":      spec.get("workdir", os.getcwd()),
             "name":         spec.get("name", ""),
+            "owner":        spec.get("owner", ""),
             "state":        "pending",
             "priority":     spec.get("priority", 0),
             "submitted_at": now_iso(),
@@ -550,10 +561,11 @@ def cmd_submit(args):
         queue["tasks"][str(task_id)] = task
         save_queue(queue, lfd)
         ev.record("submit", task=task_id, name=spec.get("name") or None,
+                  owner=spec.get("owner") or None,
                   est_runtime_secs=est_secs, need_mb=spec.get("need_mb") or None,
                   priority=spec.get("priority") or None)
 
-    print(f"Submitted task #{task_id}")
+    print(f"Submitted task #{task_id}" + (f"  (owner: {spec['owner']})" if spec.get("owner") else ""))
     if est_secs:
         print(f"  runtime estimate: {fmt_elapsed(est_secs)} (source: {est_source}) — "
               f"scheduler will avoid nodes with < estimate + 10m walltime left")
@@ -595,6 +607,14 @@ def cmd_list(args):
 
     filter_state = args.state.lower() if args.state else None
     show_all     = getattr(args, "all", False)
+    # Owner filter: explicit --owner wins; otherwise a session with $HIVE_OWNER set
+    # sees only its own tasks by default (that is why the variable exists);
+    # `--owner all` shows everyone's.
+    owner = getattr(args, "owner", None) or os.environ.get("HIVE_OWNER", "").strip() or None
+    if owner and owner.lower() == "all":
+        owner = None
+    if owner:
+        all_tasks = [t for t in all_tasks if (t.get("owner") or "") == owner]
     days         = getattr(args, "days", None) or DONE_HIDE_DAYS_DEFAULT
     limit        = getattr(args, "limit", None)
     if limit is None:
@@ -621,11 +641,12 @@ def cmd_list(args):
         tasks = visible
 
     if not tasks:
+        who = f" for owner '{owner}'" if owner else ""
         if hidden_count:
-            print(f"No tasks in the last {days}d ({hidden_count} older hidden — "
+            print(f"No tasks{who} in the last {days}d ({hidden_count} older hidden — "
                   f"hive list --all).")
         else:
-            print("No tasks found.")
+            print(f"No tasks found{who}." + ("  (hive list --owner all)" if owner else ""))
         return
 
     active   = [t for t in tasks if t["state"] in ("running", "pending")]
@@ -655,10 +676,14 @@ def cmd_list(args):
             base = f"{base} (re-disp x{rq})"
         return base
 
-    # Column widths (over everything shown)
+    # Column widths (over everything shown). OWNER column only when it carries
+    # information: some shown task has an owner and we're not already filtered to one.
     id_w    = max(len(str(t["id"])) for t in tasks)
     name_w  = max(len(t.get("name") or "—") for t in tasks)
     name_w  = max(name_w, 6)
+    show_owner = (not owner) and any(t.get("owner") for t in tasks)
+    owner_w = max((len(t.get("owner") or "—") for t in tasks), default=5) if show_owner else 0
+    owner_w = max(owner_w, 5) if show_owner else 0
     state_w = 10   # fits CANCELLING
     node_w  = max((len(node_display(t)) for t in tasks), default=4)
     node_w  = max(node_w, 4)
@@ -668,7 +693,8 @@ def cmd_list(args):
     def truncate(s, n):
         return s if len(s) <= n else s[:n-1] + "…"
 
-    header = (f"  {'ID':>{id_w}}  {'NAME':<{name_w}}  {'STATE':<{state_w}}  "
+    owner_h = f"{'OWNER':<{owner_w}}  " if show_owner else ""
+    header = (f"  {'ID':>{id_w}}  {owner_h}{'NAME':<{name_w}}  {'STATE':<{state_w}}  "
               f"{'NODE':<{node_w}}  {'ELAPSED':<{elap_w}}  CMD")
     width = len(header) - 2
     sep = "  " + "─" * width
@@ -689,19 +715,23 @@ def cmd_list(args):
         if state == "running" and t.get("cancel_requested"):
             label, color = "CANCELLING", C_YELLOW   # scheduler will stop it within a cycle
         state_str = f"{color}{label:<{state_w}}{C_RESET}"
-        print(f"  {tid:>{id_w}}  {name:<{name_w}}  {state_str}  "
+        owner_c = f"{(t.get('owner') or '—'):<{owner_w}}  " if show_owner else ""
+        print(f"  {tid:>{id_w}}  {owner_c}{name:<{name_w}}  {state_str}  "
               f"{node:<{node_w}}  {elapsed:<{elap_w}}  {cmd}")
 
     # ── Scope line (makes the current view explicit) ─────────────────────────────
     r = sum(1 for t in tasks if t["state"] == "running")
     p = sum(1 for t in tasks if t["state"] == "pending")
+    who = f"owner={owner} · " if owner else ""
     if filter_state:
-        scope = f"queue · filter={filter_state} · {len(tasks)} of {terminal_total or len(tasks)} shown"
+        scope = f"queue · {who}filter={filter_state} · {len(tasks)} of {terminal_total or len(tasks)} shown"
     elif show_all:
-        scope = f"queue · {r} running · {p} pending · all history ({terminal_total} terminal)"
+        scope = f"queue · {who}{r} running · {p} pending · all history ({terminal_total} terminal)"
     else:
-        scope = (f"queue · {r} running · {p} pending · {len(terminal)} of {terminal_total} "
+        scope = (f"queue · {who}{r} running · {p} pending · {len(terminal)} of {terminal_total} "
                  f"finished in last {days}d shown")
+    if owner:
+        scope += " · others: --owner all"
     if capped:
         scope += f" · +{capped} more (--limit N)"
     if hidden_count and not show_all:
@@ -1153,6 +1183,9 @@ def build_parser():
                     help="Priority (higher = runs first, default: 0)")
     ps.add_argument("--name", "-n", metavar="NAME",
                     help="Display name for this task")
+    ps.add_argument("--owner", "-o", metavar="OWNER",
+                    help="Who this task belongs to (agent / project name) — filter later with "
+                         "`hive list --owner OWNER`. Default: #HIVE owner= or $HIVE_OWNER")
     ps.add_argument("--need-mb", type=int, metavar="MB", dest="need_mb",
                     help="Min free GPU memory (MiB) required before dispatch; "
                          "the scheduler holds the task PENDING until a node has it free")
@@ -1175,6 +1208,8 @@ def build_parser():
                          f"(default {DONE_HIDE_DAYS_DEFAULT}); active tasks always shown")
     pl.add_argument("--all", "-a", action="store_true",
                     help="Show all tasks regardless of age (grouped by date)")
+    pl.add_argument("--owner", "-o", metavar="OWNER",
+                    help="Only this owner's tasks (default: $HIVE_OWNER if set; 'all' = everyone)")
     pl.add_argument("--limit", "-l", type=int, metavar="N",
                     help=f"Show at most N finished tasks (default {LIST_LIMIT_DEFAULT}; "
                          f"0 = no cap). Active tasks are always shown")

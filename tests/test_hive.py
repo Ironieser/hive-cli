@@ -538,6 +538,30 @@ chk("long log is tailed (header kept + omission notice + last lines)",
 chk("short log printed whole", _capture(hq.print_log, os.path.join(hs.LOG_DIR, "task-90.log"), None, False, 90).count("lines omitted") == 0)
 chk("--full prints everything", len(_capture(hq.print_log, _big, None, True, 1).splitlines()) == 1003)
 
+print("== owner tag: --owner / #HIVE owner= / $HIVE_OWNER, hive list --owner ==")
+os.environ.pop("HIVE_OWNER", None)
+wq({})
+def _submit(**kw):
+    ns = _ap.Namespace(cmd_or_file="true", workdir=None, priority=None, name=kw.get("name"),
+                       owner=kw.get("owner"), need_mb=None, gpus=None, est_runtime=None)
+    _capture(hq.cmd_submit, ns)
+    return max(rq().values(), key=lambda t: t["id"])
+chk("--owner stored on the task", _submit(owner="agentA", name="a1")["owner"] == "agentA")
+os.environ["HIVE_OWNER"] = "projB"
+chk("$HIVE_OWNER used when --owner absent", _submit(name="b1")["owner"] == "projB")
+chk("--owner beats $HIVE_OWNER", _submit(owner="agentA", name="a2")["owner"] == "agentA")
+open(os.path.join(hs.HIVE_DIR, "o.hive"), "w").write("#HIVE owner=projC\n#HIVE name=c1\necho hi\n")
+chk("#HIVE owner= parsed", hq.parse_hive_file(os.path.join(hs.HIVE_DIR, "o.hive")).get("owner") == "projC")
+def _rows(ns):
+    return [l for l in _capture(hq.cmd_list, ns).splitlines() if l.strip().startswith(tuple("0123456789"))]
+chk("hive list defaults to $HIVE_OWNER's tasks", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner=None))) == 1)
+chk("--owner NAME filters explicitly", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner="agentA"))) == 2)
+out_all = _capture(hq.cmd_list, _ap.Namespace(state=None, all=False, days=None, limit=None, owner="all"))
+chk("--owner all shows everyone, with an OWNER column", "OWNER" in out_all and "agentA" in out_all and "projB" in out_all)
+os.environ.pop("HIVE_OWNER", None)
+chk("without $HIVE_OWNER the list is unfiltered", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner=None))) == 3)
+chk("submit event carries owner", any(e["event"] == "submit" and e.get("owner") == "agentA" for e in ev.iter_events()))
+
 print("== integration: history_estimate from event log (P90) ==")
 open(ev.EVENTS_FILE, "w").close()
 for d in (600, 900, 1200):

@@ -414,8 +414,9 @@ class NodeTop:
             if qt:
                 tid    = qt["id"]
                 name   = qt.get("name") or ""
+                owner  = qt.get("owner") or ""
                 qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
-                prefix = f"#{tid} {name}: " if name else f"#{tid}: "
+                prefix = f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
                 task_cmd = prefix + qcmd
                 # Slot taken by a running hive task even if the GPU isn't busy yet
                 # (same rule as hive nodes — feedback #4/#7/#17/#32).

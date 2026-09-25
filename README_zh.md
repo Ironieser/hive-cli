@@ -89,7 +89,8 @@ hive submit job.hive                                     # 提交 .hive 脚本
 hive submit --priority 10 --name train "python train.py"  # 优先级越高越先派发（默认 0）
 hive submit --need-mb 40000 "python train_big.py"       # 等到有 ≥40 GB 空闲显存再派发
 hive submit --est-runtime 2h "python train.py"          # 运行时长估计 → 墙钟感知调度（或 'auto'）
-hive list                                               # 队列：活跃任务 + 最近 10 条已结束
+hive list                                               # 队列：活跃任务 + 最近 10 条已结束（设了 $HIVE_OWNER 只看自己的）
+hive list --owner projA   |   --owner all               # 某个 agent/项目的任务 / 所有人的
 hive list --limit 50  |  --all  |  --state failed       # 更多历史 / 全部 / 按状态过滤
 hive logs 3 -f                                          # 实时跟踪日志
 hive wait 3                                             # 阻塞到完成 → 打印日志，以任务退出码退出

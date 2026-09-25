@@ -14,6 +14,7 @@ single iteration costs you one short command and a few lines of output.
 ## The loop: submit → wait → branch
 
 ```bash
+export HIVE_OWNER=my-agent-or-project      # once per session: tags every submit, scopes hive list
 ID=$(hive submit --name train_v1 --est-runtime 2h \
       "python train.py --config v1.yaml --output_dir runs/v1 --resume" | grep -oP '#\K\d+')
 hive wait "$ID" --pending-timeout 1800      # blocks; prints state changes, then the log TAIL
@@ -41,6 +42,7 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 
 | Flag | Why you'd set it |
 |---|---|
+| `--owner NAME` | who this task belongs to (agent / project); defaults to `$HIVE_OWNER`. Several agents share one queue — this is how you find yours again |
 | `--name NAME` | groups runtime history → `hive stats NAME`, `--est-runtime auto` |
 | `--est-runtime 2h\|90m\|auto` | walltime-aware placement (`auto` = P90 of NAME's history) |
 | `--need-mb 60000` | hold until a GPU has that much free memory (big models) |
@@ -58,7 +60,7 @@ These commands are sized for agents; prefer them over `cat ~/.hive/…` or `sque
 
 | Need | Command | Size |
 |---|---|---|
-| my tasks | `hive list` | active tasks + last 10 finished (`--limit N`, `--all`, `--state failed`) |
+| my tasks | `hive list` | active + last 10 finished, **only `$HIVE_OWNER`'s when set** (`--owner NAME`, `--owner all`, `--limit N`, `--state failed`) |
 | one task's verdict | `hive wait ID` / `hive logs ID -n 50` | header + tail |
 | is the pool healthy | `hive nodes` | one line per hold job + summary |
 | why is it pending | `hive list` → NODE column shows the `pending_reason` | — |

@@ -11,7 +11,7 @@ Contents: [Commands](#commands) · [`hive submit`](#hive-submit) · [`.hive` fil
 ```bash
 hive submit "CMD" [flags] | hive submit job.hive     # queue a task → "Submitted task #N"
 hive wait ID [--pending-timeout SEC] [--log-lines N | --full-log | --no-log]
-hive list [--state S] [--limit N] [--days N] [--all]
+hive list [--owner NAME|all] [--state S] [--limit N] [--days N] [--all]
 hive logs ID [-n N | --full] [-f]
 hive cancel ID                                        # pending or running
 hive stats [NAME]                                     # min/median/P90/max run time by name
@@ -38,6 +38,7 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] \
 | Flag | Default | Meaning |
 |---|---|---|
 | `--name` / `-n` | — | label; key for runtime history (`hive stats`, `--est-runtime auto`) |
+| `--owner` / `-o` | `$HIVE_OWNER` | owner tag (agent or project name). Precedence: `--owner` > `#HIVE owner=` > `$HIVE_OWNER`. Shown as an OWNER column in `hive list --owner all` and as `[owner]` in the `hive nodes` TASK column |
 | `--est-runtime` | — | `2h`, `90m`, `1-12:00:00`, seconds, or `auto` (P90 of NAME's history). With an estimate the scheduler never places the task on a node whose remaining walltime < estimate + 10 min (`insufficient_walltime`). Without one the task is walltime-blind. |
 | `--need-mb` | 0 | minimum **free** GPU memory; task waits (`waiting_for_mem`) until a card has it |
 | `--gpus` | 1 | GPUs the task may see. A hold job may own more; hive narrows `CUDA_VISIBLE_DEVICES` to the first N so frameworks don't auto-`DataParallel` over cards you didn't ask for. `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`). |
@@ -52,6 +53,7 @@ verbatim under bash on the node; quotes, `$VARS`, `&&`, multi-line — all fine.
 ```bash
 #!/bin/bash
 #HIVE name=eval-v1
+#HIVE owner=projA
 #HIVE workdir=/lustre/fs1/home/user/project
 #HIVE est_runtime=45m
 #HIVE need_mb=30000
@@ -64,7 +66,7 @@ MODEL=/tmp/Qwen3-VL-4B-Instruct
 python eval.py --model $MODEL --skip-existing
 ```
 
-Directives: `workdir`, `priority`, `name`, `need_mb`, `gpus`, `est_runtime`. Other `#` lines
+Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`. Other `#` lines
 are comments; the rest is the command.
 
 ## `hive list`
@@ -84,6 +86,9 @@ queue · 1 running · 2 pending · 10 of 243 finished in last 7d shown · +233 m
 - Active tasks are always shown in full; finished ones are capped at 10 (`--limit N`,
   `--limit 0` or `--all` for everything; `--days N` widens the window; `--state
   done|failed|cancelled|pending|running` filters).
+- **Owner scoping**: with `$HIVE_OWNER` set the list shows only that owner's tasks and
+  says so in the scope line; `--owner NAME` picks another, `--owner all` shows everyone
+  (adds an OWNER column).
 - For PENDING tasks the NODE column holds the scheduler's `pending_reason`.
 - `(re-disp xN)` marks a task re-dispatched after its node was reclaimed.
 - ELAPSED: `wait:…` since submit for pending; run time for running/finished.

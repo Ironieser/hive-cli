@@ -337,8 +337,9 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
     if qt:
         tid    = qt["id"]
         name   = qt.get("name") or ""
+        owner  = qt.get("owner") or ""
         qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
-        prefix = f"#{tid} {name}: " if name else f"#{tid}: "
+        prefix = f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
         task_cmd = prefix + qcmd
         # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
         # busy: cold import / model load, or a poll older than the dispatch. The
