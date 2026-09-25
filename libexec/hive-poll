@@ -109,8 +109,11 @@ probe_job() {
 
     # Probe command: nvidia-smi via srun --overlap.
     #
-    # GPU stats (utilization/memory) use --id=0, which relies on SLURM cgroup device
-    # isolation (set at job allocation time) to scope to this job's GPU.
+    # GPU stats (utilization/memory) enumerate ALL the job's GPUs (no --id=0). SLURM
+    # cgroup device isolation (set at job allocation time) already scopes nvidia-smi to
+    # this job's GPUs, renumbered 0..N-1 — so this returns exactly the job's own cards:
+    # one line for a 1-GPU job (unchanged), N lines for a multi-GPU job. The status logic
+    # below takes the max across them (busy if ANY GPU is busy).
     #
     # Process filtering uses /proc/<pid>/cgroup to check job ownership.
     # CUDA_VISIBLE_DEVICES is unreliable under concurrent srun --overlap steps (multiple
@@ -118,9 +121,12 @@ probe_job() {
     # --query-compute-apps can return PIDs from other jobs' GPUs. The fix: after getting
     # PIDs from compute-apps, verify each PID's /proc/<pid>/cgroup contains
     # /job_<SLURM_JOB_ID>/ — this is set by the kernel at job allocation and is immune
-    # to concurrent step launches.
+    # to concurrent step launches. compute-apps is deduped by PID (sort -u on the pid
+    # field) so a process spanning >1 GPU is listed once.
+    #
+    # KEEP IN SYNC with hive-daemon's probe_cmd (the probe body is intentionally duplicated).
     local probe_cmd
-    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --id=0 --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --id=0 --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
+    probe_cmd='MY_JOB=$SLURM_JOB_ID; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; echo "---PS---"; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | sort -t, -k1,1 -u | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
     # Run the probe; retry once on a transient failure (empty output, non-zero
     # exit, or missing ---PS--- marker = srun never executed our command). This
@@ -250,11 +256,15 @@ main() {
         return
     fi
 
-    # Query running jobs (skip cursor_ssh_proxy). %L = TimeLeft (remaining walltime)
-    # so the scheduler can avoid placing long tasks on a soon-expiring node.
+    # Query running jobs. %L = TimeLeft (remaining walltime) so the scheduler can
+    # avoid placing long tasks on a soon-expiring node. %j (job name, last col) is
+    # only there so cursor_ssh_proxy can be filtered — the old format had no name
+    # column, so the grep never matched and `hive poll` wrote one more job than the
+    # daemon did. KEEP IN SYNC with hive-daemon.
     local squeue_out
-    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L" 2>/dev/null \
-        | grep -v cursor_ssh_proxy)
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%j" 2>/dev/null \
+        | grep -v cursor_ssh_proxy \
+        | sed 's/|[^|]*$//')   # strip job name column after filtering
 
     if [[ -z "$squeue_out" ]]; then
         log "No running jobs found."
@@ -271,7 +281,16 @@ main() {
     local job_ids=()
     declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT
 
-    while IFS='|' read -r jobid node partition elapsed timeleft; do
+    # Read squeue into an array first, and give each background probe </dev/null:
+    # a backgrounded srun inherits the while-read loop's stdin and can swallow the
+    # remaining lines (same guard as hive-daemon).
+    local -a squeue_lines=()
+    while IFS= read -r line; do
+        squeue_lines+=("$line")
+    done <<< "$squeue_out"
+
+    for line in "${squeue_lines[@]}"; do
+        IFS='|' read -r jobid node partition elapsed timeleft <<< "$line"
         jobid="${jobid// /}"; node="${node// /}"
         partition="${partition// /}"; elapsed="${elapsed// /}"; timeleft="${timeleft// /}"
         [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
@@ -281,8 +300,8 @@ main() {
         JOB_ELAPSED["$jobid"]="$elapsed"
         JOB_TIMELEFT["$jobid"]="$(slurm_time_to_secs "$timeleft")"
         log "Probing job $jobid on $node ($partition) elapsed=$elapsed left=${timeleft:-?} ..."
-        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" &
-    done <<< "$squeue_out"
+        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" </dev/null &
+    done
 
     # Wait up to 30s for all probes
     local waited=0

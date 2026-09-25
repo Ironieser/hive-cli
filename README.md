@@ -42,6 +42,8 @@ hive pool add               # sbatch a new hold job (default preset)
 hive pool add highgpu       # use a named preset
 hive pool add ~/my.slurm    # pass a script path directly
 hive pool add --count 3 --time 12:00:00   # 3 nodes, override wall time
+hive health                 # bad-node quarantine list (self-maintained; see docs/status_model.md)
+hive health report evc43    # quarantine a node now; hive re-probes it and releases it when healthy
 hive pool release 584954    # scancel a specific hold job
 hive pool release --idle    # scancel all idle hold jobs
 hive pool config            # verify preset scripts exist
@@ -73,10 +75,11 @@ hive submit job.hive                                     # submit a .hive script
 hive submit --priority 10 --name train "python train.py"  # higher priority dispatches first (default 0)
 hive submit --need-mb 40000 "python train_big.py"       # hold until ≥40 GB GPU mem is free
 hive submit --est-runtime 2h "python train.py"          # runtime estimate → walltime-aware (or 'auto')
-hive list                                               # queue: active first, history grouped by date
-hive list --days 14   |   --all   |   --state running   # widen window / show all / filter
-hive logs 3 -f                                          # follow a task's log
-hive wait 3                                             # block until done → print log, exit task's code
+hive list                                               # queue: active tasks + last 10 finished ($HIVE_OWNER-scoped)
+hive list --owner projA   |   --owner all               # one agent/project's tasks / everyone's
+hive list --limit 50  |  --all  |  --state failed       # more history / everything / filter
+hive logs 3 -n 100    |  --full  |  -f                  # tail / whole log / follow
+hive wait 3                                             # block until done → print log TAIL, exit task's code
 hive wait 3 --pending-timeout 600                       # give up (exit 75) if it never dispatches
 hive stats [NAME]                                       # completed-run durations (min/median/P90/max)
 hive cancel 3                                           # cancel a pending/running task
@@ -96,6 +99,7 @@ hive queue daemon start|stop|status|logs               # manage the scheduler (a
 #HIVE name=my-experiment   # also the key for runtime history (hive stats / --est-runtime auto)
 #HIVE need_mb=25000        # optional: min free GPU MiB before dispatch
 #HIVE est_runtime=2h       # optional: runtime estimate → won't place on a soon-expiring node
+#HIVE gpus=1               # optional: GPUs the task may see (default 1; extras are hidden)
 
 python train.py --config exp/v1.yaml
 ```

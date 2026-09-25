@@ -7,8 +7,10 @@ frontmatter under  <feedback-dir>/inbox/ ; an INDEX.md is kept in sync.
 
 Storage location resolution (first match wins):
   1. $HIVE_FEEDBACK_DIR
-  2. <repo-root>/feedback        (repo-root = parent of this script's libexec dir)
-  3. $HIVE_DIR/feedback          (~/.hive/feedback)
+  2. <source-checkout>/feedback  (install.sh records the checkout it installed from
+                                  in <install-dir>/.source_checkout)
+  3. <repo-root>/feedback        (repo-root = parent of this script's libexec dir)
+  4. $HIVE_DIR/feedback          (~/.hive/feedback)
 
 Untracked inbox/*.md survive `git reset --hard` (install.sh never runs git clean),
 so feedback filed against an installed copy is not wiped on upgrade.
@@ -40,6 +42,18 @@ def feedback_dir():
     d = os.environ.get("HIVE_FEEDBACK_DIR")
     if d:
         return os.path.expanduser(d)
+    # Agents run the INSTALLED copy (~/.local/share/hive-cli), whose feedback/ is
+    # overwritten by the next `install.sh` (rsync --delete). 23 reports silently
+    # piled up there, invisible to the maintainer working in the checkout. install.sh
+    # now records the source checkout so reports land where they are triaged.
+    src = os.path.join(REPO_ROOT, ".source_checkout")
+    try:
+        with open(src) as f:
+            root = os.path.expanduser(f.read().strip())
+        if root and os.path.isdir(os.path.join(root, "feedback")):
+            return os.path.join(root, "feedback")
+    except OSError:
+        pass
     repo_fb = os.path.join(REPO_ROOT, "feedback")
     # Prefer the repo feedback dir if its parent is writable (normal install/checkout)
     if os.path.isdir(repo_fb) or os.access(REPO_ROOT, os.W_OK):

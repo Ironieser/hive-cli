@@ -33,6 +33,11 @@ SCHED_START_LOCK = os.path.join(HIVE_DIR, "sched.start.lock")
 LOG_DIR       = os.path.join(HIVE_DIR, "logs")
 HEARTBEAT_DIR = os.path.join(HIVE_DIR, "heartbeat")
 
+# GPUs a task sees when it doesn't say. 1, not "whatever the hold job owns",
+# because a multi-GPU hold job otherwise makes frameworks auto-parallelize over
+# devices the task never asked for (feedback #8). Opt in with `#HIVE gpus=N`.
+DEFAULT_TASK_GPUS = 1
+
 LIBEXEC_DIR = os.path.dirname(os.path.realpath(__file__))
 SCHED_BIN   = os.path.join(LIBEXEC_DIR, "hive-sched")
 PYTHON      = sys.executable  # same interpreter (vlm conda env)
@@ -102,6 +107,14 @@ def now_iso():
     return datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
 
 
+def now_ts():
+    """Epoch seconds — the tz-independent twin of now_iso(). Written alongside every
+    `*_at` string as `*_ts`. Processes touching one queue run under different TZs
+    (scheduler, poller, each agent's shell), so arithmetic on the naive `*_at`
+    strings was off by hours (feedback #31: RUNNING ELAPSED inflated by 12h)."""
+    return time.time()
+
+
 def parse_iso(s):
     if not s:
         return None
@@ -109,6 +122,23 @@ def parse_iso(s):
         return datetime.strptime(s, '%Y-%m-%dT%H:%M:%S')
     except ValueError:
         return None
+
+
+def task_epoch(task, key):
+    """Epoch seconds for a task timestamp (`key` = submitted/started/finished).
+    Prefers `<key>_ts`; falls back to the legacy naive-local `<key>_at` string read
+    in this process's zone (old records — may be off if written under another TZ)."""
+    ts = task.get(f"{key}_ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return float(ts)
+    d = parse_iso(task.get(f"{key}_at"))
+    return d.timestamp() if d else None
+
+
+def task_finished_dt(task):
+    """Local datetime of a task's finish (tz-safe), for grouping/windowing."""
+    e = task_epoch(task, "finished")
+    return datetime.fromtimestamp(e) if e is not None else None
 
 
 def fmt_elapsed(seconds):
@@ -212,20 +242,21 @@ def history_estimate(name):
 
 
 def task_elapsed(task):
-    now = datetime.now()
+    now = time.time()
     state = task["state"]
     if state == "running":
-        t = parse_iso(task.get("started_at"))
-        return fmt_elapsed((now - t).total_seconds() if t else None)
-    elif state in ("done", "failed"):
-        t0 = parse_iso(task.get("started_at"))
-        t1 = parse_iso(task.get("finished_at"))
-        if t0 and t1:
-            return fmt_elapsed((t1 - t0).total_seconds())
+        t = task_epoch(task, "started")
+        return fmt_elapsed(max(0, now - t) if t is not None else None)
+    elif state in ("done", "failed", "cancelled"):
+        if isinstance(task.get("duration_secs"), int):
+            return fmt_elapsed(task["duration_secs"])
+        t0, t1 = task_epoch(task, "started"), task_epoch(task, "finished")
+        if t0 is not None and t1 is not None and t1 >= t0:
+            return fmt_elapsed(t1 - t0)
     elif state == "pending":
-        t = parse_iso(task.get("submitted_at"))
-        if t:
-            return f"wait:{fmt_elapsed((now - t).total_seconds())}"
+        t = task_epoch(task, "submitted")
+        if t is not None:
+            return f"wait:{fmt_elapsed(max(0, now - t))}"
     return "—"
 
 
@@ -237,7 +268,7 @@ def parse_hive_file(path):
     Lines starting with #HIVE key=value set metadata.
     Remaining non-comment lines form the command.
 
-    Returns dict with keys: cmd, workdir, priority, name
+    Returns dict with keys: cmd, workdir, priority, name, owner, need_mb, gpus, est_runtime
     """
     meta = {}
     cmd_lines = []
@@ -268,9 +299,16 @@ def parse_hive_file(path):
             pass
     if "name" in meta:
         result["name"] = meta["name"]
+    if "owner" in meta:
+        result["owner"] = meta["owner"]
     if "need_mb" in meta:
         try:
             result["need_mb"] = int(meta["need_mb"])
+        except ValueError:
+            pass
+    if "gpus" in meta:
+        try:
+            result["gpus"] = int(meta["gpus"])
         except ValueError:
             pass
     if "est_runtime" in meta:
@@ -434,8 +472,29 @@ def cmd_submit(args):
     if args.name:
         spec["name"] = args.name
 
+    # Owner tag: who/what this task belongs to (an agent name, a project, a campaign).
+    # Several agents share one queue, so each needs to find its own tasks again:
+    # --owner > #HIVE owner= > $HIVE_OWNER (export once per agent session).
+    if getattr(args, "owner", None):
+        spec["owner"] = args.owner
+    elif "owner" not in spec and os.environ.get("HIVE_OWNER"):
+        spec["owner"] = os.environ["HIVE_OWNER"].strip()
+
     if getattr(args, "need_mb", None) is not None:
         spec["need_mb"] = args.need_mb
+
+    # GPU count. CLI --gpus > #HIVE gpus= > DEFAULT_TASK_GPUS (1).
+    # Defaulting to 1 is deliberate: a hold job may own several GPUs, and a
+    # framework that auto-parallelizes over every visible device (HF Trainer →
+    # nn.DataParallel) then crashes or silently spreads a model it shouldn't.
+    # Multi-GPU is opt-in via `#HIVE gpus=N` / `--gpus N` (feedback #8).
+    if getattr(args, "gpus", None) is not None:
+        spec["gpus"] = args.gpus
+    elif "gpus" not in spec:
+        spec["gpus"] = DEFAULT_TASK_GPUS
+    if spec["gpus"] < 0:
+        print(f"{C_RED}error: --gpus must be >= 0{C_RESET}", file=sys.stderr)
+        sys.exit(2)
 
     # Runtime estimate (drives walltime-aware scheduling). Source priority:
     # CLI --est-runtime > #HIVE est_runtime=. Value 'auto' resolves from history.
@@ -477,9 +536,11 @@ def cmd_submit(args):
             "cmd":          spec["cmd"],
             "workdir":      spec.get("workdir", os.getcwd()),
             "name":         spec.get("name", ""),
+            "owner":        spec.get("owner", ""),
             "state":        "pending",
             "priority":     spec.get("priority", 0),
             "submitted_at": now_iso(),
+            "submitted_ts": now_ts(),
             "started_at":   None,
             "finished_at":  None,
             "slurm_jobid":  None,
@@ -487,6 +548,7 @@ def cmd_submit(args):
             "srun_pid":     None,
             "exit_code":    None,
             "need_mb":      spec.get("need_mb", 0),
+            "gpus":         spec.get("gpus", DEFAULT_TASK_GPUS),
             "est_runtime_secs":    est_secs,
             "est_source":          est_source,
             "requeue_count":       0,
@@ -499,10 +561,11 @@ def cmd_submit(args):
         queue["tasks"][str(task_id)] = task
         save_queue(queue, lfd)
         ev.record("submit", task=task_id, name=spec.get("name") or None,
+                  owner=spec.get("owner") or None,
                   est_runtime_secs=est_secs, need_mb=spec.get("need_mb") or None,
                   priority=spec.get("priority") or None)
 
-    print(f"Submitted task #{task_id}")
+    print(f"Submitted task #{task_id}" + (f"  (owner: {spec['owner']})" if spec.get("owner") else ""))
     if est_secs:
         print(f"  runtime estimate: {fmt_elapsed(est_secs)} (source: {est_source}) — "
               f"scheduler will avoid nodes with < estimate + 10m walltime left")
@@ -518,6 +581,10 @@ def cmd_submit(args):
 # ── List ──────────────────────────────────────────────────────────────────────
 
 DONE_HIDE_DAYS_DEFAULT = 7   # default window: hide terminal tasks finished > N days ago
+LIST_LIMIT_DEFAULT     = 10  # ...and show at most this many of them. `hive list` is run by
+                             # agents many times per session; 7 days of history was 250+
+                             # lines / 33 KB per call, all of it landing in their context.
+                             # Active tasks are always shown in full.
 
 
 def _date_label(d):
@@ -540,7 +607,18 @@ def cmd_list(args):
 
     filter_state = args.state.lower() if args.state else None
     show_all     = getattr(args, "all", False)
+    # Owner filter: explicit --owner wins; otherwise a session with $HIVE_OWNER set
+    # sees only its own tasks by default (that is why the variable exists);
+    # `--owner all` shows everyone's.
+    owner = getattr(args, "owner", None) or os.environ.get("HIVE_OWNER", "").strip() or None
+    if owner and owner.lower() == "all":
+        owner = None
+    if owner:
+        all_tasks = [t for t in all_tasks if (t.get("owner") or "") == owner]
     days         = getattr(args, "days", None) or DONE_HIDE_DAYS_DEFAULT
+    limit        = getattr(args, "limit", None)
+    if limit is None:
+        limit = 0 if show_all else LIST_LIMIT_DEFAULT   # --all lifts the cap; --limit 0 too
 
     # ── Windowing: keep active (running/pending) always; hide terminal tasks
     # finished more than `days` ago unless --all / --state is set. ────────────────
@@ -555,7 +633,7 @@ def cmd_list(args):
         visible = []
         for t in all_tasks:
             if t["state"] in TERMINAL_STATES:
-                fin = parse_iso(t.get("finished_at"))
+                fin = task_finished_dt(t)
                 if fin is not None and fin < cutoff:
                     hidden_count += 1
                     continue
@@ -563,19 +641,26 @@ def cmd_list(args):
         tasks = visible
 
     if not tasks:
+        who = f" for owner '{owner}'" if owner else ""
         if hidden_count:
-            print(f"No tasks in the last {days}d ({hidden_count} older hidden — "
+            print(f"No tasks{who} in the last {days}d ({hidden_count} older hidden — "
                   f"hive list --all).")
         else:
-            print("No tasks found.")
+            print(f"No tasks found{who}." + ("  (hive list --owner all)" if owner else ""))
         return
 
     active   = [t for t in tasks if t["state"] in ("running", "pending")]
     terminal = [t for t in tasks if t["state"] in TERMINAL_STATES]
     active.sort(key=lambda t: -t["id"])
     # Terminal newest-first; group by finish date below.
-    terminal.sort(key=lambda t: (parse_iso(t.get("finished_at")) or datetime.min, t["id"]),
+    terminal.sort(key=lambda t: (task_finished_dt(t) or datetime.min, t["id"]),
                   reverse=True)
+    terminal_total = len(terminal)
+    capped = 0
+    if limit and terminal_total > limit:
+        capped = terminal_total - limit
+        terminal = terminal[:limit]
+    tasks = active + terminal
 
     # For PENDING tasks the NODE column is empty, so we reuse it to show *why* the
     # task hasn't dispatched (set by the scheduler — feedback OBSERVED#8 / SESSION#8).
@@ -591,11 +676,15 @@ def cmd_list(args):
             base = f"{base} (re-disp x{rq})"
         return base
 
-    # Column widths (over everything shown)
+    # Column widths (over everything shown). OWNER column only when it carries
+    # information: some shown task has an owner and we're not already filtered to one.
     id_w    = max(len(str(t["id"])) for t in tasks)
     name_w  = max(len(t.get("name") or "—") for t in tasks)
     name_w  = max(name_w, 6)
-    state_w = 9
+    show_owner = (not owner) and any(t.get("owner") for t in tasks)
+    owner_w = max((len(t.get("owner") or "—") for t in tasks), default=5) if show_owner else 0
+    owner_w = max(owner_w, 5) if show_owner else 0
+    state_w = 10   # fits CANCELLING
     node_w  = max((len(node_display(t)) for t in tasks), default=4)
     node_w  = max(node_w, 4)
     elap_w  = 10
@@ -604,7 +693,8 @@ def cmd_list(args):
     def truncate(s, n):
         return s if len(s) <= n else s[:n-1] + "…"
 
-    header = (f"  {'ID':>{id_w}}  {'NAME':<{name_w}}  {'STATE':<{state_w}}  "
+    owner_h = f"{'OWNER':<{owner_w}}  " if show_owner else ""
+    header = (f"  {'ID':>{id_w}}  {owner_h}{'NAME':<{name_w}}  {'STATE':<{state_w}}  "
               f"{'NODE':<{node_w}}  {'ELAPSED':<{elap_w}}  CMD")
     width = len(header) - 2
     sep = "  " + "─" * width
@@ -621,23 +711,31 @@ def cmd_list(args):
         elapsed = task_elapsed(t)
         cmd     = truncate(t["cmd"].replace('\n', ' '), cmd_avail)
         color = STATE_COLORS.get(state, "")
-        state_str = f"{color}{state.upper():<{state_w}}{C_RESET}"
-        print(f"  {tid:>{id_w}}  {name:<{name_w}}  {state_str}  "
+        label = state.upper()
+        if state == "running" and t.get("cancel_requested"):
+            label, color = "CANCELLING", C_YELLOW   # scheduler will stop it within a cycle
+        state_str = f"{color}{label:<{state_w}}{C_RESET}"
+        owner_c = f"{(t.get('owner') or '—'):<{owner_w}}  " if show_owner else ""
+        print(f"  {tid:>{id_w}}  {owner_c}{name:<{name_w}}  {state_str}  "
               f"{node:<{node_w}}  {elapsed:<{elap_w}}  {cmd}")
 
     # ── Scope line (makes the current view explicit) ─────────────────────────────
     r = sum(1 for t in tasks if t["state"] == "running")
     p = sum(1 for t in tasks if t["state"] == "pending")
+    who = f"owner={owner} · " if owner else ""
     if filter_state:
-        scope = f"queue · filter={filter_state} · {len(tasks)} shown"
+        scope = f"queue · {who}filter={filter_state} · {len(tasks)} of {terminal_total or len(tasks)} shown"
     elif show_all:
-        scope = f"queue · {r} running · {p} pending · all history ({len(terminal)} terminal)"
+        scope = f"queue · {who}{r} running · {p} pending · all history ({terminal_total} terminal)"
     else:
-        scope = f"queue · {r} running · {p} pending"
-        if cutoff is not None:
-            scope += f" · since {cutoff.strftime('%m-%d')} (last {days}d)"
-        if hidden_count:
-            scope += f" · {hidden_count} older hidden (--all)"
+        scope = (f"queue · {who}{r} running · {p} pending · {len(terminal)} of {terminal_total} "
+                 f"finished in last {days}d shown")
+    if owner:
+        scope += " · others: --owner all"
+    if capped:
+        scope += f" · +{capped} more (--limit N)"
+    if hidden_count and not show_all:
+        scope += f" · {hidden_count} older (--all)"
     print(f"{C_BOLD}{scope}{C_RESET}")
 
     print(f"{C_BOLD}{header}{C_RESET}")
@@ -650,7 +748,7 @@ def cmd_list(args):
     # Terminal grouped by finish date (newest group first)
     prev_date = None
     for t in terminal:
-        fin = parse_iso(t.get("finished_at"))
+        fin = task_finished_dt(t)
         d = fin.date() if fin else None
         if d != prev_date:
             print(group_line(_date_label(d)))
@@ -660,8 +758,8 @@ def cmd_list(args):
     print()
     sched_status = f"{C_GREEN}running{C_RESET}" if is_sched_running() else f"{C_RED}stopped{C_RESET}"
     footer = f"  {C_DIM}scheduler: {sched_status}"
-    if hidden_count:
-        footer += f"  ·  +{hidden_count} older hidden (hive list --all)"
+    if capped or hidden_count:
+        footer += f"  ·  +{capped + hidden_count} more: hive list --limit N | --all | --state S"
     footer += C_RESET
     print(footer)
 
@@ -681,16 +779,38 @@ def cmd_cancel(args):
             return
 
         if task["state"] == "running":
+            # The srun step is a child of hive-sched, which may run on ANOTHER node
+            # (state is on the shared FS). A host-local os.kill from here would then
+            # miss it — the task read "cancelled" while the step kept the GPU busy —
+            # or hit an unrelated process with the same PID number. So: signal it
+            # directly only when the scheduler is on this host; otherwise record the
+            # request and let the scheduler act on it within one cycle (~30s).
             srun_pid = task.get("srun_pid")
-            if srun_pid:
+            _, sched_host = read_sched_pid()
+            sched_local = (not sched_host) or sched_host == socket.gethostname()
+            sched_alive = is_sched_running()
+            if sched_local and srun_pid:
                 try:
                     os.kill(srun_pid, signal.SIGTERM)
                     print(f"Sent SIGTERM to srun PID {srun_pid}")
                 except (ProcessLookupError, PermissionError):
                     print(f"srun process {srun_pid} already gone")
+            elif sched_alive:
+                task["cancel_requested"] = now_iso()
+                save_queue(queue, lfd)
+                print(f"Task #{task_id} cancel requested — the scheduler on "
+                      f"{sched_host or '?'} owns the srun step and will stop it within "
+                      f"~30s (hive list shows CANCELLING until then).")
+                return
+            else:
+                print(f"{C_YELLOW}Warning:{C_RESET} scheduler is not running and its host "
+                      f"({sched_host or '?'}) is not this one — cannot signal srun PID "
+                      f"{srun_pid}. Marking cancelled; the step (if any) may linger on "
+                      f"{task.get('node') or '?'}.")
 
         task["state"]       = "cancelled"
         task["finished_at"] = now_iso()
+        task["finished_ts"] = now_ts()
         save_queue(queue, lfd)
         ev.record("cancel", task=task["id"], name=task.get("name") or None,
                   node=task.get("node"))
@@ -699,21 +819,45 @@ def cmd_cancel(args):
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 
+LOG_FULL_MAX_LINES = 200   # print a log whole up to this many lines...
+LOG_TAIL_DEFAULT   = 100   # ...otherwise only its last N (agents read logs into context)
+
+
+def print_log(log_file, tail=None, full=False, task_id=None):
+    """Print a task log without flooding the caller's context. Whole file when it is
+    short (≤ LOG_FULL_MAX_LINES) or `full`; otherwise the last `tail` lines with a
+    one-line pointer to the rest. The header (first 8 lines: node, cmd, gpus…) is kept
+    when tailing since it is what makes a tail interpretable."""
+    try:
+        with open(log_file, errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        print(f"(cannot read log: {e})")
+        return
+    n = len(lines)
+    if full or tail == 0 or n <= max(LOG_FULL_MAX_LINES, tail or 0):
+        sys.stdout.write("".join(lines))
+        return
+    tail = tail or LOG_TAIL_DEFAULT
+    head = [ln for ln in lines[:8] if ln.startswith("===")]
+    body = lines[-tail:]
+    omitted = n - len(head) - len(body)
+    sys.stdout.write("".join(head))
+    ref = f"hive logs {task_id} --full" if task_id is not None else "--full"
+    print(f"{C_DIM}… {omitted} lines omitted ({n} total) — {ref}, or -n N for a longer tail …{C_RESET}")
+    sys.stdout.write("".join(body))
+
+
 def cmd_logs(args):
     task_id = str(args.id)
     queue = load_queue()
     task = queue["tasks"].get(task_id)
     # A pruned task is gone from queue.json, but its log file (deterministic path) may
     # still be on disk — fall back to it so `hive logs` keeps working after a prune.
-    if not task:
-        fallback = os.path.join(LOG_DIR, f"task-{task_id}.log")
-        if os.path.exists(fallback):
-            subprocess.run(["tail", "-f", fallback] if args.follow else ["cat", fallback])
-            return
+    log_file = (task or {}).get("log") or os.path.join(LOG_DIR, f"task-{task_id}.log")
+    if not task and not os.path.exists(log_file):
         print(f"Task #{task_id} not found.", file=sys.stderr)
         sys.exit(1)
-
-    log_file = task.get("log", os.path.join(LOG_DIR, f"task-{task_id}.log"))
     if not os.path.exists(log_file):
         print(f"No log file yet for task #{task_id}.")
         if task["state"] == "pending":
@@ -726,7 +870,7 @@ def cmd_logs(args):
         except KeyboardInterrupt:
             pass
     else:
-        subprocess.run(["cat", log_file])
+        print_log(log_file, tail=args.tail, full=args.full, task_id=task_id)
 
 
 
@@ -818,12 +962,12 @@ def cmd_wait(args):
     # scheduler recorded at finish; fall back to computing from timestamps.
     qs = task.get("queued_secs")
     if qs is None:
-        t0, t1 = parse_iso(task.get("submitted_at")), parse_iso(task.get("started_at"))
-        qs = int((t1 - t0).total_seconds()) if t0 and t1 else None
+        t0, t1 = task_epoch(task, "submitted"), task_epoch(task, "started")
+        qs = int(t1 - t0) if t0 is not None and t1 is not None and t1 >= t0 else None
     rs = task.get("duration_secs")
     if rs is None:
-        t0, t1 = parse_iso(task.get("started_at")), parse_iso(task.get("finished_at"))
-        rs = int((t1 - t0).total_seconds()) if t0 and t1 else None
+        t0, t1 = task_epoch(task, "started"), task_epoch(task, "finished")
+        rs = int(t1 - t0) if t0 is not None and t1 is not None and t1 >= t0 else None
     node = task.get("node") or "—"
     mark = {"done": f"{C_GREEN}✓", "failed": f"{C_RED}✗",
             "cancelled": f"{C_DIM}∅"}.get(state, "")
@@ -839,13 +983,16 @@ def cmd_wait(args):
           + (f" · {detail}" if detail else "")
           + (f" · on {node}" if node != "—" else ""), flush=True)
 
-    # Print log
+    # Print the log — tail only, by default. `hive wait` is the agent's blocking call;
+    # dumping a 2,500-line training log into its context at every completion was the
+    # single biggest source of context bloat. The header + last lines carry the verdict.
     if not no_log:
         log_file = task.get("log", os.path.join(LOG_DIR, f"task-{task_id}.log"))
         if os.path.exists(log_file):
             print()
             print(f"{C_DIM}{'─'*60}{C_RESET}")
-            subprocess.run(["cat", log_file])
+            print_log(log_file, tail=getattr(args, "log_lines", None),
+                      full=getattr(args, "full_log", False), task_id=task_id)
             print(f"{C_DIM}{'─'*60}{C_RESET}")
         else:
             print("(no log file found)")
@@ -959,7 +1106,7 @@ def cmd_prune(args):
     now = datetime.now()
 
     def finished(t):
-        return parse_iso(t.get("finished_at"))
+        return task_finished_dt(t)
 
     with QueueLock() as lfd:
         queue = load_queue(lfd)
@@ -1036,9 +1183,17 @@ def build_parser():
                     help="Priority (higher = runs first, default: 0)")
     ps.add_argument("--name", "-n", metavar="NAME",
                     help="Display name for this task")
+    ps.add_argument("--owner", "-o", metavar="OWNER",
+                    help="Who this task belongs to (agent / project name) — filter later with "
+                         "`hive list --owner OWNER`. Default: #HIVE owner= or $HIVE_OWNER")
     ps.add_argument("--need-mb", type=int, metavar="MB", dest="need_mb",
                     help="Min free GPU memory (MiB) required before dispatch; "
                          "the scheduler holds the task PENDING until a node has it free")
+    ps.add_argument("--gpus", type=int, metavar="N",
+                    help=f"GPUs this task may see (default: {DEFAULT_TASK_GPUS}). A hold job "
+                         f"may own several; extra ones are hidden via CUDA_VISIBLE_DEVICES so "
+                         f"frameworks don't auto-DataParallel. Use --gpus 2 for real multi-GPU; "
+                         f"the task then only places on a hold job with >= 2 GPUs")
     ps.add_argument("--est-runtime", metavar="DUR", dest="est_runtime",
                     help="Estimated runtime (e.g. 2h, 90m, 1-12:00:00, or 'auto' to use "
                          "P90 of this name's history). The scheduler then won't place the "
@@ -1053,6 +1208,11 @@ def build_parser():
                          f"(default {DONE_HIDE_DAYS_DEFAULT}); active tasks always shown")
     pl.add_argument("--all", "-a", action="store_true",
                     help="Show all tasks regardless of age (grouped by date)")
+    pl.add_argument("--owner", "-o", metavar="OWNER",
+                    help="Only this owner's tasks (default: $HIVE_OWNER if set; 'all' = everyone)")
+    pl.add_argument("--limit", "-l", type=int, metavar="N",
+                    help=f"Show at most N finished tasks (default {LIST_LIMIT_DEFAULT}; "
+                         f"0 = no cap). Active tasks are always shown")
 
     # cancel
     pc = sub.add_parser("cancel", help="Cancel a pending or running task")
@@ -1063,6 +1223,10 @@ def build_parser():
     pg.add_argument("id", type=int, metavar="ID")
     pg.add_argument("-f", "--follow", action="store_true",
                     help="Follow log output (tail -f)")
+    pg.add_argument("-n", "--tail", type=int, metavar="N",
+                    help=f"Print only the last N lines (default: whole log if ≤ "
+                         f"{LOG_FULL_MAX_LINES} lines, else last {LOG_TAIL_DEFAULT})")
+    pg.add_argument("--full", action="store_true", help="Print the whole log regardless of length")
 
     # rm
     pr = sub.add_parser("rm", help="Remove a finished/cancelled task from queue")
@@ -1096,6 +1260,11 @@ def build_parser():
                     help="Poll interval in seconds (default: 5)")
     pw.add_argument("--no-log", action="store_true",
                     help="Don't print log on completion")
+    pw.add_argument("--log-lines", type=int, default=40, metavar="N", dest="log_lines",
+                    help="On completion print only the last N log lines (default 40; "
+                         "short logs are printed whole)")
+    pw.add_argument("--full-log", action="store_true", dest="full_log",
+                    help="On completion print the whole log")
     pw.add_argument("--pending-timeout", type=float, default=0, metavar="SEC",
                     dest="pending_timeout",
                     help="If the task stays PENDING (never dispatches) longer than SEC, "
@@ -1111,6 +1280,13 @@ def build_parser():
 
 
 def main():
+    # `hive list | head` closed our stdout early → BrokenPipeError traceback that
+    # made a successful command look failed in agent logs (feedback #12). Restore the
+    # default SIGPIPE disposition so we exit quietly like any other CLI tool.
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError, OSError):
+        pass
     parser = build_parser()
     args = parser.parse_args()
 

@@ -19,6 +19,7 @@ Imported by both scripts via `sys.path.insert(0, <libexec>)`.
 
 import json
 import os
+import time
 from datetime import datetime
 
 HIVE_DIR    = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
@@ -59,7 +60,7 @@ def record(event, **fields):
     """Append one event line. Best-effort: never raises into the caller's hot path.
     None-valued fields are dropped to keep lines compact (0 / "" are kept).
     Must be called while holding queue.lock (every caller already does)."""
-    rec = {"ts": _now_iso(), "event": event}
+    rec = {"ts": _now_iso(), "t": round(time.time(), 3), "event": event}
     rec.update({k: v for k, v in fields.items() if v is not None})
     try:
         os.makedirs(HIVE_DIR, exist_ok=True)

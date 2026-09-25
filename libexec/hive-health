@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""hive-health — the self-maintained bad-node (quarantine) list
+
+  hive health                         list nodes with health records
+  hive health report NODE [-r TEXT]   quarantine NODE now (agents: file this when tasks
+                                      die at CUDA init on a node that reads IDLE)
+  hive health check NODE              run the CUDA-context probe on NODE right now
+  hive health clear NODE              release NODE manually (the scheduler also
+                                      releases it after 2 healthy probes)
+
+A quarantined node receives no dispatches. The scheduler re-probes it every
+HEALTH_CHECK_SECS through one of its hold jobs and releases it after HEALTH_OK_STREAK
+consecutive healthy probes; a failed probe re-arms the hold. See libexec/hive_health.py.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import sys
+import time
+
+LIBEXEC_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, LIBEXEC_DIR)
+import hive_health as hh   # noqa: E402
+import hive_events as ev   # noqa: E402
+
+HIVE_DIR   = hh.HIVE_DIR
+QUEUE_LOCK = os.path.join(HIVE_DIR, "queue.lock")
+NODE_DB    = os.path.join(HIVE_DIR, "node_monitor.json")
+
+C_RESET = "\033[0m"; C_BOLD = "\033[1m"; C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"; C_RED = "\033[31m"; C_DIM = "\033[2m"
+
+
+class QueueLock:
+    """Same lock every writer of the health file holds (scheduler cycle, this CLI)."""
+    def __enter__(self):
+        os.makedirs(HIVE_DIR, exist_ok=True)
+        self._fd = open(QUEUE_LOCK, "w")
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fd.close()
+
+
+def _ago(epoch):
+    if not epoch:
+        return "—"
+    s = int(time.time() - float(epoch))
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m ago"
+    return f"{s // 86400}d ago"
+
+
+def _hold_jobs_on(node):
+    """[(jobid, info)] of hold jobs currently on `node` per node_monitor.json."""
+    try:
+        with open(NODE_DB) as f:
+            jobs = json.load(f).get("jobs", {})
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [(j, i) for j, i in jobs.items() if i.get("node") == node]
+
+
+def cmd_list(args):
+    data = hh.load()
+    nodes = data.get("nodes", {})
+    if not nodes:
+        print("No node health records. All pool nodes are dispatchable.")
+        print(f"{C_DIM}Quarantine one with: hive health report <node> --reason '...'{C_RESET}")
+        return
+    print(f"{C_BOLD}  {'NODE':<10} {'STATE':<12} {'STRIKES':>7}  {'LAST CHECK':<14} "
+          f"{'RESULT':<24} REASON{C_RESET}")
+    print("  " + "─" * 96)
+    for node in sorted(nodes):
+        r = nodes[node]
+        st = r.get("state", "ok")
+        col = C_RED if st == "quarantined" else C_GREEN
+        label = "QUARANTINED" if st == "quarantined" else "ok"
+        print(f"  {node:<10} {col}{label:<12}{C_RESET} {r.get('strikes', 0):>7}  "
+              f"{_ago(r.get('last_check')):<14} {(r.get('last_result') or '—')[:24]:<24} "
+              f"{(r.get('reason') or r.get('release_reason') or '')[:60]}")
+    q = hh.quarantined_nodes(data)
+    print()
+    print(f"  {C_DIM}{len(q)} quarantined · re-probed every {hh.HEALTH_CHECK_SECS // 60} min by "
+          f"the scheduler · released after {hh.HEALTH_OK_STREAK} healthy probes · "
+          f"file: {hh.HEALTH_FILE}{C_RESET}")
+
+
+def cmd_report(args):
+    node = args.node
+    reason = args.reason or "reported via hive health"
+    with QueueLock():
+        data = hh.load()
+        fresh = hh.quarantine(data, node, reason, "agent",
+                              reporter=os.environ.get("USER", "unknown"))
+        hh.save(data)
+        ev.record("quarantine", node=node, reason=reason, source="agent")
+    verb = "quarantined" if fresh else "already quarantined (refreshed)"
+    print(f"{C_YELLOW}⚠{C_RESET} {node} {verb}: {reason}")
+    holds = _hold_jobs_on(node)
+    print(f"  hold jobs on it: {', '.join(j for j, _ in holds) or 'none in node_monitor.json'}")
+    print(f"  The scheduler stops dispatching there now, re-probes it every "
+          f"{hh.HEALTH_CHECK_SECS // 60} min and releases it after {hh.HEALTH_OK_STREAK} "
+          f"healthy CUDA probes (or: hive health clear {node}).")
+
+
+def cmd_clear(args):
+    node = args.node
+    with QueueLock():
+        data = hh.load()
+        was = hh.release(data, node, args.reason or "cleared via hive health", "manual")
+        hh.save(data)
+        if was:
+            ev.record("release", node=node, source="manual")
+    print(f"{C_GREEN}✓{C_RESET} {node} " + ("released from quarantine." if was else "was not quarantined; strikes reset."))
+
+
+def cmd_check(args):
+    node = args.node
+    holds = _hold_jobs_on(node)
+    if not holds:
+        print(f"{C_RED}No hold job on {node} in node_monitor.json — nothing to probe through.{C_RESET}")
+        sys.exit(1)
+    jid = holds[0][0]
+    print(f"Probing {node} via hold job {jid} (creating a CUDA context)...", flush=True)
+    verdict, detail = hh.cuda_probe(jid)
+    col = {"ok": C_GREEN, "fail": C_RED}.get(verdict, C_YELLOW)
+    print(f"  {col}{verdict}{C_RESET} {detail}")
+    with QueueLock():
+        data = hh.load()
+        outcome = hh.record_check(data, node, verdict, detail)
+        if verdict == "fail" and data["nodes"][node].get("state") != "quarantined":
+            hh.quarantine(data, node, f"CUDA probe failed: {detail}", "verify")
+            outcome = "quarantined"
+        hh.save(data)
+        if outcome in ("released", "quarantined"):
+            ev.record("release" if outcome == "released" else "quarantine",
+                      node=node, source="check", detail=detail)
+    if outcome:
+        print(f"  → {outcome}")
+    sys.exit(0 if verdict == "ok" else 1)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="hive health",
+                                description="Self-maintained bad-node list (quarantine)")
+    sub = p.add_subparsers(dest="command")
+    sub.add_parser("list", help="Show node health records (default)")
+    pr = sub.add_parser("report", help="Quarantine a node now")
+    pr.add_argument("node")
+    pr.add_argument("--reason", "-r", metavar="TEXT")
+    pc = sub.add_parser("clear", help="Release a node manually")
+    pc.add_argument("node")
+    pc.add_argument("--reason", "-r", metavar="TEXT")
+    pk = sub.add_parser("check", help="Run the CUDA-context probe on a node now")
+    pk.add_argument("node")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    cmd = args.command or "list"
+    {"list": cmd_list, "report": cmd_report, "clear": cmd_clear, "check": cmd_check}[cmd](args)
+
+
+if __name__ == "__main__":
+    main()

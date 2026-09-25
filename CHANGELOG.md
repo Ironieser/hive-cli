@@ -2,6 +2,140 @@
 
 ## [Unreleased]
 
+### Added
+- **Owner tag**: `hive submit --owner NAME` / `#HIVE owner=` / `$HIVE_OWNER` records which
+  agent or project a task belongs to. `hive list --owner NAME` filters; a session with
+  `$HIVE_OWNER` set sees only its own tasks by default (`--owner all` for everyone, which
+  adds an OWNER column). `hive nodes` / `hive top` show `[owner]` in the TASK column.
+  Several agents share one queue; this is how each finds its tasks again.
+
+### Changed (agent context frugality)
+- **`hive list` shows active tasks plus at most 10 finished ones** (`--limit N`,
+  `--limit 0`/`--all` for everything; the cap also applies with `--state`). The default
+  7-day view had grown to 250+ lines / 33 KB per call, all of it landing in every
+  agent's context. The scope line states how many rows are hidden and how to see them.
+- **`hive wait` prints a log tail, not the whole log**: header + last 40 lines
+  (`--log-lines N`, `--full-log`, `--no-log`). One completion had dumped 2,500 lines
+  into an agent's context.
+- **`hive logs` tails long logs**: whole file up to 200 lines, otherwise header + last 100
+  with an omission notice (`-n N`, `--full`). `-f` unchanged.
+- **Skill rewritten in the standard layout**: `.claude/skills/hive/SKILL.md` (123 lines:
+  the submit→wait loop, resumability, context-frugal commands, pending reasons, rules)
+  + `references/{cli,troubleshooting,state}.md` read on demand — replacing the 486-line
+  single-file slash command. `install.sh` installs it to `~/.claude/skills/hive/` and
+  renames an old `~/.claude/commands/hive.md` to `*.pre-skill.bak`.
+
+### Added
+- **Self-maintained bad-node list (`hive health`)** — feedback #13/#15/#16/#20/#23/#28/
+  #29/#30: evc43/evc50 read IDLE (free memory, no processes) yet every task placed there
+  died at CUDA init within a minute. nvidia-smi cannot see that; only creating a real CUDA
+  context can. hive now keeps `~/.hive/node_health.json`, keyed by physical node:
+  - **Verify-before-dispatch creates a CUDA context** (stdlib `ctypes` → `libcuda`, no
+    torch needed) inside the same `srun --overlap` step as the memory read. A failure
+    quarantines the node immediately (`pending_reason=cuda_unavailable_on_verify`);
+    `unknown` (no python / libcuda) never counts as a fault. Verified live: healthy node
+    → ok, evc43 → `cuCtxCreate=999`.
+  - **Every dispatch is now live-verified**, not only uncertain nodes, so a stale poll can
+    no longer place a task on a card a co-tenant filled since (feedback #14).
+  - **Auto-quarantine from task outcomes**: a task that fails within 180 s with a
+    CUDA-init signature in its log (`CUDA-capable device(s) is/are busy or unavailable`,
+    `CUDA unknown error`, …) is a *strike* against the node; two strikes quarantine it and
+    the task that tripped it is requeued elsewhere. A successful task clears strikes.
+    Ordinary crashes and slow failures never count.
+  - **Agents can seed it**: `hive health report <node> --reason …` quarantines at once.
+  - **It heals itself**: the scheduler re-probes each quarantined node every 10 min
+    through one of its hold jobs and releases it after 2 consecutive healthy probes
+    (after a 1 h minimum hold); a failed probe re-arms it. `hive health check <node>`
+    runs the probe now, `hive health clear <node>` releases manually.
+  - `hive nodes` / `hive top` show quarantined nodes as **QUAR**; pending tasks that have
+    only quarantined nodes left report `node_quarantined`.
+
+### Fixed
+- **Feedback filed through the installed copy was invisible and about to be deleted.**
+  `hive feedback` resolved its storage relative to the script, so agents running
+  `~/.local/share/hive-cli` wrote reports into *that* tree; 23 reports (#11–#33) piled up
+  there unseen by the maintainer, and the next `install.sh` (`rsync --delete`) would have
+  removed them. `install.sh` now records the source checkout in
+  `<install-dir>/.source_checkout`, `hive feedback` files into it, the installer rescues
+  any inbox entries left in the install dir, and `feedback/inbox/` is excluded from the
+  delete sweep.
+- **Scheduler: one unplaceable head-of-queue task starved everything behind it**
+  (feedback #24/#25/#26). Candidate nodes were popped off the shared per-cycle list even
+  when the rejection was *task-specific* (`insufficient_gpus`, `waiting_for_mem`,
+  `insufficient_walltime`), so a `gpus=2` or 6-hour task at the front consumed every
+  idle node and the rest reported `no_dispatchable_node` against a free pool. Task-level
+  rejections now leave the node for the next task; only node-level ones (probe failed,
+  busy on verify, dirty GPU) remove it. A node live-verified clean is also cached for the
+  rest of the cycle instead of re-probed per task.
+- **Timestamps were naive local strings mixed across time zones** (feedback #31). The
+  scheduler, the poller and each agent's shell can run under different `TZ` (observed:
+  EDT / Asia/Shanghai / CST), so `hive list` showed RUNNING tasks 12 h old seconds after
+  dispatch and `queued_secs` went negative → `None`. Every queue timestamp now also gets
+  a tz-independent epoch twin (`submitted_ts` / `started_ts` / `dispatched_ts` /
+  `finished_ts`; events carry `t`) and all arithmetic prefers it. The `*_at` strings are
+  kept for old readers; records without `*_ts` fall back to the old behaviour.
+- **`hive cancel` of a running task only worked from the scheduler's own host.** It
+  `os.kill`ed the srun PID locally — from another node the step kept the GPU while the
+  task read "cancelled", and a same-number PID on the local node could be hit instead.
+  Cancel now signals directly only when the scheduler is on this host; otherwise it sets
+  `cancel_requested` and the scheduler (which owns the srun child) kills the step within
+  one cycle, shown as `CANCELLING` in `hive list` meanwhile.
+- **A single quote in the command broke the dispatch wrapper** (task #9128). The log
+  header embedded `cmd`/`workdir` unquoted inside `echo '…'`; with a `'` plus any shell
+  metacharacter bash refused the whole wrapper, no heartbeat ever appeared, and the task
+  was retried as a crash orphan until declared dead. All user-controlled strings and
+  paths in the wrapper are now `shlex`-quoted (the command itself still runs verbatim).
+- **A dead task's hold job was assumed alive if the (up to 15-min-stale) node DB still
+  listed it**, turning a node reclaim into a "self-crash" (`failed`, no retry) instead of
+  an infra-failure requeue. `hold_job_alive` now always confirms with `squeue -j`; the DB
+  is only the fallback when squeue can't run.
+- **`hive poll` wrote one more job than the daemon**: its `squeue` format lacked the job
+  name column, so the `cursor_ssh_proxy` filter never matched. Format and stdin handling
+  now mirror `hive-daemon`.
+- **`hive list | head` printed a BrokenPipeError traceback** (feedback #12). SIGPIPE is
+  restored to its default so the command exits quietly.
+- **`hive nodes` / `hive top` showed IDLE for a hold job that had a RUNNING hive task**
+  whose GPU wasn't hot yet (cold import / model load / poll older than the dispatch), and
+  hid the task name — read as "scheduler ignores idle nodes" and cost several false-alarm
+  debug sessions (feedback #4/#7/#17/#32). Such rows now show **CLAIM** with the task,
+  and the summary counts `claimed:` separately. Display-only: `node_monitor.json` is
+  unchanged.
+- **`warning` was a terminal node state → hold jobs permanently evicted from dispatch
+  (feedback #10, dups #9/#6/#5).** `hive-dbpost` armed the busy→idle grace timer but
+  never cleared `gpu_idle_since`, so the same branch re-entered every poll and pinned
+  the job at `warning` for good; `hive-sched.get_candidates()` skipped `warning`, so any
+  hold job that finished one task and sat idle >180 s stopped receiving work — surviving
+  daemon restarts, because the state lives in `node_monitor.json`. Observed live as 7
+  hold jobs with completely free GPUs while 20 tasks waited on `no_dispatchable_node`.
+  The grace now expires back to `idle` with the timer cleared, and the scheduler treats
+  `warning` as *uncertain* (verify-before-dispatch) rather than busy — which also lets a
+  DB written by an older hive self-heal without hand-editing.
+- **`hive nodes` counted `warning` as `busy`**, so a wedged pool still reported a
+  plausible `busy: 18` when only 11 nodes were working. It's now its own `warn:` count.
+
+### Added
+- **`#HIVE gpus=N` / `--gpus N`** — how many GPUs a task may see, default **1**
+  (feedback #8). A hold job can own several GPUs; handing all of them to a task that
+  never asked made HF Trainer wrap the model in `nn.DataParallel` and die at step 0
+  (`Expected all tensors to be on the same device, cuda:1 vs cuda:0`) after ~40 min of
+  setup. The dispatch wrapper now keeps only the first N entries of the
+  `CUDA_VISIBLE_DEVICES` SLURM handed the step — narrowing, never widening, so it can't
+  name a device the hold job doesn't own. Multi-GPU is opt-in and gated: a task asking
+  for N only places on a hold job that owns ≥N GPUs (new reason `insufficient_gpus`).
+  Note this is a **behaviour change** for workloads that relied on seeing every GPU of a
+  multi-GPU hold job — declare `#HIVE gpus=2` for those.
+- **Task logs record actual GPU visibility** —
+  `=== gpus: requested 1, visible=[0] (hold job provided [0,1]) ===` — turning a
+  device-count surprise into one line instead of a mid-run mystery.
+
+### Notes
+- Investigated and **disproved** feedback #8's stated root cause (that `srun --overlap`
+  steps don't inherit the hold-job's per-GPU cgroup and see the whole node). Measured on
+  7 hold jobs across 2 partitions and 3 multi-tenant nodes: every step saw exactly its
+  own card, with `SLURM_STEP_GPUS` matching `scontrol`'s allocated `IDX`. The real cause
+  was a hold job submitted with `--gres=gpu:2`. No `--gres`/`--exact`/`--gpu-bind` flag
+  is needed on the dispatch step.
+
 ## [0.4.0] - 2026-06-09
 
 ### Added (walltime-aware scheduling + checkpoint-loss notification — feedback C4)

@@ -15,6 +15,7 @@
 HIVE_DIR="${HIVE_DIR:-${HOME}/.hive}"
 DB_FILE="${DB_FILE:-${HIVE_DIR}/node_monitor.json}"
 QUEUE_FILE="${HIVE_DIR}/queue.json"
+HEALTH_FILE="${HIVE_DIR}/node_health.json"
 PID_FILE="${PID_FILE:-${HIVE_DIR}/node_monitor.pid}"
 LOG_FILE="${LOG_FILE:-${HIVE_DIR}/node_monitor.log}"
 # DAEMON_BIN and POLL_BIN may be exported by the hive dispatcher;
@@ -214,6 +215,17 @@ from datetime import datetime, timezone
 
 db_path    = sys.argv[1]
 queue_path = sys.argv[2] if len(sys.argv) > 2 else None
+health_path = sys.argv[3] if len(sys.argv) > 3 else None
+
+# Quarantined physical nodes (hive health / scheduler auto-quarantine)
+quarantined = set()
+if health_path:
+    try:
+        with open(health_path) as _hf:
+            quarantined = {n for n, r in json.load(_hf).get("nodes", {}).items()
+                           if r.get("state") == "quarantined"}
+    except Exception:
+        pass
 
 # Build slurm_jobid → task map for running hive tasks
 jobid_to_task = {}
@@ -325,9 +337,22 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
     if qt:
         tid    = qt["id"]
         name   = qt.get("name") or ""
+        owner  = qt.get("owner") or ""
         qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
-        prefix = f"#{tid} {name}: " if name else f"#{tid}: "
+        prefix = f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
         task_cmd = prefix + qcmd
+        # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
+        # busy: cold import / model load, or a poll older than the dispatch. The
+        # slot is taken regardless of GPU state — show it as CLAIMED instead of
+        # IDLE, which read as "scheduler ignores idle nodes" and cost several
+        # false-alarm debug sessions (feedback #4/#7/#17/#32).
+        if status in ("idle", "warning", "probe_failed", "unknown"):
+            status = "claimed"
+    # Quarantined node (CUDA init fails there): no dispatches until the scheduler's
+    # periodic CUDA probe passes. Shown over idle-ish states; a still-running task
+    # keeps BUSY/CLAIM so the operator can see it.
+    if node in quarantined and status not in ("busy", "claimed"):
+        status = "quarantined"
 
     if len(task_cmd) > 55:
         task_cmd = task_cmd[:54] + "…"
@@ -364,7 +389,7 @@ show_table() {
     _PY="${HIVE_PYTHON:-}"
     [[ -z "$_PY" && -x "${HOME}/.conda/envs/vlm/bin/python3" ]] && _PY="${HOME}/.conda/envs/vlm/bin/python3"
     [[ -z "$_PY" ]] && _PY="$(command -v python3 2>/dev/null)"
-    parsed=$("$_PY" - "$DB_FILE" "$QUEUE_FILE" <<< "$PYTHON_PARSE" 2>/dev/null)
+    parsed=$("$_PY" - "$DB_FILE" "$QUEUE_FILE" "$HEALTH_FILE" <<< "$PYTHON_PARSE" 2>/dev/null)
     if [[ -z "$parsed" ]]; then
         echo -e "\n  ${RED}Failed to parse DB (is python3 available?).${NC}\n"
         return 1
@@ -410,7 +435,7 @@ show_table() {
     printf "${NC}\n"
     printf "  %s\n" "$SEP"
 
-    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0
+    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0 n_warn=0 n_claim=0 n_quar=0
 
     for row in "${rows[@]}"; do
         IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str left job_stale task_cmd <<< "$row"
@@ -419,12 +444,25 @@ show_table() {
         if [[ "$status" == "busy" ]]; then
             status_upper="BUSY";    status_color="${GREEN}${BOLD}"
             n_busy=$(( n_busy + 1 ))
+        elif [[ "$status" == "claimed" ]]; then
+            # queue.json says a hive task is running here; GPU not busy yet.
+            status_upper="CLAIM";   status_color="${GREEN}"
+            n_claim=$(( n_claim + 1 ))
+        elif [[ "$status" == "quarantined" ]]; then
+            # Bad node (CUDA init fails): excluded from dispatch until it passes the
+            # scheduler's periodic CUDA probe. `hive health` for details.
+            status_upper="QUAR ";   status_color="${RED}${BOLD}"
+            n_quar=$(( n_quar + 1 ))
         elif [[ "$status" == "cpu" ]]; then
             status_upper="CPU  ";   status_color="${CYAN}${BOLD}"
             n_cpu=$(( n_cpu + 1 ))
         elif [[ "$status" == "warning" ]]; then
+            # busy→idle grace window: GPU already looks free but we hold it for
+            # WARN_SECS before calling it idle. Counted separately, NOT as busy —
+            # folding it into busy hid a pool-wide wedge behind a plausible
+            # "busy: 18" when only 11 nodes were working (feedback #10).
             status_upper="WARN ";   status_color="${YELLOW}${BOLD}"
-            n_busy=$(( n_busy + 1 ))
+            n_warn=$(( n_warn + 1 ))
         elif [[ "$status" == "probe_failed" || "$status" == "unknown" ]]; then
             # Probe could not run — NOT idle. Counted separately so the summary
             # doesn't conflate "GPU free" with "we couldn't tell" (feedback OPT-J).
@@ -450,7 +488,7 @@ show_table() {
         (( job_stale )) && node_text="${node}!"
 
         local task_text task_color
-        if [[ "$status" == "busy" && -n "$task_cmd" ]]; then
+        if [[ ( "$status" == "busy" || "$status" == "claimed" ) && -n "$task_cmd" ]]; then
             task_text="$task_cmd"; task_color=""
         else
             task_text="—"; task_color="$DIM"
@@ -483,8 +521,11 @@ show_table() {
     local summary
     summary=$(printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   cpu: ${CYAN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}" \
         "$n_busy" "$n_cpu" "$n_idle")
+    (( n_claim > 0 )) && summary+="$(printf "${BOLD}   claimed: ${GREEN}%d${NC}" "$n_claim")"
+    (( n_warn > 0 ))  && summary+="$(printf "${BOLD}   warn: ${YELLOW}%d${NC}" "$n_warn")"
     (( n_pfail > 0 )) && summary+="$(printf "${BOLD}   probe-fail: ${RED}%d${NC}" "$n_pfail")"
-    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_cpu + n_idle + n_pfail ))")"
+    (( n_quar > 0 ))  && summary+="$(printf "${BOLD}   quarantined: ${RED}%d${NC}" "$n_quar")"
+    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_claim + n_cpu + n_idle + n_pfail + n_warn + n_quar ))")"
     printf "%s\n" "$summary"
 }
 

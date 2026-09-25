@@ -29,9 +29,13 @@ histogram, a `node_monitor.json` status histogram, and the tail of any
 referenced `task-<id>.log`. This is appended under `## Auto-captured context` so
 the maintainer can reproduce without round-trips.
 
-Storage resolves to `$HIVE_FEEDBACK_DIR`, else `<repo>/feedback`, else
-`$HIVE_DIR/feedback`. Inbox files are untracked-friendly: `install.sh` never runs
-`git clean`, so reports filed against an installed copy survive `git reset --hard`.
+Storage resolves to `$HIVE_FEEDBACK_DIR`, else the **source checkout** recorded by
+`install.sh` in `<install-dir>/.source_checkout`, else `<repo>/feedback`, else
+`$HIVE_DIR/feedback`. Agents run the *installed* copy, so without that pointer their
+reports landed in `~/.local/share/hive-cli/feedback/inbox/` where the maintainer never
+looked and where the next `install.sh` (`rsync --delete`) would have wiped them (this
+happened to #11–#33). The installer now also rescues any inbox entries found in the
+install dir into the checkout and never deletes `feedback/inbox/`.
 
 ## Triage loop (maintainer agent)
 

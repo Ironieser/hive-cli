@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 # since libexec scripts aren't a package.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import hive_events as ev
+import hive_health as hh   # self-maintained bad-node (quarantine) list
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HIVE_DIR      = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
@@ -42,11 +44,18 @@ LOG_ROLL_LINES    = 500
 # ── Dispatch gating (feedback C1/C2: stop dispatching into dirty/stale/unverified nodes) ──
 GPU_CLEAN_MB       = 5000   # a hold-job GPU with >5GB used is dirty (zombie / co-tenant) → skip
 NEED_MB_DEFAULT    = 0      # per-task min free MB (override via #HIVE need_mb= / --need-mb)
+DEFAULT_TASK_GPUS  = 1      # GPUs a task sees when it doesn't say (#HIVE gpus= / --gpus).
+                            # Must match hive-queue's DEFAULT_TASK_GPUS: tasks queued by an
+                            # older hive carry no "gpus" key and are read with this default.
 NODE_DB_STALE_SECS = 1800   # node DB older than this → force a re-poll instead of trusting it
 ORPHAN_GRACE_SECS  = 90     # running task w/ no srun+heartbeat+exit older than this → crash orphan
 MAX_ATTEMPTS       = 3      # requeue cap for crash orphans (prevents infinite redispatch)
 STARVATION_CYCLES  = 3      # consecutive starved cycles before forcing a poller re-poll
-LIVE_PROBE_TIMEOUT = 20     # seconds for a single verify-before-dispatch probe
+LIVE_PROBE_TIMEOUT = 45     # verify-before-dispatch probe: srun + python startup (CUDA probe)
+VERIFY_EVERY_DISPATCH = True  # live-probe (memory + CUDA context) before EVERY dispatch, not
+                              # only for uncertain nodes: the DB can be a poll cycle stale
+                              # (feedback #14) and nvidia-smi can't see a CUDA-init fault
+                              # (feedback #13/#15/#16/#28/#29) — only a real context can.
 
 # ── Walltime-aware placement (feedback C4: don't strand a long task on a dying node) ──
 # Only applies when a task carries an est_runtime_secs (explicit --est-runtime or
@@ -65,6 +74,16 @@ _starve_streak = 0
 
 def now_iso():
     return datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def now_ts():
+    """Epoch seconds. Every queue timestamp is written twice: the human-readable
+    naive-local `*_at` string (kept for old readers) and this tz-independent `*_ts`.
+    The scheduler, the poller and each agent's shell may run under DIFFERENT TZ
+    settings (observed: sched EDT, poller Asia/Shanghai, submitting shell CST), so
+    subtracting two `*_at` strings written by different processes was off by hours
+    (feedback #31: ELAPSED inflated by 12h, queued_secs negative → None)."""
+    return time.time()
 
 
 def roll_log():
@@ -149,16 +168,30 @@ def _age_seconds(iso):
         return None
 
 
-def _age_local(iso):
-    """Age of a LOCAL timestamp (queue fields: dispatched_at / started_at, written
-    by now_iso() = datetime.now()). Must NOT be compared as UTC (feedback note:
-    tz mismatch would inflate the age by the UTC offset)."""
-    if not iso:
+def _task_epoch(task, key):
+    """Epoch seconds of a task timestamp (`key` = submitted/started/dispatched/
+    finished). Prefers the tz-safe `<key>_ts`; falls back to the legacy naive-local
+    `<key>_at` string interpreted in THIS process's zone (the pre-0.4.1 behaviour,
+    so old records keep working; they may be off if the writer ran under another TZ)."""
+    ts = task.get(f"{key}_ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return float(ts)
+    s = task.get(f"{key}_at")
+    if not s:
         return None
     try:
-        return (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+        return datetime.fromisoformat(s).timestamp()
     except ValueError:
         return None
+
+
+def _task_age(task, *keys):
+    """Seconds since the first of `keys` that the task carries, else None."""
+    for k in keys:
+        e = _task_epoch(task, k)
+        if e is not None:
+            return time.time() - e
+    return None
 
 
 def _pid_alive(pid):
@@ -232,9 +265,12 @@ def db_time_left(info, db_updated):
 def hold_job_alive(jid, jobs_db):
     """True if hold-job `jid` is still a running SLURM allocation.
 
-    Fast path: present in the (just-loaded) node DB. Slow path (only taken when a
-    task just died, so it's rare): a bounded `squeue -j` confirm, since the node DB
-    may simply be stale. Falls back to the DB verdict if squeue can't be run.
+    Always confirmed with a bounded `squeue -j` (only called when a task just died,
+    so it's rare). The node DB is NOT trusted as a fast path: it is refreshed every
+    900s and a poll cycle takes minutes, so a hold job reclaimed a few minutes ago is
+    still listed there — trusting it turned a node loss into a "self-crash" (failed,
+    no retry) instead of an infra-failure requeue. The DB is only the fallback when
+    squeue itself can't be run.
 
     NOTE on lock-hold: this and live_probe() run inside the QueueLock-held cycle, so a
     cycle that must verify several uncertain nodes and reconcile a dead task can hold
@@ -243,8 +279,6 @@ def hold_job_alive(jid, jobs_db):
     outside the lock and re-acquire only to commit the claim."""
     if not jid:
         return False
-    if jid in jobs_db:
-        return True
     try:
         out = subprocess.run(
             ["squeue", "-h", "-j", str(jid), "-t", "R", "-o", "%i"],
@@ -255,26 +289,20 @@ def hold_job_alive(jid, jobs_db):
 
 
 def _duration_secs(task):
-    """Wall-clock run duration from started_at→finished_at (both local time)."""
-    t0, t1 = task.get("started_at"), task.get("finished_at")
-    if not t0 or not t1:
+    """Wall-clock run duration started→finished (tz-safe, see _task_epoch)."""
+    t0, t1 = _task_epoch(task, "started"), _task_epoch(task, "finished")
+    if t0 is None or t1 is None:
         return None
-    try:
-        d = (datetime.fromisoformat(t1) - datetime.fromisoformat(t0)).total_seconds()
-    except (ValueError, TypeError):
-        return None
+    d = t1 - t0
     return int(d) if d >= 0 else None
 
 
 def _queued_secs(task):
-    """Queue wait before the run that finished: submitted_at→started_at (local time)."""
-    t0, t1 = task.get("submitted_at"), task.get("started_at")
-    if not t0 or not t1:
+    """Queue wait before the run that finished: submitted→started (tz-safe)."""
+    t0, t1 = _task_epoch(task, "submitted"), _task_epoch(task, "started")
+    if t0 is None or t1 is None:
         return None
-    try:
-        d = (datetime.fromisoformat(t1) - datetime.fromisoformat(t0)).total_seconds()
-    except (ValueError, TypeError):
-        return None
+    d = t1 - t0
     return int(d) if d >= 0 else None
 
 
@@ -329,15 +357,42 @@ def request_repoll(reason):
         logging.warning("Requested immediate node re-poll (%s)", reason)
 
 
+def _max_gpu(lines):
+    """Max (util, mem_used, mem_total) across nvidia-smi GPU csv lines, each
+    'utilization,memory.used,memory.total'. Returns None if no line parses.
+
+    Phase-1 multi-GPU: live_probe enumerates all the hold-job's GPUs and the verify
+    gate treats the node as ONE slot — busy/dirty if ANY GPU is busy/dirty (max). This
+    is conservative until per-GPU scheduling (Phase 2) can target a specific free GPU.
+    """
+    util = used = total = 0
+    parsed = False
+    for ln in lines:
+        parts = ln.split(",")
+        if len(parts) < 3:
+            continue
+        try:
+            u, mu, mt = (int(float(x.strip())) for x in parts[:3])
+        except ValueError:
+            continue
+        util, used, total = max(util, u), max(used, mu), max(total, mt)
+        parsed = True
+    return (util, used, total) if parsed else None
+
+
 def live_probe(slurm_jobid):
     """Fast single-job GPU probe, bypassing the (possibly stale) node DB.
 
     Used to verify-before-dispatch so one stale/failed poll can't strand a node
     and so we never dispatch onto a node whose GPU is actually occupied
-    (feedback OPT-B / OBSERVED#2). Returns {ok, util, mem_used, mem_total}.
+    (feedback OPT-B / OBSERVED#2). Enumerates ALL the hold-job's GPUs (no --id=0;
+    cgroup isolation scopes nvidia-smi to the job's own cards) and aggregates with
+    max, so a node with any busy/dirty GPU is rejected. Returns {ok, util, mem_used,
+    mem_total}.
     """
-    probe = ("nvidia-smi --id=0 --query-gpu=utilization.gpu,memory.used,memory.total "
-             "--format=csv,noheader,nounits 2>/dev/null")
+    probe = ("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
+             "--format=csv,noheader,nounits 2>/dev/null; "
+             f"echo {hh.CUDA_MARKER}; " + hh.cuda_probe_shell())
     try:
         out = subprocess.run(
             ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
@@ -345,33 +400,50 @@ def live_probe(slurm_jobid):
             capture_output=True, text=True, timeout=LIVE_PROBE_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError):
         return {"ok": False}
-    lines = [l for l in (out.stdout or "").strip().splitlines() if l.strip()]
+    raw = (out.stdout or "")
+    gpu_part, _, cuda_part = raw.partition(hh.CUDA_MARKER)
+    lines = [l for l in gpu_part.strip().splitlines() if l.strip()]
     if out.returncode != 0 or not lines:
         return {"ok": False}
-    try:
-        util, used, total = [int(float(x.strip())) for x in lines[0].split(",")]
-    except (ValueError, IndexError):
+    agg = _max_gpu(lines)
+    if agg is None:
         return {"ok": False}
-    return {"ok": True, "util": util, "mem_used": used, "mem_total": total}
+    util, used, total = agg
+    # The CUDA verdict rides in the same srun step: `fail` means creating a context on
+    # the hold job's GPU failed (co-tenant / broken node), `unknown` means the probe
+    # couldn't run (no python / libcuda) and is never treated as a fault.
+    cuda, cuda_detail = hh.parse_cuda_probe(cuda_part.splitlines())
+    return {"ok": True, "util": util, "mem_used": used, "mem_total": total,
+            "cuda": cuda, "cuda_detail": cuda_detail}
 
 
-def get_candidates(jobs_db, used_jobids, freed):
+def get_candidates(jobs_db, used_jobids, freed, quarantined=frozenset()):
     """Candidate hold-jobs for dispatch, each (jid, info, needs_verify).
+
+    Hold jobs on a `quarantined` physical node (hive health) are never candidates.
 
     Dispatchable = SLURM-allocated + plausibly free, decoupled from a single
     `status=="idle"` check (feedback OPT-B). `idle` nodes are candidates; so are
-    `probe_failed`/`unknown` and just-freed nodes — but those carry needs_verify
-    so we live-probe before trusting them. `busy`/`warning`/`cpu` are excluded.
+    `probe_failed`/`unknown`/`warning` and just-freed nodes — but those carry
+    needs_verify so we live-probe before trusting them. `busy`/`cpu` are excluded.
     Fresh trustworthy idles are tried first (cheap, no live probe).
     """
     cands = []
     for jid, info in jobs_db.items():
         if jid in used_jobids:
             continue
+        if info.get("node") in quarantined:
+            continue
         st = info.get("status")
         forced = jid in freed
         is_idle = (st == "idle")
-        is_uncertain = st in ("probe_failed", "unknown")
+        # `warning` is uncertain, not busy: it means "GPU looked quiet but we're
+        # inside the busy→idle grace window". Treating it as a hard skip stranded
+        # nodes permanently whenever the grace timer failed to clear (feedback
+        # #10); including it here also lets a node_monitor.json written by an
+        # older hive self-heal without hand-editing. needs_verify is always set
+        # for it, so live_probe() rejects any node that is genuinely busy.
+        is_uncertain = st in ("probe_failed", "unknown", "warning")
         if not (is_idle or is_uncertain or forced):
             continue
         stale = (_age_seconds(info.get("polled_at")) or 0) > NODE_DB_STALE_SECS
@@ -405,55 +477,102 @@ def dispatch_task(task, slurm_jobid, node_name):
 
     started_at = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
 
+    # Everything user-controlled that lands in the wrapper (cmd, workdir, paths) is
+    # shell-quoted. The header used to be `echo '=== cmd: {cmd} ==='`, so a cmd
+    # containing a single quote plus any shell-special character (task #9128:
+    # `echo 'holding ... (CUDA init dies)'`) was a bash syntax error: the wrapper
+    # never ran, no heartbeat appeared, and the task was retried as a crash orphan
+    # until it was "declared dead".
+    q  = shlex.quote
+    lf = q(log_file)
+    hb = q(hb_file)
+    xf = q(exit_file)
+    cmd_oneline = cmd.replace("\n", " ")
+
     # Remaining walltime of the hold-job at dispatch (logged so the submitting agent
     # can see how long this node can run the task before SLURM reclaims it).
     wt_left = task.get("node_time_left_secs")
-    wt_line = (f"echo '=== node walltime remaining at dispatch: {_fmt_dur(wt_left)} "
-               f"(then this node is reclaimed) ===' >> {log_file}\n")
+    wt_line = ("echo " + q(f"=== node walltime remaining at dispatch: {_fmt_dur(wt_left)} "
+                           f"(then this node is reclaimed) ===") + f" >> {lf}\n")
     est = task.get("est_runtime_secs")
     est_line = ""
     if est:
-        est_line = (f"echo '=== estimated runtime: {_fmt_dur(int(est))} "
-                    f"(source: {task.get('est_source', 'user')}) ===' >> {log_file}\n")
+        est_line = ("echo " + q(f"=== estimated runtime: {_fmt_dur(int(est))} "
+                                f"(source: {task.get('est_source', 'user')}) ===")
+                    + f" >> {lf}\n")
     # Re-dispatch warning: a task put back on a (possibly different) node loses any
     # in-memory/un-checkpointed progress — make that unmissable in the log.
     rq = int(task.get("requeue_count", 0) or 0)
     rq_line = ""
     if rq > 0:
-        rq_line = (f"echo '=== WARNING: re-dispatch #{rq} (attempt {task.get('attempts', 0)}). "
-                   f"Previous run on another node was interrupted; this is a FRESH start — "
-                   f"prior progress is lost unless your command resumes from a checkpoint. ===' "
-                   f">> {log_file}\n")
+        rq_line = ("echo " + q(f"=== WARNING: re-dispatch #{rq} (attempt {task.get('attempts', 0)}). "
+                               f"Previous run on another node was interrupted; this is a FRESH start — "
+                               f"prior progress is lost unless your command resumes from a checkpoint. ===")
+                   + f" >> {lf}\n")
+
+    # ── GPU visibility ────────────────────────────────────────────────────────
+    # SLURM's cgroup already scopes the step to the hold-job's own GPUs, renumbered
+    # 0..N-1 — verified on multi-tenant nodes, so we never need to widen it. But a
+    # hold job may own MORE GPUs than the task asked for, and a framework that
+    # auto-parallelizes over every visible device (HF Trainer → nn.DataParallel)
+    # then crashes at step 0 (feedback #8: task 6862 on a gpu:2 hold job).
+    #
+    # So NARROW, never widen: keep the first N entries of whatever SLURM handed the
+    # step. Subsetting the existing value (rather than hardcoding indices) means we
+    # cannot invent a device the job doesn't own, and it works whether SLURM gives
+    # indices or UUIDs. If CUDA_VISIBLE_DEVICES is unset (CPU-only hold job) we
+    # leave it alone. The resulting visibility is logged so a device-count surprise
+    # is one line in the log instead of a 40-minute mystery.
+    want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
+    if want_gpus > 0:
+        gpu_line = (
+            # Log the visibility SLURM handed us *before* narrowing — that is the line
+            # that diagnoses a device-count surprise ("hold job gave [0,1]" is the whole
+            # story behind a DataParallel crash). SLURM_STEP_GPUS is a physical INDEX
+            # list, not a count, so it is deliberately not used as one here.
+            f'_HIVE_CVD_ALL="${{CUDA_VISIBLE_DEVICES:-<unset>}}"\n'
+            f'if [ -n "${{CUDA_VISIBLE_DEVICES:-}}" ]; then\n'
+            f'  export CUDA_VISIBLE_DEVICES=$(echo "$CUDA_VISIBLE_DEVICES" | cut -d, -f1-{want_gpus})\n'
+            f'fi\n'
+            f'echo "=== gpus: requested {want_gpus}, visible=[${{CUDA_VISIBLE_DEVICES:-<unset>}}]'
+            f' (hold job provided [$_HIVE_CVD_ALL]) ===" >> {lf}\n'
+        )
+    else:
+        gpu_line = (
+            f'export CUDA_VISIBLE_DEVICES=""\n'
+            f'echo "=== gpus: requested 0 — all GPUs hidden ===" >> {lf}\n'
+        )
 
     # Shell wrapper that runs on the compute node.
     # All output (including srun-level errors) goes to the task log.
     wrapper = (
         # ── Header ──────────────────────────────────────────────────────────
-        f"echo '=== hive task #{task_id} started at {started_at} ===' >> {log_file}\n"
-        f"echo '=== node: {node_name}  slurm_jobid: {slurm_jobid} ===' >> {log_file}\n"
+        "echo " + q(f"=== hive task #{task_id} started at {started_at} ===") + f" >> {lf}\n"
+        "echo " + q(f"=== node: {node_name}  slurm_jobid: {slurm_jobid} ===") + f" >> {lf}\n"
         + wt_line + est_line + rq_line +
-        f"echo '=== workdir: {workdir} ===' >> {log_file}\n"
-        f"echo '=== cmd: {cmd.replace(chr(10), ' ')} ===' >> {log_file}\n"
-        f"echo '' >> {log_file}\n"
+        "echo " + q(f"=== workdir: {workdir} ===") + f" >> {lf}\n"
+        "echo " + q(f"=== cmd: {cmd_oneline} ===") + f" >> {lf}\n"
+        f"echo '' >> {lf}\n"
         # ── cd with error guard ──────────────────────────────────────────────
-        f"if ! cd {workdir} 2>> {log_file}; then\n"
-        f"  echo 'ERROR: cannot cd to workdir: {workdir}' >> {log_file}\n"
-        f"  echo 1 > {exit_file}\n"
+        f"if ! cd {q(workdir)} 2>> {lf}; then\n"
+        "  echo " + q(f"ERROR: cannot cd to workdir: {workdir}") + f" >> {lf}\n"
+        f"  echo 1 > {xf}\n"
         f"  exit 1\n"
         f"fi\n"
+        + gpu_line +
         # ── Heartbeat process (disowned to suppress bash "Terminated" noise) ───
-        f"( while true; do date -Iseconds > {hb_file}; sleep 30; done ) &\n"
+        f"( while true; do date -Iseconds > {hb}; sleep 30; done ) &\n"
         f"_HB_PID=$!\n"
         f"disown $_HB_PID\n"
-        # ── Run the actual command ───────────────────────────────────────────
-        f"{cmd} >> {log_file} 2>&1\n"
+        # ── Run the actual command (verbatim: it is the user's shell script) ──
+        f"{cmd} >> {lf} 2>&1\n"
         f"_EC=$?\n"
         # ── Footer (double-quotes so $(date) and $_EC are expanded by bash) ──
-        f'echo "" >> {log_file}\n'
-        f'echo "=== hive task #{task_id} finished at $(date -Iseconds)  exit_code=$_EC ===" >> {log_file}\n'
+        f'echo "" >> {lf}\n'
+        f'echo "=== hive task #{task_id} finished at $(date -Iseconds)  exit_code=$_EC ===" >> {lf}\n'
         f"kill $_HB_PID 2>/dev/null\n"
-        f"rm -f {hb_file}\n"
-        f"echo $_EC > {exit_file}\n"
+        f"rm -f {hb}\n"
+        f"echo $_EC > {xf}\n"
     )
 
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -525,7 +644,7 @@ def _is_crash_orphan(task):
     pid = task.get("srun_pid")
     if pid and _pid_alive(pid):
         return False   # srun still a live process — not an orphan
-    age = _age_local(task.get("dispatched_at") or task.get("started_at"))
+    age = _task_age(task, "dispatched", "started")
     return age is None or age > ORPHAN_GRACE_SECS
 
 
@@ -542,6 +661,9 @@ def run_one_cycle():
     with QueueLock() as lfd:
         queue = load_queue(lfd)
         tasks = queue.get("tasks", {})
+        health = hh.load()
+        health_changed = False
+        quarantined = hh.quarantined_nodes(health)
 
         # ── (1) Check running tasks ──────────────────────────────────────────
         running_jobids = set()
@@ -555,11 +677,41 @@ def run_one_cycle():
 
             status = check_task_status(task["id"], task.get("srun_pid"))
 
+            if task.get("cancel_requested") and not status.startswith("done:"):
+                # `hive cancel` may run on ANOTHER node (feedback C5 class): the srun
+                # child lives in this process, so only the scheduler can signal it —
+                # a host-local os.kill from the CLI either missed the step (task
+                # marked cancelled, GPU still busy) or hit an unrelated same-number
+                # PID. The CLI records the request; we act on it here.
+                pid = task.get("srun_pid")
+                if pid and _pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)   # srun forwards it to the step
+                    except OSError:
+                        pass
+                task["state"]         = "cancelled"
+                task["finished_at"]   = now_iso()
+                task["finished_ts"]   = now_ts()
+                task["duration_secs"] = _duration_secs(task)
+                task["queued_secs"]   = _queued_secs(task)
+                task.pop("cancel_requested", None)
+                if jid:
+                    running_jobids.discard(jid)
+                    freed_jobids.add(jid)   # live-verified before reuse (step may still be tearing down)
+                changed = True
+                logging.info("Task %d cancelled on request (srun pid %s, node %s)",
+                             task["id"], pid, task.get("node", "?"))
+                ev.record("cancel", task=task["id"], name=task.get("name") or None,
+                          node=task.get("node"), slurm_jobid=jid,
+                          run_secs=task["duration_secs"])
+                continue
+
             if status.startswith("done:"):
                 ec = int(status.split(":")[1])
                 task["state"]       = "done" if ec == 0 else "failed"
                 task["exit_code"]   = ec
                 task["finished_at"] = now_iso()
+                task["finished_ts"] = now_ts()
                 task["duration_secs"] = _duration_secs(task)   # run time → runtime history
                 task["queued_secs"]   = _queued_secs(task)     # wait time → feedback
                 if jid:
@@ -574,6 +726,51 @@ def run_one_cycle():
                           slurm_jobid=jid, run_secs=task["duration_secs"],
                           queued_secs=task["queued_secs"])
 
+                # ── Node health feedback (hive_health) ───────────────────────
+                node_name = task.get("node")
+                dur = task.get("duration_secs")
+                if ec == 0 and node_name:
+                    health_changed |= hh.clear_strikes(health, node_name)
+                elif (node_name and dur is not None and dur < hh.FAST_FAIL_SECS):
+                    sig = hh.classify_log_tail(task.get("log", ""))
+                    if sig:
+                        # Fast death with a CUDA-init signature: a strike against the
+                        # NODE, not the command. Two strikes quarantine it, and the task
+                        # that tripped the wire is given another node (it never got past
+                        # init, so nothing is lost).
+                        health_changed = True
+                        tripped = hh.strike(health, node_name, f"task {task['id']}: {sig}")
+                        logging.warning("Task %d died in %ss on %s with a CUDA-init fault "
+                                        "(%s) — strike %d%s", task["id"], dur, node_name, sig,
+                                        health["nodes"][node_name]["strikes"],
+                                        "; node QUARANTINED" if tripped else "")
+                        if tripped:
+                            quarantined.add(node_name)
+                            ev.record("quarantine", node=node_name, source="auto",
+                                      task=task["id"], reason=sig)
+                            if task.get("attempts", 0) < MAX_ATTEMPTS:
+                                task["attempts"]       = task.get("attempts", 0) + 1
+                                task["state"]          = "pending"
+                                task["pending_reason"] = "node_quarantined_redispatch"
+                                task["slurm_jobid"]    = None
+                                task["node"]           = None
+                                task["srun_pid"]       = None
+                                task["started_at"] = task["started_ts"] = task["dispatched_ts"] = None
+                                task["finished_at"] = task["finished_ts"] = None
+                                task["exit_code"]      = None
+                                append_log_note(task, [
+                                    "",
+                                    f"=== hive: {node_name} quarantined after repeated CUDA-init "
+                                    f"failures; task #{task['id']} will be RE-DISPATCHED to another "
+                                    f"node (attempt {task['attempts']}/{MAX_ATTEMPTS}). ===",
+                                    "",
+                                ])
+                                freed_jobids.discard(jid)
+                                ev.record("requeue", task=task["id"],
+                                          name=task.get("name") or None,
+                                          reason="node_quarantined", prev_node=node_name,
+                                          attempts=task["attempts"], checkpoint_lost=False)
+
             elif status == "dead":
                 if _is_crash_orphan(task) and task.get("attempts", 0) < MAX_ATTEMPTS:
                     # Never actually ran — requeue instead of losing it (OPT-E).
@@ -586,6 +783,8 @@ def run_one_cycle():
                     task["node"]          = None
                     task["srun_pid"]      = None
                     task["started_at"]    = None
+                    task["started_ts"]    = None
+                    task["dispatched_ts"] = None
                     if jid:
                         running_jobids.discard(jid)
                     changed = True
@@ -612,6 +811,8 @@ def run_one_cycle():
                     task["node"]               = None
                     task["srun_pid"]           = None
                     task["started_at"]         = None
+                    task["started_ts"]         = None
+                    task["dispatched_ts"]      = None
                     append_log_note(task, [
                         "",
                         f"=== hive: node {prev_node} (hold job {jid}) was reclaimed mid-run "
@@ -637,6 +838,7 @@ def run_one_cycle():
                     task["state"]       = "failed"
                     task["exit_code"]   = -1
                     task["finished_at"] = now_iso()
+                    task["finished_ts"] = now_ts()
                     task["duration_secs"] = _duration_secs(task)
                     task["queued_secs"]   = _queued_secs(task)
                     if jid:
@@ -649,12 +851,37 @@ def run_one_cycle():
                               slurm_jobid=jid, run_secs=task["duration_secs"],
                               queued_secs=task["queued_secs"])
 
+        # ── (1b) Periodic health checks of quarantined nodes ─────────────────
+        # Re-probe each quarantined node (through one of its hold jobs that isn't
+        # running a task) every HEALTH_CHECK_SECS; HEALTH_OK_STREAK healthy probes
+        # release it, a failed probe re-arms the hold. This is what keeps the
+        # bad-node list self-maintaining instead of a manual blacklist.
+        now = time.time()
+        for node_name, rec in list(health.get("nodes", {}).items()):
+            if not hh.due_for_check(rec, now):
+                continue
+            jid = next((j for j, i in jobs_db.items()
+                        if i.get("node") == node_name and j not in running_jobids), None)
+            if jid is None:
+                hh.record_check(health, node_name, None, "no_hold_job")
+                health_changed = True
+                continue
+            verdict, detail = hh.cuda_probe(jid)
+            outcome = hh.record_check(health, node_name, verdict, detail)
+            health_changed = True
+            logging.info("Health check %s via %s: %s %s%s", node_name, jid, verdict, detail,
+                         f" → {outcome}" if outcome else "")
+            if outcome == "released":
+                quarantined.discard(node_name)
+                ev.record("release", node=node_name, source="auto", detail=detail)
+
         # ── (2) Dispatch pending tasks ───────────────────────────────────────
         # Candidate nodes are tried per task with a verify-before-dispatch live
         # probe + a GPU-clean / free-mem gate, so we never dispatch onto a dirty
         # or actually-occupied GPU (feedback C1/C2). A reason is recorded on each
         # task that can't be placed this cycle.
-        candidates = get_candidates(jobs_db, running_jobids, freed_jobids)
+        candidates = get_candidates(jobs_db, running_jobids, freed_jobids, quarantined)
+        n_quarantined_jobs = sum(1 for i in jobs_db.values() if i.get("node") in quarantined)
         pending = sorted(
             [t for t in tasks.values() if t["state"] == "pending"],
             key=lambda t: (-t.get("priority", 0), t["submitted_at"]),
@@ -663,35 +890,86 @@ def run_one_cycle():
         dispatched = 0
         for task in pending:
             need_mb = int(task.get("need_mb") or NEED_MB_DEFAULT)
-            reason = "no_dispatchable_node"
+            want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
+            # If the only reason nothing is dispatchable is that the pool's nodes are
+            # quarantined, say so instead of the generic reason.
+            reason = "node_quarantined" if (not candidates and n_quarantined_jobs) \
+                else "no_dispatchable_node"
             placed = False
 
-            while candidates:
-                jid, info, needs_verify = candidates.pop(0)
-                used, total = db_gpu_mem(info)
+            # `candidates` is shared by every pending task this cycle. A NODE-level
+            # rejection (probe failed / actually busy / dirty GPU) removes the node
+            # for everyone; a TASK-level rejection (not enough GPUs, memory or
+            # walltime for THIS task) must leave it for the next task. Consuming
+            # candidates on task-level rejections let one unplaceable head-of-queue
+            # task (gpus=2 on a 1-GPU pool, a 6h estimate on a 2h node, ...) strand
+            # every task behind it with `no_dispatchable_node` while the whole pool
+            # sat idle (feedback #24/#25/#26).
+            i = 0
+            while i < len(candidates):
+                jid, info, needs_verify = candidates[i]
+                if "_live" in info:
+                    used, total = info["_live"]       # verified earlier this cycle
+                else:
+                    used, total = db_gpu_mem(info)
 
-                if needs_verify:
+                # GPU-count gate (task-level): a task asking for N GPUs must land on a
+                # hold job that actually owns N. Older DB records (no per-GPU array)
+                # report 0 and stay unrestricted, so legacy behaviour is kept.
+                have_gpus = len(info.get("gpu") or [])
+                if have_gpus and want_gpus > have_gpus:
+                    reason = "insufficient_gpus"
+                    i += 1
+                    continue
+
+                if needs_verify or VERIFY_EVERY_DISPATCH:
                     p = live_probe(jid)
                     if not p["ok"]:
                         reason = "probe_unverifiable"
-                        continue   # can't confirm free — skip this node this cycle
+                        candidates.pop(i)      # node-level: can't confirm free this cycle
+                        continue
                     used, total = p["mem_used"], p["mem_total"]
                     # A node the DB called idle but that is actually occupied:
                     if p["util"] >= 5 and used >= 500:
                         reason = "node_busy_on_verify"
+                        candidates.pop(i)      # node-level
                         continue
+                    if p.get("cuda") == "fail":
+                        # nvidia-smi says free, but a CUDA context can't be created:
+                        # co-tenant outside our cgroup or a broken node. No user code
+                        # involved, so this alone quarantines the node (hive health).
+                        node_name = info.get("node", "?")
+                        reason = "cuda_unavailable_on_verify"
+                        candidates.pop(i)      # node-level
+                        if node_name not in quarantined:
+                            hh.quarantine(health, node_name,
+                                          f"CUDA probe failed on verify: {p.get('cuda_detail')}",
+                                          "verify")
+                            quarantined.add(node_name)
+                            health_changed = True
+                            logging.warning("Node %s QUARANTINED: CUDA context creation failed "
+                                            "on verify (%s)", node_name, p.get("cuda_detail"))
+                            ev.record("quarantine", node=node_name, source="verify",
+                                      reason=p.get("cuda_detail"))
+                        continue
+                    # Verified clean: keep the live reading so the next task doesn't
+                    # pay for another srun probe on the same node this cycle.
+                    info = dict(info, _live=(used, total))
+                    candidates[i] = (jid, info, False)
 
                 if used > GPU_CLEAN_MB:
                     reason = "gpu_dirty"          # zombie / co-tenant memory resident
+                    candidates.pop(i)          # node-level
                     continue
                 if total and need_mb and (total - used) < need_mb:
-                    reason = "waiting_for_mem"
+                    reason = "waiting_for_mem"    # task-level
+                    i += 1
                     continue
 
-                # Walltime gate (only when the task carries a runtime estimate — see
-                # WALLTIME_MARGIN_SECS): never place a long task on a node that will be
-                # reclaimed mid-run. -1 (unlimited) and None (unknown / older poller)
-                # never block.
+                # Walltime gate (task-level; only when the task carries a runtime
+                # estimate — see WALLTIME_MARGIN_SECS): never place a long task on a
+                # node that will be reclaimed mid-run. -1 (unlimited) and None
+                # (unknown / older poller) never block.
                 node_left = db_time_left(info, db_updated)
                 est = task.get("est_runtime_secs")
                 if est and node_left is not None and node_left >= 0 \
@@ -700,8 +978,11 @@ def run_one_cycle():
                     logging.info("Task %d skips %s: node walltime %s < est %s + margin",
                                  task["id"], info.get("node", "?"),
                                  _fmt_dur(node_left), _fmt_dur(int(est)))
+                    i += 1
                     continue
 
+                # This node is taken (whether or not the launch below succeeds).
+                candidates.pop(i)
                 node_name = info.get("node", "?")
                 logging.info("Dispatching task %d → %s (slurm jobid %s, used=%dMiB, "
                              "node_walltime=%s)", task["id"], node_name, jid, used,
@@ -714,6 +995,7 @@ def run_one_cycle():
                 task["srun_pid"]     = None
                 task["started_at"]   = now_iso()
                 task["dispatched_at"] = now_iso()
+                task["started_ts"]   = task["dispatched_ts"] = now_ts()
                 task["node_time_left_secs"] = node_left
                 task.pop("pending_reason", None)
                 save_queue(queue, lfd)
@@ -723,7 +1005,7 @@ def run_one_cycle():
                     logging.error("Failed to dispatch task %d: %s", task["id"], e)
                     task["state"] = "pending"
                     task["slurm_jobid"] = task["node"] = task["srun_pid"] = None
-                    task["started_at"] = None
+                    task["started_at"] = task["started_ts"] = task["dispatched_ts"] = None
                     save_queue(queue, lfd)
                     reason = "dispatch_error"
                     placed = True   # consumed the candidate; stop trying for this task
@@ -744,6 +1026,9 @@ def run_one_cycle():
                 if task.get("pending_reason") != reason:
                     task["pending_reason"] = reason
                     changed = True
+
+        if health_changed:
+            hh.save(health)
 
         # ── (3) Starvation watchdog ──────────────────────────────────────────
         if pending and dispatched == 0:

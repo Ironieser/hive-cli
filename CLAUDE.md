@@ -13,7 +13,7 @@ loops. There is no build step; it is a set of executable scripts symlinked onto 
 
 ```bash
 bash install.sh                 # install to ~/.local/share/hive-cli, symlink hive→~/bin,
-                                # copy Claude skill to ~/.claude/commands/hive.md
+                                # install Claude skill to ~/.claude/skills/hive/
 ./hive <subcommand>             # run directly from the checkout (no install needed)
 ./hive help                     # full subcommand list
 ```
@@ -51,7 +51,10 @@ Two **independent background daemons**, each reading/writing JSON state under `~
 2. **Task scheduler** — `libexec/hive-sched` (30s loop). Reads `queue.json` +
    `node_monitor.json`, dispatches `pending` tasks via `srun --overlap`, and tracks
    liveness via heartbeat files under `~/.hive/heartbeat/`. Managed through
-   `hive queue daemon` / `hive-queue` (the user-facing CLI).
+   `hive queue daemon` / `hive-queue` (the user-facing CLI). It also owns the node
+   health list (`libexec/hive_health.py`, user-facing `hive health`): verify-probe CUDA
+   failures and fast CUDA-signature task failures quarantine a node; periodic probes
+   release it.
 
 The two daemons communicate **only** through `node_monitor.json` — the scheduler never
 polls SLURM directly. It trusts the poller's DB for *fresh, idle* nodes, but for
@@ -70,6 +73,10 @@ ran `hive nodes` spawned its own poller → N× `squeue`/`srun` step blowup (fee
 
 A third user-facing tool, **`libexec/hive-feedback`**, lets other agents file issues
 into `<repo>/feedback/inbox/` for the repo-owning agent to triage (see `feedback/`).
+Agents run the *installed* copy, so `install.sh` writes `<install-dir>/.source_checkout`
+and `hive-feedback` files into that checkout; the installer also rescues inbox entries
+left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`. Check
+`hive feedback list --status open` from the checkout at the start of a maintenance pass.
 
 ### Key invariants when editing
 
@@ -83,12 +90,41 @@ into `<repo>/feedback/inbox/` for the repo-owning agent to triage (see `feedback
 - `hive-dbpost` carries a `probe_failed` job forward to its last-good state (flagged
   `carried_forward`) for up to 30 min, so one transient probe miss doesn't drop a node.
 - A `busy→idle` transition first becomes `warning` (held in `gpu_idle_since`) before
-  flipping to `idle`, so brief GPU dips don't churn the table.
+  flipping to `idle`, so brief GPU dips don't churn the table. **`warning` is transient,
+  never terminal** — when the grace expires, `hive-dbpost` must set `idle` *and clear
+  `gpu_idle_since`*, or the job re-enters that branch every poll and is pinned at
+  `warning` for good. The scheduler treats `warning` as *uncertain* (verify-before-
+  dispatch), not as `busy`, so a stale DB self-heals and the grace window never costs
+  throughput. Never make `warning` a hard skip in `get_candidates()` (feedback #10).
 - **Scheduler dispatch is gated, not status-blind.** `hive-sched` only dispatches onto a
   GPU with ≤ 5 GB used (`GPU_CLEAN_MB`) and ≥ the task's `need_mb` free; uncertain nodes
   get a live verify-probe first; a starvation watchdog SIGUSR1s the poller after 3
   starved cycles; tasks that can't place get a `pending_reason`. Dispatch is crash-safe
   (claim saved before the `srun` launch; orphans without heartbeat/exit are requeued).
+- **Only node-level rejections consume a dispatch candidate.** `candidates` is shared by
+  every pending task in a cycle. `probe_unverifiable` / `node_busy_on_verify` /
+  `gpu_dirty` describe the node → pop it; `insufficient_gpus` / `waiting_for_mem` /
+  `insufficient_walltime` describe the task → leave it (`i += 1`). Popping on task-level
+  rejections let one unplaceable head-of-queue task starve the whole queue with
+  `no_dispatchable_node` (feedback #24–#26).
+- **Time arithmetic uses the `*_ts` epoch fields, never the `*_at` strings.** The
+  scheduler, poller and each agent's shell run under different `TZ`s; `*_at` is naive
+  local for display only. Write both on every state change (`now_iso()` + `now_ts()`);
+  read via `_task_epoch` / `task_epoch`, which fall back to `*_at` for pre-0.4.1 records.
+- **Never `os.kill` an srun PID from a node other than the scheduler's.** `hive cancel`
+  sets `cancel_requested` and the scheduler (owner of the srun child) kills the step; the
+  CLI only signals directly when `sched.pid`'s host is the local host.
+- **Everything user-controlled in the dispatch wrapper is `shlex.quote`d** (cmd in the
+  header, workdir, log/heartbeat paths). The command line itself runs verbatim.
+- **Node health is a separate, self-maintained list** (`libexec/hive_health.py`,
+  `~/.hive/node_health.json`, keyed by physical node). Every dispatch is live-verified
+  (`VERIFY_EVERY_DISPATCH`) with memory *and* a real CUDA-context probe; `fail`
+  quarantines the node, `unknown` (no python/libcuda) **never** counts as a fault. Fast
+  task failures count as strikes only with a CUDA-init signature in the log
+  (`CUDA_FAULT_PATTERNS`) — keep those specific so a buggy command can't blacklist a
+  node. The scheduler re-probes quarantined nodes and releases them itself; don't add a
+  static blacklist. Offline tests stub the probe via `HIVE_CUDA_PROBE_CMD` (the mock
+  cluster has no GPU) and the live reading via `MOCK_LIVE_GPU`.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward
@@ -96,6 +132,17 @@ into `<repo>/feedback/inbox/` for the repo-owning agent to triage (see `feedback
   placed on a node expiring within `est + WALLTIME_MARGIN_SECS`; a task *without* an
   estimate stays walltime-blind, so existing behaviour is unchanged. `-1`=unlimited and
   `null`=unknown never block.
+- **GPU visibility is narrowed, never widened.** SLURM's cgroup already scopes an
+  `srun --overlap` step to the hold-job's own GPUs, renumbered `0..N-1` — verified on
+  multi-tenant nodes, so hive never needs `--gres`/`--gpu-bind` on the step. But a hold
+  job may own *more* GPUs than the task wants, and a framework that auto-parallelizes
+  over every visible device then crashes (feedback #8). So the dispatch wrapper keeps
+  only the first `gpus` entries of whatever SLURM handed it (`cut -d, -f1-N` on
+  `CUDA_VISIBLE_DEVICES`) — subsetting the existing value, so it can never name a device
+  the job doesn't own, and it works for index *or* UUID form. Default `gpus`=1; a task
+  asking for N only places on a hold job with ≥N GPUs (`insufficient_gpus`).
+  `DEFAULT_TASK_GPUS` is duplicated in `hive-queue` and `hive-sched` — keep them equal,
+  since tasks queued by an older hive carry no `gpus` key and are read with the default.
 - **Infra failure ≠ self-crash.** A dead `running` task whose hold-job is **gone**
   (confirmed by `squeue -j`) is requeued to another node (`requeue_count`++,
   `checkpoint_warning`, log banner, `hive wait` ⚠) — the new run starts fresh. A dead
@@ -140,7 +187,7 @@ Keep the rest of the repo cluster-agnostic.
 ## Task model
 
 `hive queue submit` accepts either a raw command string or a `.hive` script. `.hive`
-files use `#HIVE key=value` directives (`workdir`, `priority`, `name`, `need_mb`)
+files use `#HIVE key=value` directives (`workdir`, `priority`, `name`, `need_mb`, `gpus`)
 analogous to `#SBATCH`. Task states: `pending → running → done|failed|cancelled`.
 Pending tasks carry a scheduler-set `pending_reason` (surfaced in the `hive list` NODE
 column) explaining why they haven't dispatched. Logs land in
@@ -154,4 +201,12 @@ column) explaining why they haven't dispatched. Logs land in
 - User-facing strings mix English and Simplified Chinese (`hive-jobs` help is zh-CN);
   match the surrounding file. README has a `README_zh.md` counterpart.
 - `docs/architecture.md` documents the data flow and JSON schemas; update it when the
-  daemon/DB contract changes. The bundled Claude skill lives at `.claude/commands/hive.md`.
+  daemon/DB contract changes. The bundled Claude skill is `.claude/skills/hive/SKILL.md`
+  (short, always loaded when it triggers) + `references/{cli,troubleshooting,state}.md`
+  (read on demand). Keep SKILL.md under ~150 lines; put detail in references. Every
+  user-facing behaviour change must be reflected there — other agents learn hive from it.
+- **CLI output is sized for agent context.** `hive list` caps finished rows
+  (`LIST_LIMIT_DEFAULT`), `hive wait` prints a log *tail* (`--log-lines`, default 40),
+  `hive logs` tails logs over `LOG_FULL_MAX_LINES` (`-n` / `--full`). A 7-day history
+  was 250+ lines and a `hive wait` once dumped 2,500 lines into an agent's context.
+  Don't add unbounded output paths.
