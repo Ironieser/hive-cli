@@ -17,6 +17,12 @@ allocations, and out-of-band contention all collapsed into `idle`/`busy`
 | `probe_failed` | the `srun --overlap` probe could **not** run | none — empty / non-zero / no `---PS---` marker, after one retry | only after a live verify-probe |
 | `unknown` | legacy alias for a failed probe (pre-v0.4.0 DBs) | none | treated like `probe_failed` |
 
+`hive nodes` / `hive top` additionally render **CLAIM** (display-only, never written to
+the DB) when `queue.json` has a `running` task on a hold job whose GPU reading is
+`idle`/`warning`/`probe_failed`: the slot is taken (cold import, model load, or a poll
+older than the dispatch) even though the card isn't hot yet. Dispatch already excluded
+such jobs (`used_jobids`); only the table was misleading (feedback #4/#7/#17/#32).
+
 Extra fields a record may carry:
 
 - `gpu_idle_since` — epoch when the busy→idle grace timer started (drives `warning`).
@@ -56,6 +62,13 @@ Dispatchability is **decoupled from a single `status=="idle"` check**:
 3. **GPU-clean / free-mem gate**: skip any candidate with > `GPU_CLEAN_MB`=5000 MiB
    resident (zombie process or out-of-band co-tenant), or with less than the task's
    `need_mb` free. The task stays PENDING with a `pending_reason`.
+3a. **Candidates are shared across the pending list, and only NODE-level rejections
+   consume them.** `probe_unverifiable`, `node_busy_on_verify` and `gpu_dirty` describe
+   the node and remove it for every task this cycle; `insufficient_gpus`,
+   `waiting_for_mem` and `insufficient_walltime` describe *this task* and leave the node
+   for the next one. (Before v0.4.1 every rejection popped the node, so one unplaceable
+   head-of-queue task starved the whole queue with `no_dispatchable_node` — feedback
+   #24/#25/#26.) A node live-verified clean is cached for the rest of the cycle.
 3b. **Walltime gate** (only when the task carries `est_runtime_secs`): skip any node
    whose live remaining walltime (`time_left_secs` − DB age) is below
    `est_runtime_secs + WALLTIME_MARGIN_SECS`=600s, so a long task is never placed on a
@@ -76,7 +89,24 @@ Dispatchability is **decoupled from a single `status=="idle"` check**:
    but the new run starts fresh — so the loss is surfaced in the task log, in
    `hive wait` (`⚠`), and as `(re-disp xN)` in `hive list`. A task whose hold-job is
    **still alive** when its heartbeat dies is treated as a self-crash → `failed`, no
-   retry (so a buggy command can't loop forever).
+   retry (so a buggy command can't loop forever). "Alive" is always confirmed with a
+   bounded `squeue -j`, never read from the node DB alone — the DB can be up to a poll
+   cycle stale and still list a reclaimed job.
+8. **Cancel is executed by the scheduler.** `hive cancel` on a running task signals the
+   srun step directly only when the scheduler runs on the caller's host (the step is the
+   scheduler's child); otherwise it sets `cancel_requested` on the task and the scheduler
+   SIGTERMs the step in its next cycle, marks the task `cancelled`, and live-verifies the
+   node before reusing it. `hive list` shows `CANCELLING` in between.
+
+## Timestamps
+
+Every queue timestamp is stored twice: a human-readable naive-local `*_at` string
+(`submitted_at`, `started_at`, `dispatched_at`, `finished_at`) and a tz-independent epoch
+`*_ts` twin. **Arithmetic must use `*_ts`** (`_task_epoch` in `hive-sched`, `task_epoch`
+in `hive-queue`): the scheduler, the poller and each agent's shell may run under
+different `TZ` settings, so subtracting two `*_at` strings written by different
+processes was off by hours (feedback #31). Records written before v0.4.1 have no `*_ts`
+and fall back to parsing `*_at` in the reader's zone. `events.jsonl` lines carry `t`.
 
 ## `pending_reason` values
 

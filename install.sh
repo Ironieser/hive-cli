@@ -26,8 +26,23 @@ if [[ "${SCRIPT_DIR}" != "${INSTALL_DIR}" && -f "${SCRIPT_DIR}/hive" && -d "${SC
     # excludes .git and gitignored scratch so we don't clobber the install dir's repo.)
     info "Installing from local checkout: ${SCRIPT_DIR}"
     mkdir -p "$INSTALL_DIR"
+    # Feedback filed through the INSTALLED copy (older hive-feedback wrote to
+    # <install-dir>/feedback/inbox) must reach the checkout, not be wiped by the
+    # rsync --delete below. Rescue anything the checkout doesn't have yet.
+    if [[ -d "${INSTALL_DIR}/feedback/inbox" ]]; then
+        mkdir -p "${SCRIPT_DIR}/feedback/inbox"
+        _rescued=0
+        for _fb in "${INSTALL_DIR}"/feedback/inbox/*.md; do
+            [[ -f "$_fb" ]] || continue
+            if [[ ! -e "${SCRIPT_DIR}/feedback/inbox/$(basename "$_fb")" ]]; then
+                cp "$_fb" "${SCRIPT_DIR}/feedback/inbox/" && _rescued=$(( _rescued + 1 ))
+            fi
+        done
+        (( _rescued > 0 )) && warn "Rescued ${_rescued} feedback report(s) from ${INSTALL_DIR}/feedback/inbox into the checkout (run: hive feedback reindex)"
+    fi
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete --exclude '.git' --filter=':- .gitignore' \
+        rsync -a --delete --exclude '.git' --exclude 'feedback/inbox/' \
+              --filter=':- .gitignore' \
               "${SCRIPT_DIR}/" "${INSTALL_DIR}/"
     else
         # Fallback: copy tracked top-level entries (no .git)
@@ -42,6 +57,15 @@ elif [[ -d "${INSTALL_DIR}/.git" ]]; then
 else
     info "Cloning from ${REPO_URL}..."
     git clone "$REPO_URL" "$INSTALL_DIR"
+fi
+
+# Record where this install came from so `hive feedback` (run from the installed
+# copy by other agents) files reports into the checkout the maintainer triages.
+if [[ "${SCRIPT_DIR}" != "${INSTALL_DIR}" && -f "${SCRIPT_DIR}/hive" && -d "${SCRIPT_DIR}/libexec" ]]; then
+    printf '%s\n' "${SCRIPT_DIR}" > "${INSTALL_DIR}/.source_checkout"
+    info "Feedback from the installed copy will be filed into ${SCRIPT_DIR}/feedback"
+else
+    rm -f "${INSTALL_DIR}/.source_checkout"
 fi
 
 # ── 2. Make executables + ensure data files present ──────────────────────────

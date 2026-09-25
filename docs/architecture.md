@@ -123,8 +123,18 @@ node_monitor.pid         # daemon PID (validated with kill -0 before use)
 node_monitor.log         # daemon log, rolling 500 lines
 pool-logs/slurm-<id>.out # hold-job stdout (redirected by `hive pool add`)
 
+queue.json               # task queue (hive-queue / hive-sched, flock on queue.lock)
+# per task: id, cmd, workdir, name, state, priority, need_mb, gpus, est_runtime_secs,
+#   slurm_jobid, node, srun_pid, exit_code, pending_reason, requeue_count, log, …
+#   submitted_at/started_at/dispatched_at/finished_at   naive-local strings (display)
+#   submitted_ts/started_ts/dispatched_ts/finished_ts   epoch seconds — USE THESE for
+#                                                        arithmetic (processes run under
+#                                                        different TZs; see status_model.md)
+#   cancel_requested   set by `hive cancel` from a node other than the scheduler's; the
+#                      scheduler kills the srun step and marks the task cancelled.
+
 events.jsonl             # durable append-only task lifecycle log (hive_events.py)
-{"ts":"…","event":"submit",  "task":5,"name":"train","est_runtime_secs":7200}
+{"ts":"…","t":1780000000.0,"event":"submit",  "task":5,"name":"train","est_runtime_secs":7200}
 {"ts":"…","event":"dispatch","task":5,"node":"evc23","slurm_jobid":"584954","node_time_left_secs":45000}
 {"ts":"…","event":"finish",  "task":5,"state":"done","run_secs":4332,"queued_secs":192}
 {"ts":"…","event":"requeue", "task":6,"reason":"infra_failure","checkpoint_lost":true}
@@ -154,6 +164,7 @@ own copy — feedback C5):
 | "running?" | heartbeat fresh (any node) **or** same-host PID alive | same |
 | force action | — | `node_monitor.poll-request` file → immediate poll |
 | remote stop | SIGTERM same-host | `node_monitor.stop-request` file (honored each tick) |
+| cancel a running task | `cancel_requested` on the task → scheduler SIGTERMs its srun child (same-host CLI fast path: direct kill) | — |
 
 SIGUSR1 is kept only as a same-host fast path for forcing a re-poll; the request files
 are what make it work across nodes. Result: one queue, one scheduler, one poller for the

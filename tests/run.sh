@@ -28,7 +28,9 @@ jid=""; prev=""
 for a in "$@"; do [[ "$prev" == "-j" ]] && jid="$a"; prev="$a"; done
 if [[ -n "$jid" ]]; then case ",$jid," in *",700,"*|*",9001,"*) echo "$jid";; esac; exit 0; fi
 fmt=""; for a in "$@"; do [[ "$a" == "%i|"* ]] && fmt="$a"; done
-if [[ "$fmt" == *"%j" ]]; then echo "700|nodeX|gpu|1:00:00|20:00:00|hold"
+if [[ "$fmt" == *"%j" ]]; then
+  echo "700|nodeX|gpu|1:00:00|20:00:00|hold"
+  echo "801|login1|normal|1:00:00|15-00:00:00|cursor_ssh_proxy"   # must be filtered out
 else echo "700|nodeX|gpu|1:00:00|20:00:00"; fi
 EOF
 cat > "$TMP/bin/srun" <<'EOF'
@@ -79,6 +81,8 @@ assert len(gpu) == 2, gpu
 assert {g['index'] for g in gpu} == {0, 1}, gpu
 assert j['status'] == 'busy', j['status']
 print("  [OK] poller sees BOTH GPUs (idx 0,1); node busy because GPU1 is busy")
+assert '801' not in d['jobs'], sorted(d['jobs'])
+print("  [OK] hive-poll filters cursor_ssh_proxy like the daemon (was: no %j column, grep never matched)")
 PY
 smoke() { if "$@" >/dev/null 2>&1; then echo "  [OK] $label"; else echo "  [FAIL] $label"; fail=1; fi; }
 label="submit --est-runtime"; smoke "$PY" "$REPO/libexec/hive-queue" submit "true" --name reg --est-runtime 30m
@@ -88,9 +92,35 @@ label="prune --dry-run";      smoke "$PY" "$REPO/libexec/hive-queue" prune --dry
 "$PY" "$REPO/libexec/hive-queue" wait 1 --no-log --interval 0.2 --pending-timeout 1 >/dev/null 2>&1; rc=$?
 [[ $rc -eq 75 ]] && echo "  [OK] wait --pending-timeout -> exit 75" || { echo "  [FAIL] wait exit $rc (want 75)"; fail=1; }
 
+"$PY" "$REPO/libexec/hive-queue" list 2>"$TMP/bp.err" | head -1 >/dev/null
+if grep -q "Traceback" "$TMP/bp.err"; then echo "  [FAIL] list | head -> BrokenPipe traceback"; fail=1
+else echo "  [OK] list | head exits quietly (no BrokenPipe traceback)"; fi
+
 echo
 echo "=== python unit + integration ==="
 "$PY" "$REPO/tests/test_hive.py" "$REPO" || fail=1
+
+echo
+echo "=== hive nodes: CLAIMED display ==="
+# A hold job whose GPU reads idle but that has a RUNNING hive task in queue.json must
+# show CLAIM (not IDLE) with the task in the TASK column (feedback #4/#7/#17/#32).
+"$PY" - <<'PY'
+import json, os, time
+H = os.environ['HIVE_DIR']
+now = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
+json.dump({"updated": now, "jobs": {"700": {"node": "nodeX", "partition": "gpu", "job_elapsed": "1h",
+    "gpu": [{"index": 0, "util": 0, "mem_used": 0, "mem_total": 81920}], "processes": [],
+    "status": "idle", "gpu_idle_since": None, "time_left_secs": 72000, "polled_at": now}}},
+    open(H + "/node_monitor.json", "w"))
+json.dump({"version": 1, "next_id": 2, "tasks": {"1": {"id": 1, "name": "warm", "cmd": "python train.py",
+    "state": "running", "slurm_jobid": "700", "node": "nodeX", "submitted_at": now, "started_at": now,
+    "log": H + "/logs/task-1.log"}}}, open(H + "/queue.json", "w"))
+PY
+printf '%s\n%s\n' "$$" "$(hostname)" > "$HIVE_DIR/node_monitor.pid"   # "poller alive" -> no autostart
+_nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')   # strip ANSI colors
+if grep -q "CLAIM" <<<"$_nodes" && grep -q "#1 warm: python train.py" <<<"$_nodes" && grep -q "claimed: 1" <<<"$_nodes"; then
+  echo "  [OK] running task on a GPU-idle hold job shows CLAIM + task name + claimed count"
+else echo "  [FAIL] CLAIM display"; echo "$_nodes" | tail -8; fail=1; fi
 
 echo
 if [[ $fail -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi

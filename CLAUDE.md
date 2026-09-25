@@ -70,6 +70,10 @@ ran `hive nodes` spawned its own poller → N× `squeue`/`srun` step blowup (fee
 
 A third user-facing tool, **`libexec/hive-feedback`**, lets other agents file issues
 into `<repo>/feedback/inbox/` for the repo-owning agent to triage (see `feedback/`).
+Agents run the *installed* copy, so `install.sh` writes `<install-dir>/.source_checkout`
+and `hive-feedback` files into that checkout; the installer also rescues inbox entries
+left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`. Check
+`hive feedback list --status open` from the checkout at the start of a maintenance pass.
 
 ### Key invariants when editing
 
@@ -94,6 +98,21 @@ into `<repo>/feedback/inbox/` for the repo-owning agent to triage (see `feedback
   get a live verify-probe first; a starvation watchdog SIGUSR1s the poller after 3
   starved cycles; tasks that can't place get a `pending_reason`. Dispatch is crash-safe
   (claim saved before the `srun` launch; orphans without heartbeat/exit are requeued).
+- **Only node-level rejections consume a dispatch candidate.** `candidates` is shared by
+  every pending task in a cycle. `probe_unverifiable` / `node_busy_on_verify` /
+  `gpu_dirty` describe the node → pop it; `insufficient_gpus` / `waiting_for_mem` /
+  `insufficient_walltime` describe the task → leave it (`i += 1`). Popping on task-level
+  rejections let one unplaceable head-of-queue task starve the whole queue with
+  `no_dispatchable_node` (feedback #24–#26).
+- **Time arithmetic uses the `*_ts` epoch fields, never the `*_at` strings.** The
+  scheduler, poller and each agent's shell run under different `TZ`s; `*_at` is naive
+  local for display only. Write both on every state change (`now_iso()` + `now_ts()`);
+  read via `_task_epoch` / `task_epoch`, which fall back to `*_at` for pre-0.4.1 records.
+- **Never `os.kill` an srun PID from a node other than the scheduler's.** `hive cancel`
+  sets `cancel_requested` and the scheduler (owner of the srun child) kills the step; the
+  CLI only signals directly when `sched.pid`'s host is the local host.
+- **Everything user-controlled in the dispatch wrapper is `shlex.quote`d** (cmd in the
+  header, workdir, log/heartbeat paths). The command line itself runs verbatim.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

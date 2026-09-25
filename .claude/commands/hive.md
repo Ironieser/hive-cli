@@ -47,7 +47,8 @@ hive list --state running # filter by state
 hive stats [NAME]         # completed-run durations by name (min/median/P90/max)
 
 # Cancel / clean up
-hive cancel <ID>          # cancel pending or running task
+hive cancel <ID>          # cancel pending or running task (a running one shows CANCELLING
+                          # for up to ~30s while the scheduler stops its srun step)
 hive queue rm <ID>        # delete one done/failed/cancelled record
 hive prune --dry-run      # preview which old terminal tasks would be dropped
 hive prune --older-than 7d# trim old terminal tasks (history kept in events.jsonl)
@@ -232,7 +233,9 @@ hive submit "python eval.py --checkpoint results/v1/best.pt"
   --days N` widens/narrows the window; `hive list --all` shows everything; `hive list
   --state done|failed|...` filters. Use `hive prune` to actually drop old ones.
 
-States: `RUNNING` (green) → `PENDING` (yellow) → `DONE` (dim) → `FAILED` (red) → `CANCELLED` (dim)
+States: `RUNNING` (green) → `PENDING` (yellow) → `DONE` (dim) → `FAILED` (red) → `CANCELLED` (dim).
+A running task you cancelled from a different node than the scheduler's shows
+`CANCELLING` until the scheduler (which owns the srun step) stops it, within one 30s cycle.
 
 ELAPSED format: `<N>s` / `<N>m<SS>s` / `<N>h<MM>m`. Pending shows `wait:<time>` (since submitted).
 
@@ -262,6 +265,12 @@ The bottom of `hive list` also shows scheduler status: `scheduler: running  2 ru
 
 `hive nodes` has a **LEFT** column showing each node's remaining walltime (red when
 under an hour) so you can see how long a node can run before SLURM reclaims it.
+
+`hive nodes` STATUS values: `BUSY` (GPU in use), `CLAIM` (a hive task is RUNNING on this
+hold job but its GPU isn't hot yet — cold import / model load; the slot is taken), `IDLE`,
+`WARN` (was busy, GPU went quiet, grace window), `PFAIL` (probe failed), `CPU` (no GPU).
+Only `IDLE` (and, after a live verify, `WARN`/`PFAIL`) can receive new tasks, so
+`CLAIM`/`BUSY` rows plus `no_dispatchable_node` on pending tasks is normal, not a bug.
 
 ---
 
@@ -406,6 +415,9 @@ q  = json.load(open(f"{HIVE_DIR}/queue.json"))
 
 # status ∈ {idle, busy, cpu, warning, probe_failed}. A probe_failed node may carry
 # v["carried_forward"]=True (last-good state reused after a transient probe miss).
+# (`CLAIM` in `hive nodes` is display-only: an idle-looking job with a running task.)
+# Task timestamps: use the epoch fields (submitted_ts / started_ts / finished_ts) for
+# arithmetic; the *_at strings are naive local time of whichever process wrote them.
 idle  = [(jid, v["node"]) for jid, v in db["jobs"].items() if v["status"] == "idle"]
 run   = [t for t in q["tasks"].values() if t["state"] == "running"]
 pend  = [t for t in q["tasks"].values() if t["state"] == "pending"]
@@ -434,7 +446,8 @@ hive feedback list                                           # see what's filed
 
 Each submit auto-captures the hive version, a `queue.json` + `node_monitor.json`
 state snapshot, and the tail of any `--task` log, so the maintainer can reproduce.
-Reports live in `<repo>/feedback/inbox/`; see `feedback/TRIAGE.md`.
+Reports land in the maintainer's checkout (`hive feedback list` prints the dir); see
+`feedback/TRIAGE.md`.
 
 ---
 

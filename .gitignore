@@ -12,3 +12,6 @@ slurm-*.out
 
 # feedback runtime lock; inbox/*.md entries ARE tracked (see feedback/TRIAGE.md)
 feedback/.feedback.lock
+
+# written by install.sh into the INSTALL dir (points hive-feedback at the checkout)
+.source_checkout

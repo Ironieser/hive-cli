@@ -107,6 +107,14 @@ def now_iso():
     return datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
 
 
+def now_ts():
+    """Epoch seconds — the tz-independent twin of now_iso(). Written alongside every
+    `*_at` string as `*_ts`. Processes touching one queue run under different TZs
+    (scheduler, poller, each agent's shell), so arithmetic on the naive `*_at`
+    strings was off by hours (feedback #31: RUNNING ELAPSED inflated by 12h)."""
+    return time.time()
+
+
 def parse_iso(s):
     if not s:
         return None
@@ -114,6 +122,23 @@ def parse_iso(s):
         return datetime.strptime(s, '%Y-%m-%dT%H:%M:%S')
     except ValueError:
         return None
+
+
+def task_epoch(task, key):
+    """Epoch seconds for a task timestamp (`key` = submitted/started/finished).
+    Prefers `<key>_ts`; falls back to the legacy naive-local `<key>_at` string read
+    in this process's zone (old records — may be off if written under another TZ)."""
+    ts = task.get(f"{key}_ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return float(ts)
+    d = parse_iso(task.get(f"{key}_at"))
+    return d.timestamp() if d else None
+
+
+def task_finished_dt(task):
+    """Local datetime of a task's finish (tz-safe), for grouping/windowing."""
+    e = task_epoch(task, "finished")
+    return datetime.fromtimestamp(e) if e is not None else None
 
 
 def fmt_elapsed(seconds):
@@ -217,20 +242,21 @@ def history_estimate(name):
 
 
 def task_elapsed(task):
-    now = datetime.now()
+    now = time.time()
     state = task["state"]
     if state == "running":
-        t = parse_iso(task.get("started_at"))
-        return fmt_elapsed((now - t).total_seconds() if t else None)
-    elif state in ("done", "failed"):
-        t0 = parse_iso(task.get("started_at"))
-        t1 = parse_iso(task.get("finished_at"))
-        if t0 and t1:
-            return fmt_elapsed((t1 - t0).total_seconds())
+        t = task_epoch(task, "started")
+        return fmt_elapsed(max(0, now - t) if t is not None else None)
+    elif state in ("done", "failed", "cancelled"):
+        if isinstance(task.get("duration_secs"), int):
+            return fmt_elapsed(task["duration_secs"])
+        t0, t1 = task_epoch(task, "started"), task_epoch(task, "finished")
+        if t0 is not None and t1 is not None and t1 >= t0:
+            return fmt_elapsed(t1 - t0)
     elif state == "pending":
-        t = parse_iso(task.get("submitted_at"))
-        if t:
-            return f"wait:{fmt_elapsed((now - t).total_seconds())}"
+        t = task_epoch(task, "submitted")
+        if t is not None:
+            return f"wait:{fmt_elapsed(max(0, now - t))}"
     return "—"
 
 
@@ -503,6 +529,7 @@ def cmd_submit(args):
             "state":        "pending",
             "priority":     spec.get("priority", 0),
             "submitted_at": now_iso(),
+            "submitted_ts": now_ts(),
             "started_at":   None,
             "finished_at":  None,
             "slurm_jobid":  None,
@@ -579,7 +606,7 @@ def cmd_list(args):
         visible = []
         for t in all_tasks:
             if t["state"] in TERMINAL_STATES:
-                fin = parse_iso(t.get("finished_at"))
+                fin = task_finished_dt(t)
                 if fin is not None and fin < cutoff:
                     hidden_count += 1
                     continue
@@ -598,7 +625,7 @@ def cmd_list(args):
     terminal = [t for t in tasks if t["state"] in TERMINAL_STATES]
     active.sort(key=lambda t: -t["id"])
     # Terminal newest-first; group by finish date below.
-    terminal.sort(key=lambda t: (parse_iso(t.get("finished_at")) or datetime.min, t["id"]),
+    terminal.sort(key=lambda t: (task_finished_dt(t) or datetime.min, t["id"]),
                   reverse=True)
 
     # For PENDING tasks the NODE column is empty, so we reuse it to show *why* the
@@ -619,7 +646,7 @@ def cmd_list(args):
     id_w    = max(len(str(t["id"])) for t in tasks)
     name_w  = max(len(t.get("name") or "—") for t in tasks)
     name_w  = max(name_w, 6)
-    state_w = 9
+    state_w = 10   # fits CANCELLING
     node_w  = max((len(node_display(t)) for t in tasks), default=4)
     node_w  = max(node_w, 4)
     elap_w  = 10
@@ -645,7 +672,10 @@ def cmd_list(args):
         elapsed = task_elapsed(t)
         cmd     = truncate(t["cmd"].replace('\n', ' '), cmd_avail)
         color = STATE_COLORS.get(state, "")
-        state_str = f"{color}{state.upper():<{state_w}}{C_RESET}"
+        label = state.upper()
+        if state == "running" and t.get("cancel_requested"):
+            label, color = "CANCELLING", C_YELLOW   # scheduler will stop it within a cycle
+        state_str = f"{color}{label:<{state_w}}{C_RESET}"
         print(f"  {tid:>{id_w}}  {name:<{name_w}}  {state_str}  "
               f"{node:<{node_w}}  {elapsed:<{elap_w}}  {cmd}")
 
@@ -674,7 +704,7 @@ def cmd_list(args):
     # Terminal grouped by finish date (newest group first)
     prev_date = None
     for t in terminal:
-        fin = parse_iso(t.get("finished_at"))
+        fin = task_finished_dt(t)
         d = fin.date() if fin else None
         if d != prev_date:
             print(group_line(_date_label(d)))
@@ -705,16 +735,38 @@ def cmd_cancel(args):
             return
 
         if task["state"] == "running":
+            # The srun step is a child of hive-sched, which may run on ANOTHER node
+            # (state is on the shared FS). A host-local os.kill from here would then
+            # miss it — the task read "cancelled" while the step kept the GPU busy —
+            # or hit an unrelated process with the same PID number. So: signal it
+            # directly only when the scheduler is on this host; otherwise record the
+            # request and let the scheduler act on it within one cycle (~30s).
             srun_pid = task.get("srun_pid")
-            if srun_pid:
+            _, sched_host = read_sched_pid()
+            sched_local = (not sched_host) or sched_host == socket.gethostname()
+            sched_alive = is_sched_running()
+            if sched_local and srun_pid:
                 try:
                     os.kill(srun_pid, signal.SIGTERM)
                     print(f"Sent SIGTERM to srun PID {srun_pid}")
                 except (ProcessLookupError, PermissionError):
                     print(f"srun process {srun_pid} already gone")
+            elif sched_alive:
+                task["cancel_requested"] = now_iso()
+                save_queue(queue, lfd)
+                print(f"Task #{task_id} cancel requested — the scheduler on "
+                      f"{sched_host or '?'} owns the srun step and will stop it within "
+                      f"~30s (hive list shows CANCELLING until then).")
+                return
+            else:
+                print(f"{C_YELLOW}Warning:{C_RESET} scheduler is not running and its host "
+                      f"({sched_host or '?'}) is not this one — cannot signal srun PID "
+                      f"{srun_pid}. Marking cancelled; the step (if any) may linger on "
+                      f"{task.get('node') or '?'}.")
 
         task["state"]       = "cancelled"
         task["finished_at"] = now_iso()
+        task["finished_ts"] = now_ts()
         save_queue(queue, lfd)
         ev.record("cancel", task=task["id"], name=task.get("name") or None,
                   node=task.get("node"))
@@ -842,12 +894,12 @@ def cmd_wait(args):
     # scheduler recorded at finish; fall back to computing from timestamps.
     qs = task.get("queued_secs")
     if qs is None:
-        t0, t1 = parse_iso(task.get("submitted_at")), parse_iso(task.get("started_at"))
-        qs = int((t1 - t0).total_seconds()) if t0 and t1 else None
+        t0, t1 = task_epoch(task, "submitted"), task_epoch(task, "started")
+        qs = int(t1 - t0) if t0 is not None and t1 is not None and t1 >= t0 else None
     rs = task.get("duration_secs")
     if rs is None:
-        t0, t1 = parse_iso(task.get("started_at")), parse_iso(task.get("finished_at"))
-        rs = int((t1 - t0).total_seconds()) if t0 and t1 else None
+        t0, t1 = task_epoch(task, "started"), task_epoch(task, "finished")
+        rs = int(t1 - t0) if t0 is not None and t1 is not None and t1 >= t0 else None
     node = task.get("node") or "—"
     mark = {"done": f"{C_GREEN}✓", "failed": f"{C_RED}✗",
             "cancelled": f"{C_DIM}∅"}.get(state, "")
@@ -983,7 +1035,7 @@ def cmd_prune(args):
     now = datetime.now()
 
     def finished(t):
-        return parse_iso(t.get("finished_at"))
+        return task_finished_dt(t)
 
     with QueueLock() as lfd:
         queue = load_queue(lfd)
@@ -1140,6 +1192,13 @@ def build_parser():
 
 
 def main():
+    # `hive list | head` closed our stdout early → BrokenPipeError traceback that
+    # made a successful command look failed in agent logs (feedback #12). Restore the
+    # default SIGPIPE disposition so we exit quietly like any other CLI tool.
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError, OSError):
+        pass
     parser = build_parser()
     args = parser.parse_args()
 

@@ -408,6 +408,10 @@ class NodeTop:
                 qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
                 prefix = f"#{tid} {name}: " if name else f"#{tid}: "
                 task_cmd = prefix + qcmd
+                # Slot taken by a running hive task even if the GPU isn't busy yet
+                # (same rule as hive nodes — feedback #4/#7/#17/#32).
+                if status in ("IDLE", "WARNING", "PROBE_FAILED", "UNKNOWN"):
+                    status = "CLAIMED"
 
             task_cmd_short = short_cmd(task_cmd, task_w)
 
@@ -434,6 +438,8 @@ class NodeTop:
                 status_x = 2 + 10 + 1 + 8 + 1 + 10 + 1 + 10 + 1
                 if status == "BUSY":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY) | curses.A_BOLD)
+                elif status == "CLAIMED":
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY))
                 elif status == "WARNING":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_WARN) | curses.A_BOLD | curses.A_BLINK)
                 elif status == "CPU":

@@ -328,6 +328,13 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
         qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
         prefix = f"#{tid} {name}: " if name else f"#{tid}: "
         task_cmd = prefix + qcmd
+        # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
+        # busy: cold import / model load, or a poll older than the dispatch. The
+        # slot is taken regardless of GPU state — show it as CLAIMED instead of
+        # IDLE, which read as "scheduler ignores idle nodes" and cost several
+        # false-alarm debug sessions (feedback #4/#7/#17/#32).
+        if status in ("idle", "warning", "probe_failed", "unknown"):
+            status = "claimed"
 
     if len(task_cmd) > 55:
         task_cmd = task_cmd[:54] + "…"
@@ -410,7 +417,7 @@ show_table() {
     printf "${NC}\n"
     printf "  %s\n" "$SEP"
 
-    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0 n_warn=0
+    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0 n_warn=0 n_claim=0
 
     for row in "${rows[@]}"; do
         IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str left job_stale task_cmd <<< "$row"
@@ -419,6 +426,10 @@ show_table() {
         if [[ "$status" == "busy" ]]; then
             status_upper="BUSY";    status_color="${GREEN}${BOLD}"
             n_busy=$(( n_busy + 1 ))
+        elif [[ "$status" == "claimed" ]]; then
+            # queue.json says a hive task is running here; GPU not busy yet.
+            status_upper="CLAIM";   status_color="${GREEN}"
+            n_claim=$(( n_claim + 1 ))
         elif [[ "$status" == "cpu" ]]; then
             status_upper="CPU  ";   status_color="${CYAN}${BOLD}"
             n_cpu=$(( n_cpu + 1 ))
@@ -454,7 +465,7 @@ show_table() {
         (( job_stale )) && node_text="${node}!"
 
         local task_text task_color
-        if [[ "$status" == "busy" && -n "$task_cmd" ]]; then
+        if [[ ( "$status" == "busy" || "$status" == "claimed" ) && -n "$task_cmd" ]]; then
             task_text="$task_cmd"; task_color=""
         else
             task_text="—"; task_color="$DIM"
@@ -487,9 +498,10 @@ show_table() {
     local summary
     summary=$(printf "  ${BOLD}busy: ${GREEN}%d${NC}${BOLD}   cpu: ${CYAN}%d${NC}${BOLD}   idle: ${YELLOW}%d${NC}" \
         "$n_busy" "$n_cpu" "$n_idle")
+    (( n_claim > 0 )) && summary+="$(printf "${BOLD}   claimed: ${GREEN}%d${NC}" "$n_claim")"
     (( n_warn > 0 ))  && summary+="$(printf "${BOLD}   warn: ${YELLOW}%d${NC}" "$n_warn")"
     (( n_pfail > 0 )) && summary+="$(printf "${BOLD}   probe-fail: ${RED}%d${NC}" "$n_pfail")"
-    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_cpu + n_idle + n_pfail + n_warn ))")"
+    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_claim + n_cpu + n_idle + n_pfail + n_warn ))")"
     printf "%s\n" "$summary"
 }
 

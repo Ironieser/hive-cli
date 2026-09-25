@@ -310,6 +310,91 @@ _log = open(os.path.join(hs.LOG_DIR, "task-53.log")).read()
 chk("dispatch logs the task's actual GPU visibility",
     "=== gpus: requested 1" in _log and "hold job provided" in _log)
 
+print("== regression: head-of-queue task must not consume candidates (feedback #24-#26) ==")
+# A high-priority task that can't be placed anywhere (gpus=2 on a 1-GPU pool) used to
+# pop every candidate off the shared list, so the task behind it saw an empty list and
+# reported no_dispatchable_node while the pool sat idle.
+wdb({"700": node("a", 72000), "701": node("b", 72000)})
+wq({"60": dict(task(60, name="head", priority=10), gpus=2),
+    "61": task(61, name="behind")})
+hs.run_one_cycle()
+time.sleep(0.4)
+chk("unplaceable head task stays pending with its own reason",
+    rq()["60"]["state"] == "pending" and rq()["60"].get("pending_reason") == "insufficient_gpus")
+chk("task behind it still dispatches (candidates were returned)",
+    rq()["61"]["state"] in ("running", "done"))
+wdb({"700": node("a", 1200), "701": node("b", 1200)})            # 20 min left on both
+wq({"62": dict(task(62, name="long", priority=10), est_runtime_secs=36000),
+    "63": task(63, name="short")})
+hs.run_one_cycle()
+time.sleep(0.4)
+chk("walltime-blocked head task -> insufficient_walltime",
+    rq()["62"].get("pending_reason") == "insufficient_walltime")
+chk("estimate-less task behind it dispatches", rq()["63"]["state"] in ("running", "done"))
+# Node-level rejections still consume: a dirty node is skipped for everyone.
+dirty = node("d", 72000); dirty["gpu"][0]["mem_used"] = 20000
+wdb({"700": dirty})
+wq({"64": task(64, name="x"), "65": task(65, name="y")})
+hs.run_one_cycle()
+chk("dirty node rejected for every task (node-level)",
+    rq()["64"].get("pending_reason") == "gpu_dirty" and rq()["65"].get("pending_reason") in ("gpu_dirty", "no_dispatchable_node"))
+
+print("== regression: timestamps are tz-safe (feedback #31) ==")
+# The scheduler, poller and each agent's shell can run under different TZs. A task's
+# `*_at` strings written by different processes therefore can't be subtracted; the
+# `*_ts` epoch twins can. Simulate a started_at string 12h off from the epoch.
+_t = task(70, name="tz", state="running")
+_t["started_ts"] = time.time() - 90
+_t["started_at"] = (datetime.datetime.now() - datetime.timedelta(hours=12)).strftime('%Y-%m-%dT%H:%M:%S')
+chk("running ELAPSED uses started_ts, not the (foreign-TZ) started_at string",
+    hq.task_elapsed(_t) in ("1m30s", "1m31s"))
+_t["submitted_ts"] = _t["started_ts"] - 45
+chk("queued_secs from epoch fields", hs._queued_secs(_t) == 45)
+_t["finished_ts"] = _t["started_ts"] + 600
+chk("duration_secs from epoch fields", hs._duration_secs(_t) == 600)
+chk("legacy task without *_ts still parses its *_at strings",
+    hs._duration_secs({"started_at": "2026-06-07T10:00:00", "finished_at": "2026-06-07T10:10:00"}) == 600)
+chk("submit writes submitted_ts", isinstance(
+    (lambda: (hq.cmd_submit(__import__("argparse").Namespace(
+        cmd_or_file="true", workdir=None, priority=None, name="ts", need_mb=None, gpus=None,
+        est_runtime=None)), max(rq().values(), key=lambda t: t["id"]))[1].get("submitted_ts"))(), float))
+_ev = list(ev.iter_events())[-1]
+chk("events carry an epoch `t` field", isinstance(_ev.get("t"), float))
+
+print("== regression: cancel of a running task is executed by the scheduler (cross-node) ==")
+open(ev.EVENTS_FILE, "w").close()
+wdb({"700": node("c", 72000)})
+_c = task(80, name="cx", state="running", jid="700", node="c", st=loc(-30), dispatched=loc(-30))
+_c["started_ts"] = _c["dispatched_ts"] = time.time() - 30
+_c["cancel_requested"] = loc()
+open(os.path.join(hs.HEARTBEAT_DIR, "80"), "w").write("x")     # step "alive"
+wq({"80": _c})
+hs.run_one_cycle()
+t = rq()["80"]
+chk("cancel_requested -> cancelled by the scheduler cycle",
+    t["state"] == "cancelled" and "cancel_requested" not in t and isinstance(t.get("finished_ts"), float))
+chk("cancel event recorded", any(e["event"] == "cancel" and e["task"] == 80 for e in ev.iter_events()))
+os.remove(os.path.join(hs.HEARTBEAT_DIR, "80"))
+
+print("== regression: dispatch wrapper is shell-safe (task #9128) ==")
+_wd = os.path.join(hs.HIVE_DIR, "work dir")
+os.makedirs(_wd, exist_ok=True)
+_q = dict(task(90, name="quote"), cmd="echo 'a (b); c' && echo \"d $HOME\"", workdir=_wd)
+hs.dispatch_task(_q, "700", "g1")
+time.sleep(0.5)
+_log = open(os.path.join(hs.LOG_DIR, "task-90.log")).read()
+_xf = os.path.join(hs.HEARTBEAT_DIR, "90.exit")
+chk("header records the cmd verbatim (quotes, parens, semicolon)",
+    "=== cmd: echo 'a (b); c' && echo \"d $HOME\" ===" in _log)
+chk("workdir with a space is cd'd into and logged", f"=== workdir: {_wd} ===" in _log and "cannot cd" not in _log)
+chk("the command itself ran (exit 0)", os.path.exists(_xf) and open(_xf).read().strip() == "0")
+chk("its output landed in the log", "a (b); c" in _log.split("=== cmd:")[1])
+
+print("== regression: hold_job_alive confirms with squeue even when the node DB is stale ==")
+chk("jid listed in a stale DB but gone from squeue -> not alive",
+    hs.hold_job_alive("2001", {"2001": node("stale", 100)}) is False)
+chk("jid squeue reports running -> alive", hs.hold_job_alive("700", {}) is True)
+
 print("== integration: history_estimate from event log (P90) ==")
 open(ev.EVENTS_FILE, "w").close()
 for d in (600, 900, 1200):

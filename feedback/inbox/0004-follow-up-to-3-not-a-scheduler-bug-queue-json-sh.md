@@ -2,15 +2,15 @@
 id: 4
 title: follow-up to #3: NOT a scheduler bug — queue.json showed 8 running tasks holding
 severity: medium
-status: triaged
+status: done
 tags: []
 submitter: si384883
 hive_version: 0.3.2
 task_ids: []
 created: 2026-07-14T14:03:21
-updated: 2026-07-26T13:51:03
+updated: 2026-09-25T06:53:37
 source: cli
-triage_note: Display-only: hive nodes shows IDLE for a node whose hold-job has a running task (GPU-based status vs slot-based placement). Merged with #7; needs a CLAIMED/STARTING state + an all_slots_claimed pending_reason. Not the #10 deadlock.
+triage_note: Fixed: hive nodes/top show CLAIM (+task name, claimed: count) when queue.json has a running task on a GPU-idle hold job.
 ---
 
 follow-up to #3: NOT a scheduler bug — queue.json showed 8 running tasks holding all 8 hold-jobs (slot-based placement), while 'hive nodes' displayed all 8 as IDLE 0GB (GPU-utilization-based status). The IDLE display + 'no_dispatchable_node' reason combo is misleading when slots are claimed by running tasks that aren't using the GPU yet; suggest a distinct reason like 'all_slots_claimed' and/or showing claimed-but-gpu-idle in hive nodes.

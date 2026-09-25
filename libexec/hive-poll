@@ -256,11 +256,15 @@ main() {
         return
     fi
 
-    # Query running jobs (skip cursor_ssh_proxy). %L = TimeLeft (remaining walltime)
-    # so the scheduler can avoid placing long tasks on a soon-expiring node.
+    # Query running jobs. %L = TimeLeft (remaining walltime) so the scheduler can
+    # avoid placing long tasks on a soon-expiring node. %j (job name, last col) is
+    # only there so cursor_ssh_proxy can be filtered — the old format had no name
+    # column, so the grep never matched and `hive poll` wrote one more job than the
+    # daemon did. KEEP IN SYNC with hive-daemon.
     local squeue_out
-    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L" 2>/dev/null \
-        | grep -v cursor_ssh_proxy)
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%j" 2>/dev/null \
+        | grep -v cursor_ssh_proxy \
+        | sed 's/|[^|]*$//')   # strip job name column after filtering
 
     if [[ -z "$squeue_out" ]]; then
         log "No running jobs found."
@@ -277,7 +281,16 @@ main() {
     local job_ids=()
     declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT
 
-    while IFS='|' read -r jobid node partition elapsed timeleft; do
+    # Read squeue into an array first, and give each background probe </dev/null:
+    # a backgrounded srun inherits the while-read loop's stdin and can swallow the
+    # remaining lines (same guard as hive-daemon).
+    local -a squeue_lines=()
+    while IFS= read -r line; do
+        squeue_lines+=("$line")
+    done <<< "$squeue_out"
+
+    for line in "${squeue_lines[@]}"; do
+        IFS='|' read -r jobid node partition elapsed timeleft <<< "$line"
         jobid="${jobid// /}"; node="${node// /}"
         partition="${partition// /}"; elapsed="${elapsed// /}"; timeleft="${timeleft// /}"
         [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
@@ -287,8 +300,8 @@ main() {
         JOB_ELAPSED["$jobid"]="$elapsed"
         JOB_TIMELEFT["$jobid"]="$(slurm_time_to_secs "$timeleft")"
         log "Probing job $jobid on $node ($partition) elapsed=$elapsed left=${timeleft:-?} ..."
-        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" &
-    done <<< "$squeue_out"
+        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" </dev/null &
+    done
 
     # Wait up to 30s for all probes
     local waited=0
