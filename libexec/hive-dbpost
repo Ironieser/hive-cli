@@ -37,6 +37,7 @@ WARN_SECS     = 180     # grace before busy→idle becomes a warning
 CARRY_MAX_AGE = 1800    # carry a last-good state forward up to 30 min of failures
 
 GOOD_STATES = ("idle", "busy", "cpu", "warning")
+NODE_FAULT_DETAILS = ("gpu_unresponsive", "no_gpu_devices")
 
 
 def _age_seconds(iso):
@@ -77,7 +78,11 @@ def main():
         if status == "probe_failed":
             old_status = old_job.get("status")
             old_age    = _age_seconds(old_job.get("polled_at"))
-            if (old_status in GOOD_STATES
+            # A probe that RAN and found the GPU unanswering is a verdict about the
+            # node, not a transient miss — carrying the last-good state over it would
+            # show a wedged node as idle for another 30 min.
+            node_fault = job.get("probe_detail") in NODE_FAULT_DETAILS
+            if (not node_fault and old_status in GOOD_STATES
                     and old_age is not None and old_age <= CARRY_MAX_AGE):
                 job["gpu"]            = old_job.get("gpu", [])
                 job["processes"]      = old_job.get("processes", [])

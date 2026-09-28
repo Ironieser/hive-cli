@@ -2,15 +2,15 @@
 id: 27
 title: nodes 显示 WARN + 0G/80G + 2% 且 pending 报 no_dispatchable_node,但 srun --overlap 直接
 severity: medium
-status: triaged
+status: done
 tags: []
 submitter: si384883
 hive_version: 0.4.0
 task_ids: []
 created: 2026-08-02T19:27:19
-updated: 2026-09-25T06:53:38
+updated: 2026-09-28T15:36:34
 source: cli
-triage_note: Display: per-row age for WARN rows. Related CLAIM fix landed; stale marker (!) exists at >10min. Open enhancement.
+triage_note: hive nodes: a row read more than 10 min ago says how old its reading is in the TASK column ('[read 25m ago]'); GPU% / MEM cover all cards of the hold job.
 ---
 
 nodes 显示 WARN + 0G/80G + 2% 且 pending 报 no_dispatchable_node,但 srun --overlap 直接探测同一 hold job 得到 100% util / 23-44GB used——即节点其实在跑我自己的任务。poller 的 last-polled 状态过期(~10min)时 WARN 行与 BUSY 行难以区分,容易被误判成 feedback #25/#26 的 idle-node bug 而去做不必要的绕过。建议 WARN 行显式标注 stale-since 时间戳

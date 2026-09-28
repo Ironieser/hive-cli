@@ -4,15 +4,26 @@
 |---|---|---|
 | Task stuck PENDING | `hive list` → NODE column = `pending_reason` | see the table in [cli.md](cli.md#pending_reason-values) |
 | `no_dispatchable_node` but `hive nodes` shows IDLE | `hive queue daemon status` | `stopped` → `hive queue daemon start`; `running` → nodes are being live-verified and rejected (look at the reason on the next cycle) |
+| `pool_empty` | `hive nodes` shows no rows | every hold job expired; `hive pool add` — nothing dispatches until then |
+| `gpu_unresponsive` / `no_gpu_devices` | `hive health` | the node's GPU driver is wedged (SLURM keeps handing such GPUs out because nobody keeps them). hive quarantines the node after 2 strikes; its hold job still uses allocation → `hive pool release JOBID`, then `hive pool add` |
+| Queue stuck and the reason is unclear | `grep "not dispatchable" ~/.hive/sched.log \| tail` | the scheduler logs why it passed over each hold job |
 | `insufficient_walltime` never clears | `hive nodes` LEFT column | `hive pool add --time …` or lower `--est-runtime`; this reason does not resolve by itself |
 | `waiting_for_mem` | `hive nodes` MEM column | lower `--need-mb` or add a bigger card |
 | `gpu_dirty` / `node_busy_on_verify` | `hive nodes` MEM | a zombie or co-tenant holds the card; wait or add nodes |
 | Task FAILED in < 1 min | `hive logs ID -n 40` | CUDA-init errors → node problem: `hive health` (probably already quarantined); `hive health report NODE` if not. Otherwise it is your command. |
 | Task FAILED, log ends abruptly, no footer | top of log / `hive list` | `srun` error at the top = hold job died; hive requeues those (`infra_failure_redispatch`) |
 | `hive wait` prints ⚠ re-dispatched | — | node reclaimed mid-run; the new run started from scratch — make the command resume from its checkpoint |
-| `hive list` shows RUNNING for hours but the log has a `finished` footer | `hive queue daemon status` | scheduler died before reaping; `hive queue daemon start` reaps it on the next cycle |
-| Node shows `PFAIL` | `hive poll` | probe couldn't run (srun contention / node wedged / hold job expired); hive still verifies before dispatch |
+| `hive list` shows RUNNING for hours but the log has a `finished` footer | `hive queue daemon status` | scheduler died before reaping. `hive list` / `hive wait` restart it by themselves when tasks are active; otherwise `hive queue daemon start` |
+| Node shows `PFAIL` | `hive poll` | probe failed; `probe_detail` in `node_monitor.json` says why (`srun_failed` = couldn't run, `gpu_unresponsive` / `no_gpu_devices` = broken node). hive still verifies before dispatch |
+| Task stays `CANCELLING` | `hive queue daemon status` | the scheduler stops running tasks (≤ 30 s). If it is alive but not acting: `hive cancel --force ID` marks the task cancelled now; from another host the step itself is only stopped once that scheduler acts |
+| `hive queue daemon stop` says the scheduler is on another host | — | it leaves a stop request the scheduler honours within seconds; if it does not, log in to that host and stop it there |
+| `pool_empty` although autoscale is on | `hive pool autoscale` | it says why it is not submitting (max_nodes reached by unusable hold jobs, daily limit, `until` passed) |
+| `waiting_for_gang` never clears | `hive nodes` | the pool has fewer free NODES than `--nodes` asks for; two hold jobs on one node are one node |
+| Task `failed` with exit 126, or `cancelled` with `gang_member_failed` | `hive list --state failed` | another member of its multi-node task failed; that member's log says why |
+| `hive nodes` row says `[unreadable record: …]` | `hive poll` | the node DB holds something the table cannot read for that hold job; the other rows are right |
+| Node shows `SLOW` | `hive health` | works, but CUDA needs minutes to initialise. Takes long tasks (`--est-runtime` ≥ 1h) or `--allow-slow`, after every faster node. A task there is silent for minutes at start-up — that is not a hang (the log header says so). Becomes normal again after 2 checks at normal speed |
 | Node shows `QUAR` | `hive health` | quarantined; auto-released after 2 healthy probes, or `hive health clear NODE` |
+| Quarantined node with no hold job on it | `hive health` RESULT column | the health monitor takes over: released when SLURM reports the node **rebooted** since the quarantine, or when a `hive_canary` job (10 min, 1 GPU, every 6 h, pinned to the node) probes healthy twice. `canary_pending` = waiting in the SLURM queue. Don't cancel `hive_canary` jobs |
 | Node shows `CLAIM` with 0 % GPU | — | normal: a task is in cold import / model load; the slot is taken |
 | `hive nodes` looks stale (`node!`, old "last polled") | `hive poll` | forces a poll; dispatch never trusts the table alone |
 | `hive submit` errors "cmd must not contain srun" | — | drop the `srun` prefix; hive dispatches itself |

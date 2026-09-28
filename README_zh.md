@@ -42,6 +42,8 @@ hive pool add                           # sbatch 一个新占卡作业（默认 
 hive pool add highgpu                   # 使用指定 preset
 hive pool add ~/my.slurm                # 直接传 slurm 脚本路径
 hive pool add --count 3 --time 12:00:00 # 同时提交 3 个，覆盖时长
+hive pool add --exclude evc22,evc[40-43] # 不落在这些节点上（已隔离的节点会自动排除）
+hive pool autoscale                      # 自动补充的当前设置，以及它现在会做什么
 hive pool release 584954                # scancel 指定占卡作业
 hive pool release --idle                # 自动 scancel 所有空闲节点
 hive pool config                        # 查看 preset 配置，验证脚本路径
@@ -101,8 +103,7 @@ hive prune --older-than 7d                              # 清理旧的终态任�
 hive queue daemon start|stop|status|logs               # 管理调度器（submit 会自动拉起）
 ```
 
-`hive wait` 退出码（供 agent 判断）：**0** 完成 · **1** 失败 · **75** 一直没派发
-（`--pending-timeout`）· **130** 取消。
+`hive wait` 以任务自身的退出码退出（**0** 表示成功），保留值见下方表格。
 
 **`.hive` 脚本格式**（类比 SLURM 的 `#SBATCH` 指令）：
 
@@ -160,6 +161,69 @@ hive stats train                                              # 查看历史（c
 
 任务**自身命令**崩溃(节点还活着)则标记 `failed`,**不**重试。
 
+### 流水线、参数扫描、多节点、资源限制
+
+```bash
+ID=$(hive submit -q --name train "python train.py")           # -q 只输出任务 ID
+hive submit --after $ID "python eval.py"                       # train 成功结束后才运行
+hive submit --after-any $ID "bash cleanup.sh"                  # 不论成败都运行
+hive submit --array 0-9%4 'python train.py --seed $HIVE_ARRAY_INDEX'   # 参数扫描，同时最多 4 个
+hive submit --after a120 "python report.py"                    # 等整个数组 120 跑完
+hive wait --array 120        |  hive wait 3 4 5                # 每个任务一行，不打印日志
+hive cancel --array 120      |  hive cancel --force 3          # --force：调度器无响应时使用
+hive submit --nodes 4 'python ddp.py --rank $HIVE_GANG_RANK'   # 4 个节点，同时启动
+hive submit --nodes 2 --same-node 'python ddp.py …'            # 2 个 hold job，可以在同一节点上
+hive submit --timeout 2h --notify 'curl -d "$HIVE_TASK_NAME $HIVE_TASK_STATE" URL' "python x.py"
+hive submit --gpus 2 --cpus 4 --mem 32000 "python x.py"        # GPU 数、CPU 数、内存 (MiB)
+hive submit --begin 08:00 --warn-before 10m "python x.py"      # 8 点后才启动；节点到期前 10 分钟发 SIGUSR1
+hive submit --priority 9 --preempt "python urgent.py"          # 可以挤掉 --preemptible 的任务
+hive submit --preemptible --est-runtime 12h "python long.py"   # 同意被挤掉并重新排队
+hive submit --max-running 3 …   (或 export HIVE_MAX_RUNNING=3) # 该 owner 最多同时运行 3 个任务
+hive submit --exclude evc22 --no-slow "python x.py"            # 不上这些节点 / 不上慢节点
+hive hold 3 | hive unhold 3 | hive priority 10 3               # 调整尚未启动的任务
+```
+
+| `hive wait ID` 的退出码 | 含义 |
+|---|---|
+| 命令自身的退出码 | `0` = 成功 |
+| `124` | 超过 `--timeout` 被终止 |
+| `125` | 未运行：它 `--after` 的任务没有成功结束 |
+| `126` | 未运行：所属多节点任务的另一个成员失败（已在运行的成员以 `cancelled` 结束）|
+| `75` / `130` / `2` | 一直未派发（`--pending-timeout`）/ 被取消 / 任务不存在 |
+
+拥有 N 张卡的 hold job 最多同时运行 N 个单卡任务，每个任务只能看到自己的卡。
+`hive stats` 按任务名显示运行时长和实测的显存峰值，`--est-runtime auto` 与
+`--need-mb auto` 的取值来自这里。
+
+### 节点健康
+
+hive 自己维护一份坏节点名单（`hive health`）。每次派发前都会读取 GPU 状态并创建一个
+CUDA context，两步各有时限：
+
+| 节点状态 | 观察到的现象 | hive 的处理 |
+|---|---|---|
+| `QUAR` | GPU 无响应、列不出设备，或无法创建 CUDA context | 不派发；每 10 分钟重新探测；新的 hold job 会避开该节点 |
+| `SLOW` | 能创建 context，但需要几分钟 | 只接 `--est-runtime` ≥ 1h 或带 `--allow-slow` 的任务，且排在所有快节点之后 |
+| 正常 | — | — |
+
+节点上没有 hold job 时，靠两种方式恢复：SLURM 报告该节点已重启，或者一个小的
+`hive_canary` 作业在上面探测通过。
+
+### 节点池自动补充
+
+```json
+"autoscale": {"enabled": true, "preset": "highgpu", "min_nodes": 6, "max_nodes": 8,
+              "time": "7-00:00:00", "renew_before": "12h", "until": "2026-12-31"}
+```
+
+写入 `~/.hive/pool_config.json` 后，调度器会自动维持 `min_nodes` 个可用的 hold job，并在
+它们到期前提交替换的。它会自行提交作业，因此有多重上限：总数不超过 `max_nodes`，每次
+最多 2 个，每 10 分钟决策一次，每天最多 12 个，`until`（必填）之后停止。它通过查询
+SLURM 来统计 hold job，查询不到时什么都不做。加上 `"active_within": "48h"` 后，只有在这段时间内
+有任务提交（或仍有任务在排队、运行）时才会补充。`hive pool autoscale` 显示它当前会做什么。
+其他配置项：`"prefer_partitions"`、`"fair_share"`、`"exclude"`、`"auto_prune_days"`
+（默认 14）、`"log_keep_days"`。
+
 ### 保持队列整洁
 
 ```bash
@@ -193,6 +257,8 @@ hive feedback list                                       # 查看已提交的反
 
 每次提交会自动附带 hive 版本与队列/节点状态快照。反馈存入 `feedback/inbox/`，
 参见 [`feedback/TRIAGE.md`](feedback/TRIAGE.md)。
+
+调度器会自动清理结束超过 `auto_prune_days` 天的任务（默认 14 天）。
 
 ## 文件说明
 

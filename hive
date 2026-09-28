@@ -85,7 +85,7 @@ case "$subcommand" in
         exec "$py" "${HIVE_LIBEXEC}/hive-health" "$@"
         ;;
     # ── Queue shortcuts (hive submit → hive queue submit, etc.) ──────────────
-    submit|wait|list|ls|cancel|logs|rm|stats|prune)
+    submit|wait|list|ls|cancel|logs|rm|stats|prune|hold|unhold|priority)
         py="$(_resolve_python)"
         exec "$py" "${HIVE_LIBEXEC}/hive-queue" "$subcommand" "$@"
         ;;
@@ -116,16 +116,25 @@ case "$subcommand" in
     daemon   start|stop|restart|status|logs
     poll                      Trigger immediate node poll
     submit   "cmd"|job.hive   Submit to task queue (shortcut for queue submit)
+                              (--exclude NODES → never run on those nodes)
+                              (--timeout 2h → killed after that run time; --notify CMD)
+                              (--after ID → pipeline; --array 0-9%4 → sweep)
+                              (--nodes N → multi-node; --preempt / --preemptible)
+                              (--begin WHEN; --cpus N --mem MiB; --warn-before 10m)
+                              all flags: hive submit --help
                               (--est-runtime 2h|auto → walltime-aware scheduling)
-    wait     ID               Block until task done, print log, exit $?
+    wait     ID [ID…]|--array A  Block until done. One ID: log tail + its exit code.
+                              Several / an array: one line each, exit 1 if any failed
     list                      Show task queue (shortcut for queue list)
     logs     ID [-f]          Show / follow task log
-    cancel   ID               Cancel pending or running task
+    cancel   ID|--array A     Cancel pending or running task (the scheduler stops it, ≤30s)
+    hold     ID…|--array A    Keep pending task(s) out of dispatch; `unhold` to let go
+    priority N ID…|--array A  Change the priority of pending task(s)
     stats    [NAME]           Completed-task runtime history (for --est-runtime)
     prune    [--older-than D] Drop old terminal tasks from the queue (history kept)
     queue    submit|list|wait|cancel|logs|rm|stats|prune|daemon
                               Full task queue interface
-    pool     add|release|init|config
+    pool     add|release|init|config|autoscale
                               Manage node pool (sbatch hold jobs / scancel)
     feedback "text" | submit|list|show|triage
                               File / manage feedback for the hive-cli repo

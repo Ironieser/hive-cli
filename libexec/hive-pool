@@ -2,7 +2,9 @@
 """hive-pool — manage the pre-allocated SLURM node pool
 
 Commands:
-  hive pool add [PRESET] [--count N]   Submit new hold job(s)
+  hive pool add [PRESET] [--count N] [--exclude NODES]
+                                       Submit new hold job(s); quarantined nodes
+                                       (hive health) are excluded automatically
   hive pool release JOBID              Cancel a hold job (scancel)
   hive pool release --idle             Cancel all currently IDLE hold jobs
   hive pool init                       Create ~/.hive/pool_config.json from example
@@ -12,8 +14,13 @@ Commands:
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import hive_health as hh   # quarantined nodes are kept out of new hold jobs
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HIVE_DIR     = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
@@ -76,6 +83,61 @@ def load_idle_jobids():
         return []
 
 
+# ── Node exclusion ────────────────────────────────────────────────────────────
+
+def script_excludes(script):
+    """Node lists from the script's own `#SBATCH --exclude=` / `-x` lines. An
+    `--exclude` on the sbatch command line REPLACES those rather than adding to them,
+    so they have to be carried over by hand."""
+    found = []
+    try:
+        with open(script) as f:
+            lines = f.readlines()
+    except OSError:
+        return found
+    for line in lines:
+        m = re.match(r"^\s*#SBATCH\s+(.*)$", line)
+        if not m:
+            continue
+        # One #SBATCH line may carry several options, quoted or not:
+        #   #SBATCH -p gpu -x evc7      #SBATCH --partition=gpu --exclude="evc8,evc9"
+        try:
+            words = shlex.split(m.group(1), comments=True)
+        except ValueError:
+            words = m.group(1).split()
+        k = 0
+        while k < len(words):
+            w = words[k]
+            if w.startswith("--exclude="):
+                found.append(w[len("--exclude="):])
+            elif w in ("--exclude", "-x") and k + 1 < len(words):
+                found.append(words[k + 1])
+                k += 1
+            elif re.fullmatch(r"-x\S+", w) and not w.startswith("--"):
+                found.append(w[2:])                  # -xevc7
+            k += 1
+    return [x for x in found if x]
+
+
+def build_exclude(script, cli, config_lists, auto):
+    """(merged --exclude value or None, quarantined nodes that were added)."""
+    flat = []
+    for x in config_lists:                      # a string, or a JSON list of them
+        flat += [str(y) for y in x] if isinstance(x, (list, tuple)) else ([str(x)] if x else [])
+    parts = script_excludes(script) + [x for x in flat if x] + ([cli] if cli else [])
+    known = set()
+    for p in parts:
+        try:
+            known.update(hh.expand_nodes(p))
+        except ValueError as e:
+            print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
+            sys.exit(2)
+    added = sorted(n for n in hh.quarantined_nodes() - known
+                   if hh.valid_node_name(n)) if auto else []
+    parts += added
+    return (",".join(parts) or None), added
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_add(args):
@@ -88,11 +150,21 @@ def cmd_add(args):
         script = os.path.expanduser(target)
         preset_name = os.path.basename(script)
         desc = ""
+        # The standing "exclude" of pool_config.json applies to a script path too.
+        config_excl = []
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE) as f:
+                    config_excl = [json.load(f).get("exclude")]
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
     else:
         config = load_config()
         preset_name, preset = get_preset(config, target)
         script = os.path.expanduser(preset.get("script", ""))
         desc = preset.get("description", "")
+        # Standing exclusions: "exclude" at the top of pool_config.json and/or in a preset.
+        config_excl = [config.get("exclude"), preset.get("exclude")]
         if not script:
             print(f"Preset '{preset_name}' has no 'script' field.", file=sys.stderr)
             sys.exit(1)
@@ -111,12 +183,20 @@ def cmd_add(args):
     out_pat = os.path.join(POOL_LOG_DIR, "slurm-%j.out")
     err_pat = os.path.join(POOL_LOG_DIR, "slurm-%j.err")
 
+    # A hold job that lands on a broken node is worse than none: it uses allocation and
+    # never runs a task. SLURM favours exactly those nodes — their GPUs are always free —
+    # so every node hive has quarantined is excluded unless --no-auto-exclude is given.
+    exclude, auto_added = build_exclude(script, args.exclude, config_excl,
+                                        not args.no_auto_exclude)
+
     def build_cmd(extra=None):
         cmd = ["sbatch"]
         if extra:
             cmd += extra
         if time_arg:
             cmd += ["--time", time_arg]
+        if exclude and (args.exclude or auto_added or any(config_excl)):
+            cmd += [f"--exclude={exclude}"]
         cmd += ["--output", out_pat, "--error", err_pat, script]
         return cmd
 
@@ -135,11 +215,25 @@ def cmd_add(args):
     time_str = f"  time={time_arg}" if time_arg else ""
     print(f"Submitting {count}× hold job  [{preset_name}]  {desc}{time_str}")
     print(f"  {C_DIM}logs → {POOL_LOG_DIR}/slurm-<jobid>.out{C_RESET}")
+    if auto_added:
+        print(f"  {C_DIM}excluding quarantined node(s): {', '.join(auto_added)}  "
+              f"(hive health; --no-auto-exclude to skip){C_RESET}")
+    requested = [str(x) for x in config_excl + [args.exclude] if x]
+    if requested:
+        print(f"  {C_DIM}excluding: {', '.join(requested)}{C_RESET}")
 
     for _ in range(count):
         result = subprocess.run(build_cmd(), capture_output=True, text=True)
         if result.returncode == 0:
             print(f"  {C_GREEN}✓{C_RESET} {result.stdout.strip()}")
+            # Remember which exclusions are hive's, so they can be lifted when the
+            # node leaves quarantine while this job still waits in the queue.
+            m = re.search(r"(\d+)\s*$", result.stdout.strip())
+            if m and auto_added:
+                try:
+                    hh.track_excludes(m.group(1), auto_added)
+                except OSError:
+                    pass
         else:
             print(f"  {C_RED}✗{C_RESET} {result.stderr.strip()}", file=sys.stderr)
 
@@ -231,6 +325,57 @@ def cmd_init(args):
     print(f"  hive pool add       # submit one hold job")
 
 
+def cmd_autoscale(args):
+    """Show what pool autoscale is set to and what the scheduler would do with it now —
+    through the same code the scheduler runs. It is switched on and off in
+    pool_config.json ("autoscale": {"enabled": …})."""
+    import hive_autoscale as hauto
+    cfg, off = hauto.check_settings()
+    if cfg is None:
+        print(f"autoscale: {C_DIM}off{C_RESET} — {off}")
+        print('  to switch it on, add to ' + CONFIG_FILE + ':')
+        print('    "autoscale": {"enabled": true, "preset": "highgpu", "min_nodes": 6, "max_nodes": 8,')
+        print('                  "time": "7-00:00:00", "renew_before": "12h", "until": "2026-12-31"}')
+        return
+    print(f"autoscale: {C_GREEN}on{C_RESET}  preset {cfg['preset']}, keep {cfg['min_nodes']} usable, "
+          f"at most {cfg['max_nodes']} hold jobs, each {cfg['time'] or 'as long as the script says'}, "
+          f"replaced {cfg['renew_before'] / 3600:g}h before it expires, until {cfg['until']}"
+          + (f", only while a task was submitted in the last {cfg['active_within'] / 3600:g}h"
+             if cfg.get("active_within") else ""))
+    health = hh.load()
+    unusable = hh.quarantined_nodes(health) | hh.slow_nodes(health)
+    state = hauto.load_state()
+    if state is None:
+        print(f"  {C_RED}{hauto.STATE_FILE} cannot be read — the scheduler submits nothing until "
+              f"it is repaired or removed{C_RESET}")
+        return
+    jobs = hauto.observe()
+    n, why = hauto.plan(cfg, jobs, unusable, state.get("submitted") or [])
+    if cfg.get("active_within"):
+        import time as _t2
+        seen = hauto.last_submit()
+        idle = seen is None or _t2.time() - seen > cfg["active_within"]
+        print("  last task submitted: "
+              + ("never" if seen is None else f"{(_t2.time() - seen) / 3600:.1f}h ago")
+              + (f"  → {C_YELLOW}idle, nothing is submitted{C_RESET}" if idle else ""))
+        if idle:
+            n, why = 0, "hive has not been used lately"
+    if jobs is not None:
+        run_ = [j for j in jobs if j["state"] == "RUNNING"]
+        print(f"  hold jobs now: {len(run_)} running "
+              f"({sum(1 for j in run_ if j['node'] in unusable)} on a quarantined or slow node), "
+              f"{sum(1 for j in jobs if j['state'] == 'PENDING')} queued")
+    print(f"  at its next decision the scheduler would submit {n} — {why}")
+    import time as _t
+    due = hauto.EVERY_SECS - (_t.time() - float(state.get("last_run") or 0))
+    print(f"  next decision: {'now' if due <= 0 else f'in about {int(due)}s'} "
+          f"(one every {hauto.EVERY_SECS // 60} min, while the scheduler runs)")
+    day = [t for t in (state.get("submitted") or []) if _t.time() - t < 86400]
+    print(f"  submitted by autoscale in the last 24 h: {len(day)} (limit {hauto.MAX_PER_DAY})")
+    if state.get("last_decision"):
+        print(f"  last decision: {state['last_decision']}")
+
+
 def cmd_config(args):
     config = load_config()
     presets = config.get("presets", {})
@@ -291,6 +436,12 @@ def build_parser():
                     help="Number of hold jobs to submit (default: 1)")
     pa.add_argument("--time", "-t", default=None, metavar="TIME",
                     help="Override --time in the sbatch script, e.g. 1-00:00:00, 12:00:00, 3d")
+    pa.add_argument("--exclude", "-x", default=None, metavar="NODES",
+                    help="Nodes the hold job must not land on (SLURM list: evc22,evc[40-43]). "
+                         "Added to the script's own #SBATCH --exclude and to the 'exclude' "
+                         "key of pool_config.json")
+    pa.add_argument("--no-auto-exclude", action="store_true",
+                    help="Do not exclude the nodes hive has quarantined (see `hive health`)")
     pa.add_argument("--no-validate", action="store_true",
                     help="Skip the 'sbatch --test-only' pre-flight check")
 
@@ -304,6 +455,9 @@ def build_parser():
 
     # init
     sub.add_parser("init", help=f"Create {CONFIG_FILE} from example")
+
+    # autoscale
+    sub.add_parser("autoscale", help="Show the autoscale setting and what it would do now")
 
     # config
     pcfg = sub.add_parser("config", help="Show current preset configuration")
@@ -325,6 +479,8 @@ def main():
         cmd_init(args)
     elif args.command == "config":
         cmd_config(args)
+    elif args.command == "autoscale":
+        cmd_autoscale(args)
 
 
 if __name__ == "__main__":

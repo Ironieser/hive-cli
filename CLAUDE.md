@@ -87,6 +87,15 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   probing filters PIDs by `/proc/<pid>/cgroup` containing `/job_<jobid>/`. The probe
   body is duplicated in `hive-daemon` and `hive-poll` — keep them in sync; the
   *post-processing* (warning timer + carry-forward) is shared via `hive-dbpost`.
+- **A probe that ran and got no answer from the GPU is a verdict, not a miss.** `nvidia-smi`
+  runs in the background under its own deadline (`gpu_query_shell` in `hive_health.py`,
+  duplicated in the two bash pollers) because a wedged driver blocks it in uninterruptible
+  sleep where `timeout` can't end it. The deadline is 60 s, not less: healthy normal-
+  partition nodes answer in up to ~25 s, wedged ones took 116 s+. `gpu_unresponsive` / `no_gpu_devices` — only when
+  SLURM granted a GPU (`CUDA_VISIBLE_DEVICES` set), so a CPU-only hold job is never at
+  fault — strike the node and are never carried forward; an srun that couldn't run stays
+  `probe_unverifiable`, never strikes, and backs off per hold job. Without this, three
+  hold jobs sat 24 h with pending tasks (2026-09-26) while every probe timed out.
 - `hive-dbpost` carries a `probe_failed` job forward to its last-good state (flagged
   `carried_forward`) for up to 30 min, so one transient probe miss doesn't drop a node.
 - A `busy→idle` transition first becomes `warning` (held in `gpu_idle_since`) before
@@ -125,6 +134,125 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   node. The scheduler re-probes quarantined nodes and releases them itself; don't add a
   static blacklist. Offline tests stub the probe via `HIVE_CUDA_PROBE_CMD` (the mock
   cluster has no GPU) and the live reading via `MOCK_LIVE_GPU`.
+- **New hold jobs stay off quarantined nodes.** `hive pool add` passes `--exclude` with
+  every node on the health list (SLURM favours broken nodes — their GPUs are always
+  free). A command-line `--exclude` *replaces* the script's `#SBATCH --exclude`, so
+  `build_exclude()` re-reads the script's list and merges it; never pass a bare one.
+  Task-level `exclude_nodes` (`hive submit --exclude`) is a task-level rejection
+  (`node_excluded`, `i += 1`).
+- **A quarantined node must have a way back that needs no hold job.** Since `pool add`
+  excludes it, the through-a-hold-job check never runs there again. The scheduler's
+  health step then calls `hh.check_without_hold_job`: release if `scontrol` reports a
+  `BootTime` after the quarantine, else a `hive_canary` batch job pinned to the node
+  (two probes; one outstanding per node; every `CANARY_INTERVAL_SECS`; opt out with
+  `"health_canary": false` in `pool_config.json`). The pollers filter `hive_canary` out
+  by job name, or a canary would show up as a hold job. The offline suite mocks
+  `scontrol`/`sbatch`/`scancel` — keep it that way, the real ones are on `PATH`.
+- **`--timeout` is enforced, `--est-runtime` is a hint.** Over `timeout_secs` of run time
+  the scheduler SIGTERMs the step: `failed`, exit 124, `fail_reason: timeout`. It is the
+  command's doing — never retried, never a strike against the node.
+- **The notify hook runs in the scheduler, detached, after the outcome is recorded.**
+  `notify(task, event)` is called on every terminal transition and on requeue; it must
+  stay non-blocking (it runs inside the `queue.lock` cycle) and must never be able to
+  change a task's state. Pending tasks cancelled by the CLI do not fire it.
+- **GPU usage is sampled by the wrapper, reduced by the scheduler.** The dispatch wrapper
+  keeps `heartbeat/<id>.usage` (`peak_mb max_util sum_util samples`, first `gpus` cards
+  only); `collect_usage()` moves it onto the task at every terminal transition and the
+  `finish` event carries it — that event is the history behind `hive stats` and
+  `--need-mb auto`. Read `gpus` through `task_gpus()`: `task.get("gpus") or DEFAULT`
+  turned an explicit 0 into 1.
+- **Health probes of quarantined nodes run in background threads** (`start_health_probe`
+  / `finished_health_probes`); the cycle starts one and applies its verdict on a later
+  cycle. They target nodes known to be slow or wedged (60–150 s each) and, run inline,
+  delayed dispatch by minutes on an idle pool.
+  The tests set `hs.HEALTH_ASYNC = False` so one cycle yields one verdict.
+- **No node is probed under `queue.lock`.** A cycle is two passes of `_cycle()`: pass 1
+  reaps, applies the gates and notes which hold job each dispatchable task would take
+  (`wanted`); `probe_nodes()` probes those in parallel with the lock released; pass 2 is
+  a full pass again, on the queue as reloaded, and dispatches from `probe_cache`. Pass 2
+  never probes: a task whose node is rejected there shows `verifying_node` and is tried
+  next cycle. Everything in `_cycle` must therefore be safe to run twice in a row.
+- **One scheduler per cluster, and it says so itself.** The heartbeat is written by its
+  own thread every 15 s, never per cycle: it must mean "the process is alive", because
+  `hive list` / `hive wait` start a scheduler when it looks dead (`ensure_sched`).
+  `hive-sched` also refuses to start next to a live one (`another_scheduler`), and
+  exits when its main loop has not finished a pass for `MAIN_STALL_SECS`. Across
+  hosts it is stopped by a request file (`sched.stop-request`), never by PID.
+- **Task strikes and verify strikes are separate counters** (`strikes`,
+  `verify_strikes`). A clean verify probe clears only the latter: a node can pass every
+  probe while every task dies at CUDA init, and only a task that succeeds clears that.
+- **A freed hold job stays offered until the node DB has caught up** (`_freed_at`), and
+  **gates that need no probe run before the probe** (walltime, card size, exclusion,
+  slow): pass 1 asks for the FIRST eligible node, so everything that makes a node
+  ineligible for the task has to be known before that — or remembered afterwards
+  (`_task_skip` for the task, `_probe_backoff` for the node, and candidates with a
+  rejection on record are sorted last). Each of these was a stuck queue in review.
+- **The scheduler stops between passes, not inside one** (`handle_signal` defers while
+  `_in_cycle`). Events and notify hooks fire during a pass, the queue and the health
+  list are saved at its end; `hive queue daemon stop` waits for the process to go.
+- **A running task is cancelled by the scheduler, also on the same host** — that is
+  where run time, GPU usage and the notify hook are recorded. The CLI kills srun itself
+  only when no scheduler is running.
+- **Red-team findings are regression tests** (`tests/test_hive.py`, "red team" section).
+  The mock srun runs wrappers locally: `tests/run.sh` kills what they leave behind.
+- **A task's finish time is its exit file's mtime**, not the cycle that noticed it.
+- **`--max-running` caps the owner, not the task**: the lowest cap among the owner's
+  pending and running tasks applies to all of them.
+- **Dependencies and concurrency caps are gates that need no node.** They are checked
+  before the candidate loop (`waiting_for_dependency`, `array_limit`, `owner_limit`),
+  never consume a candidate, and do not count towards the starvation watchdog. A
+  failed/cancelled `--after` dependency fails the dependant without running it (exit
+  125, `dependency_failed`); a dependency that was pruned is looked up in
+  `events.jsonl`, and one hive knows nothing about counts as `done`. An array is N
+  ordinary tasks sharing `array_id` — same `name`, so history and `auto` still group.
+- **The user's command runs in a subshell** in the dispatch wrapper. Without it a
+  command containing `exit N` ended the wrapper before the footer and the exit file
+  were written, and the task surfaced as a crash orphan / "declared dead" (-1).
+- **Queued hold jobs follow the quarantine list.** When the list grows the scheduler
+  (background thread) adds the new nodes to `ExcNodeList` of the user's PENDING hold
+  jobs via `scontrol update`. A hold job is recognised by its stdout being under
+  `pool-logs/`; jobs submitted any other way are never modified. Add-only.
+- **`slow` is a third node state, between ok and quarantined.** A node whose CUDA
+  context is created, but in more than `CUDA_INIT_DEADLINE`, is `slow`
+  (`hh.mark_slow`): it takes only tasks for which `hh.task_accepts_slow()` holds
+  (`allow_slow`, else `est_runtime_secs` ≥ 1 h) — a task-level rejection, `node_slow` —
+  and candidates are sorted so slow nodes come last, then by `prefer_partitions`.
+  Verify-before-dispatch has a 60 s CUDA deadline and therefore quarantines such a node
+  first; it is the periodic check, which waits `SLOW_CUDA_DEADLINE`, that finds the
+  context does get created and reclassifies it. Verify on a slow node skips the CUDA
+  probe. `pool add` does not exclude slow nodes. A node hive quarantined for a FAULT
+  becomes slow only after `HEALTH_OK_STREAK` slow-but-ok probes in a row and its
+  minimum hold (`hh.slow_probe`); one put away by an agent or by hand never does.
+- **Placement is decided, then committed.** `find_slot()` says where a task can run and
+  reserves its cards, `commit()` dispatches, `release()` gives a reservation back. A
+  multi-node task (`gang_size`; members are an array, `array_index` = rank) places
+  ALL members through `find_slot(avoid_nodes=…)` or releases every reservation; a
+  member that fails, is cancelled or is requeued ends the gang (`abort_broken_gangs`).
+- **Preemption is opt-in on both sides and is a requeue, not a cancel.** The victim
+  gets `cancel_requested` + `preempted_by`; the cancel branch of step (1) turns that
+  into `pending`. Never pick a victim of equal priority, a gang member, or one that
+  did not say `preemptible`.
+- **Autoscale spends allocation by itself, so it fails closed.** It counts hold jobs
+  by asking SLURM (`observe()`: the user's jobs whose stdout is under `pool-logs/`),
+  never from the node DB, which is empty with the poller down and behind otherwise.
+  SLURM unreachable, state file unreadable or UNWRITABLE, any setting not exactly
+  valid (`"enabled"` must be JSON `true`, `until` is required) → submit nothing. The
+  state is written before submitting and kept in memory too. `max_nodes` counts every
+  hold job, usable or not. `hive pool autoscale` must go through the same functions.
+  `"active_within"` ties it to use (`last_submit()`; owner `hive-selftest` does not
+  count): an unreadable record means "no use", never "use".
+- **`--warn-before` signals the command's process group.** The command runs under
+  `setsid` with a no-op USR1 trap in its shell; signalling that shell alone killed it
+  and orphaned the program behind it. The heartbeat and sampler loops ignore USR1.
+- **A preemption must be worth it and must be finished.** `pick_victim` only names a
+  task on a hold job the preemptor can use and whose step this scheduler can stop; the
+  victim is requeued when its step is gone, and the freed hold job is kept for the
+  preemptor (`_reserved`). A user's `hive cancel` beats a preemption under way.
+- **`hive nodes` rows are tab-separated and read by bash**: every cell goes through
+  `cell()` (never empty, no tab or newline) and every row through `emit()` in a `try`.
+- **The scheduler wakes on `sched.wake` and on exit files** (`idle_wait`), at least
+  `MIN_CYCLE_GAP` after the last cycle. CLI commands that change what may run call
+  `wake_scheduler()`.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward
@@ -132,6 +260,18 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   placed on a node expiring within `est + WALLTIME_MARGIN_SECS`; a task *without* an
   estimate stays walltime-blind, so existing behaviour is unchanged. `-1`=unlimited and
   `null`=unknown never block.
+- **A hold job with N cards is N slots.** A slot is a position in the hold job's
+  `CUDA_VISIBLE_DEVICES` list and in its `nvidia-smi` listing; a running task records
+  the ones it holds in `gpu_slots` and the wrapper keeps exactly those (`cut -f`).
+  Occupancy is recomputed from the tasks each pass (`slots_in_use`), never patched as
+  tasks finish. A running task WITHOUT `gpu_slots` was dispatched by an older
+  scheduler and holds the whole hold job. `pick_slots()` decides per card; "nothing
+  usable on this hold job" is node-level (pop + backoff), "usable but not for this
+  task" is task-level. A partially used hold job reads `busy` to the poller and is
+  still a candidate (`partial`). Inside a step `nvidia-smi` lists ALL the hold job's
+  cards — it is CUDA that sees only the task's — so the usage sampler picks its lines
+  by position. To try changes on several cards without waiting for H100s, a 2×V100
+  hold job (`--gres=gpu:tesla_v100-pcie-32gb:2`, normal partition) starts at once.
 - **GPU visibility is narrowed, never widened.** SLURM's cgroup already scopes an
   `srun --overlap` step to the hold-job's own GPUs, renumbered `0..N-1` — verified on
   multi-tenant nodes, so hive never needs `--gres`/`--gpu-bind` on the step. But a hold

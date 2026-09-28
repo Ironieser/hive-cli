@@ -15,10 +15,11 @@ single iteration costs you one short command and a few lines of output.
 
 ```bash
 export HIVE_OWNER=my-agent-or-project      # once per session: tags every submit, scopes hive list
-ID=$(hive submit --name train_v1 --est-runtime 2h \
-      "python train.py --config v1.yaml --output_dir runs/v1 --resume" | grep -oP '#\K\d+')
+ID=$(hive submit -q --name train_v1 --est-runtime 2h \
+      "python train.py --config v1.yaml --output_dir runs/v1 --resume")
 hive wait "$ID" --pending-timeout 1800      # blocks; prints state changes, then the log TAIL
-# exit codes:  0 done · 1 failed · 75 never dispatched · 130 cancelled
+# exit code = the command's own (0 done) · 124 timeout · 125 dependency failed
+#             · 75 never dispatched · 130 cancelled        → test for != 0
 ```
 
 `hive wait` prints the last 40 log lines plus the header (node, cmd, GPU visibility). That
@@ -45,8 +46,20 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--owner NAME` | who this task belongs to (agent / project); defaults to `$HIVE_OWNER`. Several agents share one queue — this is how you find yours again |
 | `--name NAME` | groups runtime history → `hive stats NAME`, `--est-runtime auto` |
 | `--est-runtime 2h\|90m\|auto` | walltime-aware placement (`auto` = P90 of NAME's history) |
-| `--need-mb 60000` | hold until a GPU has that much free memory (big models) |
-| `--gpus N` | GPUs the task may see (default **1**; extras are hidden so frameworks don't auto-DataParallel) |
+| `--need-mb 60000\|auto` | hold until a GPU has that much free memory (`auto` = measured peak of NAME's past runs + 10 %) |
+| `--gpus N` | GPUs the task gets (default **1**). A multi-GPU hold job runs several tasks at once, one set of cards each; your task sees only its own |
+| `--timeout 2h` | kill the task after that much run time (failed, exit 124) — use it for anything that can hang |
+| `--notify CMD` | run CMD when the task finishes or is requeued (`HIVE_TASK_*` env; runs on the scheduler host; default `$HIVE_NOTIFY`) |
+| `--after ID,ID` | pipeline: run only after those tasks ended done (fails with them, exit 125). `--after aN` = after the whole array N. `--after-any` = whatever their outcome |
+| `--array 0-9%4` | sweep: one task per index (`$HIVE_ARRAY_INDEX`, single-quote the command), at most 4 at once. `hive wait --array ID`, `hive cancel --array ID` |
+| `--max-running N` | cap for the whole owner: at most N of its tasks run at once (`export HIVE_MAX_RUNNING=N`) |
+| `--allow-slow` | accept a SLOW node (CUDA init takes minutes there, then normal speed). Automatic for `--est-runtime` ≥ 1h; `--no-slow` to refuse. Give long training / serving jobs an estimate so they use these nodes and leave the fast ones for short runs |
+| `--nodes N` | multi-node task: N members start together, one node each, with `$HIVE_GANG_RANK/SIZE/HOSTS`; one fails → all stop. `--same-node`: members may share a node (several 1-GPU hold jobs on it) |
+| `--preemptible` / `--preempt` | a long low-priority task agrees to be stopped and requeued / an urgent one (give it `--priority` > 0) may stop such a task |
+| `--begin 2h\|08:00` | not before that time |
+| `--cpus N` `--mem MB` | CPU / memory limit of the task (hold jobs have few CPUs; tasks sharing one fight over them) |
+| `--warn-before 10m` | SIGUSR1 to every process of the command that long before its node expires; your program must handle it (to checkpoint) |
+| `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
 | `--priority N` | higher dispatches first |
 
@@ -62,8 +75,10 @@ These commands are sized for agents; prefer them over `cat ~/.hive/…` or `sque
 |---|---|---|
 | my tasks | `hive list` | active + last 10 finished, **only `$HIVE_OWNER`'s when set** (`--owner NAME`, `--owner all`, `--limit N`, `--state failed`) |
 | one task's verdict | `hive wait ID` / `hive logs ID -n 50` | header + tail |
+| several tasks / a sweep | `hive wait ID ID …` / `hive wait --array ID` | one line per task, no logs; exit 1 if any did not end done |
 | is the pool healthy | `hive nodes` | one line per hold job + summary |
 | why is it pending | `hive list` → NODE column shows the `pending_reason` | — |
+| will the pool be refilled | `hive pool autoscale` | what autoscale keeps, and what it would submit now |
 | bad nodes | `hive health` | one line per node |
 | how long do runs take | `hive stats NAME` | one line per name |
 
@@ -76,10 +91,12 @@ The NODE column of `hive list` says why. The common ones:
 
 | reason | meaning → what to do |
 |---|---|
-| `no_dispatchable_node` | no free hold job → `hive nodes`; wait or `hive pool add` |
+| `pool_empty` | the pool has no hold job. If `hive pool autoscale` says it is on, it submits hold jobs within 10 min of your submit (they then wait in the SLURM queue); need more, or sooner → `hive pool add highgpu` |
+| `held` | somebody ran `hive hold` on it → `hive unhold ID` |
+| `no_dispatchable_node` | every hold job is busy → `hive nodes`; wait or `hive pool add` |
 | `waiting_for_mem` / `insufficient_gpus` / `insufficient_walltime` | your task's requirement isn't met by any node → lower it or `hive pool add …` |
 | `gpu_dirty` / `node_busy_on_verify` | a card looked free but isn't (co-tenant / zombie) → wait |
-| `cuda_unavailable_on_verify` / `node_quarantined` | node can't create a CUDA context; hive quarantined it → `hive health` |
+| `gpu_unresponsive` / `cuda_unavailable_on_verify` / `node_quarantined` | the node's GPU is broken; hive quarantines it → `hive health`, then `hive pool add` for a replacement |
 | `infra_failure_redispatch` | node reclaimed mid-run; re-running elsewhere (progress lost unless checkpointed) |
 
 Full table and node STATUS legend (`BUSY/CLAIM/IDLE/WARN/PFAIL/QUAR/CPU`):

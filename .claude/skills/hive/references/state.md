@@ -39,6 +39,16 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `requeue_count`, `checkpoint_warning`, `attempts`: re-dispatch history.
 - `gpus`, `need_mb`, `est_runtime_secs`, `est_source` (`user` | `history`): placement inputs.
 - `node`, `slurm_jobid`, `log`: where it ran and where its output is.
+- `timeout_secs`, `notify`, `exclude_nodes`, `allow_slow`, `held`: as submitted.
+- `depends_on` (ids), `depends_mode` (`ok` | `any`), `failed_dependency`.
+- `array_id`, `array_index`, `array_max_running`; `max_running` (owner cap).
+- `fail_reason` (`timeout` | `dependency_failed`), `exit_code` (124 / 125 for those).
+- `gang_size`, `gang_hosts` (multi-node members; `array_id` / `array_index` = rank),
+  `preempt`, `preemptible`, `preempt_count`, `begin_ts`, `cpus`, `mem_mb`,
+  `warn_before_secs`, `warned_ts`.
+- `gpu_slots`: positions of the cards it holds within the hold job (absent on tasks
+  dispatched before GPU slots: those hold the whole hold job).
+- `gpu_peak_mb`, `gpu_avg_util`, `gpu_max_util`, `gpu_samples`: measured on the node.
 
 ## Node record fields
 
@@ -48,10 +58,12 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `time_left_secs`: remaining walltime measured at the DB's `updated` (`-1` unlimited,
   `null` unknown); subtract the DB age for a live value.
 - `carried_forward: true`: last-good reading reused after a transient probe miss.
+- `probe_detail`: why a `probe_failed` probe failed — `srun_failed`, `gpu_unresponsive`,
+  `no_gpu_devices`; empty otherwise. The last two are never carried forward.
 - `polled_at`: when this record was last probed successfully (UTC).
 
 ## Health record fields
 
-`state` (`quarantined | ok`), `reason`, `source` (`verify | auto | agent | manual`),
+`state` (`quarantined | slow | ok`), `slow_init_secs`, `reason`, `source` (`verify | auto | agent | manual`),
 `strikes`, `ok_streak`, `since`, `until` (minimum hold), `last_check`, `last_result`,
 `history` (last 20 events).

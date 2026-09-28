@@ -169,6 +169,14 @@ def fmt_mem(mem_used_mib, mem_total_mib):
     return f"{mib_to_g(mem_used_mib)}/{mib_to_g(mem_total_mib)}"
 
 
+def _num(x, default=0):
+    """A number out of whatever the DB holds ("N/A", null, "12.0")."""
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return default
+
+
 def gpu_util_str(job):
     gpus = job.get("gpu", [])
     if not gpus:
@@ -265,20 +273,24 @@ class NodeTop:
 
         # Quarantined nodes (hive health)
         self.quarantined = set()
+        self.slow = set()          # usable, but CUDA takes minutes to initialise
         try:
             with open(os.path.join(HIVE_DIR, "node_health.json")) as _hf:
-                self.quarantined = {n for n, r in json.load(_hf).get("nodes", {}).items()
-                                    if r.get("state") == "quarantined"}
+                _hn = json.load(_hf).get("nodes", {})
+            self.quarantined = {n for n, r in _hn.items() if r.get("state") == "quarantined"}
+            self.slow = {n for n, r in _hn.items() if r.get("state") == "slow"}
         except Exception:
             pass
         # Load queue: build slurm_jobid → task map for running hive tasks
         self.jobid_to_task = {}
+        self.jobid_tasks = {}      # every running task of a hold job (GPU slots)
         try:
             with open(QUEUE_PATH) as f:
                 q = json.load(f)
             for t in q.get("tasks", {}).values():
                 if t.get("state") == "running" and t.get("slurm_jobid"):
-                    self.jobid_to_task[str(t["slurm_jobid"])] = t
+                    self.jobid_tasks.setdefault(str(t["slurm_jobid"]), []).append(t)
+                    self.jobid_to_task.setdefault(str(t["slurm_jobid"]), t)
         except Exception:
             pass
 
@@ -388,16 +400,17 @@ class NodeTop:
             is_expanded = (jid == self.expanded)
 
             status = jdata.get("status", "unknown").upper()
-            node   = jdata.get("node", "?")
-            part   = jdata.get("partition", "?")
-            elapsed = jdata.get("job_elapsed", "?")
-            gpus   = jdata.get("gpu", [])
-            procs  = jdata.get("processes", [])
+            node   = str(jdata.get("node") or "?")
+            part   = str(jdata.get("partition") or "?")
+            elapsed = str(jdata.get("job_elapsed") or "?")
+            gpus   = [g for g in (jdata.get("gpu") or []) if isinstance(g, dict)]
+            procs  = [p_ for p_ in (jdata.get("processes") or []) if isinstance(p_, dict)]
 
             # GPU util / mem
-            util = gpus[0].get("util", 0) if gpus else 0
-            mem_used  = gpus[0].get("mem_used", 0) if gpus else 0
-            mem_total = gpus[0].get("mem_total", 0) if gpus else 0
+            # over all the hold job's cards: busiest card, memory of all (as hive nodes)
+            util = max((_num(g.get("util")) for g in gpus), default=0)
+            mem_used  = sum(_num(g.get("mem_used")) for g in gpus)
+            mem_total = sum(_num(g.get("mem_total")) for g in gpus)
             mem_str   = fmt_mem(mem_used, mem_total) if gpus else "?"
 
             # Main task command — prefer authoritative queue data, fall back to probe
@@ -414,9 +427,15 @@ class NodeTop:
             if qt:
                 tid    = qt["id"]
                 name   = qt.get("name") or ""
+                if name and qt.get("array_index") is not None:
+                    name = f"{name}[{qt['array_index']}]"
                 owner  = qt.get("owner") or ""
-                qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
-                prefix = f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
+                qcmd   = " ".join(str(qt.get("cmd") or "").split())
+                _all   = self.jobid_tasks.get(jid, [])
+                _held  = min(len(gpus), sum(len(t["gpu_slots"]) if t.get("gpu_slots") is not None
+                                            else len(gpus) for t in _all))
+                share  = f"(+{len(_all) - 1} more, {_held}/{len(gpus)} GPUs) " if len(_all) > 1 else ""
+                prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
                 task_cmd = prefix + qcmd
                 # Slot taken by a running hive task even if the GPU isn't busy yet
                 # (same rule as hive nodes — feedback #4/#7/#17/#32).
@@ -424,6 +443,8 @@ class NodeTop:
                     status = "CLAIMED"
             if node in self.quarantined and status not in ("BUSY", "CLAIMED"):
                 status = "QUAR"
+            elif node in self.slow and status not in ("BUSY", "CLAIMED"):
+                status = "SLOW"
 
             task_cmd_short = short_cmd(task_cmd, task_w)
 
@@ -454,6 +475,8 @@ class NodeTop:
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY))
                 elif status == "QUAR":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_STALE) | curses.A_BOLD)
+                elif status == "SLOW":
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_WARN))
                 elif status == "WARNING":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_WARN) | curses.A_BOLD | curses.A_BLINK)
                 elif status == "CPU":
@@ -485,10 +508,20 @@ class NodeTop:
             row += 1
 
         if row < max_row:
-            busy_count = sum(1 for _, j in self.rows if j.get("status") == "busy")
-            idle_count = sum(1 for _, j in self.rows if j.get("status") == "idle")
-            total = len(self.rows)
-            summary = f"  busy: {busy_count}   idle: {idle_count}   total: {total}"
+            # as shown in the rows: a quarantined or slow node is not "idle"
+            def _shown(j):
+                n_ = j.get("node")
+                st = j.get("status")
+                if st != "busy" and n_ in self.quarantined:
+                    return "quar"
+                if st not in ("busy", "probe_failed") and n_ in self.slow:
+                    return "slow"
+                return st
+            kinds = [_shown(j) for _, j in self.rows]
+            summary = (f"  busy: {kinds.count('busy')}   idle: {kinds.count('idle')}"
+                       + (f"   slow: {kinds.count('slow')}" if "slow" in kinds else "")
+                       + (f"   quarantined: {kinds.count('quar')}" if "quar" in kinds else "")
+                       + f"   total: {len(kinds)}")
             self._safe_addstr(row, 0, summary, curses.color_pair(C_HEADER))
             row += 1
 
@@ -496,7 +529,7 @@ class NodeTop:
 
     def _draw_detail(self, row, max_row, W, jid, jdata):
         """Draw expanded detail panel for a job."""
-        node = jdata.get("node", "?")
+        node = str(jdata.get("node") or "?")
         part = jdata.get("partition", "?")
 
         # Top border
