@@ -876,6 +876,150 @@ chk("hive stats shows GPU peak (P90) and mean util", "GPU-PEAK" in _buf.getvalue
 open(ev.EVENTS_FILE, "w").close(); wq({})
 reset_health(); reset_sched_state()
 
+print("== phase 3: dependencies, arrays, concurrency caps ==")
+import argparse as _ap
+def _capture(fn, *a):
+    buf = _io.StringIO()
+    with _cl.redirect_stdout(buf):
+        fn(*a)
+    return buf.getvalue()
+reset_health(); reset_sched_state()
+open(ev.EVENTS_FILE, "w").close()
+chk("parse_array: range / list / step / cap",
+    hq.parse_array("0-3") == ([0, 1, 2, 3], None) and hq.parse_array("1,3,5") == ([1, 3, 5], None)
+    and hq.parse_array("0-20:5%2") == ([0, 5, 10, 15, 20], 2))
+def _bad(fn, *a):
+    try: fn(*a); return False
+    except ValueError: return True
+chk("parse_array rejects nonsense", _bad(hq.parse_array, "5-1") and _bad(hq.parse_array, "a-b")
+    and _bad(hq.parse_array, "0-3%0") and _bad(hq.parse_array, "0-5000"))
+chk("parse_id_list", hq.parse_id_list("12, 13 14,12") == [12, 13, 14] and _bad(hq.parse_id_list, "12,x"))
+
+def _ns(**kw):
+    base = dict(cmd_or_file="true", workdir=None, priority=None, name=None, owner=None, need_mb=None,
+                gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
+                after_any=None, array=None, max_running=None)
+    base.update(kw); return __import__("argparse").Namespace(**base)
+def _submit3(**kw):
+    buf = _io.StringIO()
+    with _cl.redirect_stdout(buf):
+        hq.cmd_submit(_ns(**kw))
+    return buf.getvalue()
+def _exits(fn, *a, **k):
+    try:
+        with _cl.redirect_stdout(_io.StringIO()), _cl.redirect_stderr(_io.StringIO()):
+            fn(*a, **k)
+    except SystemExit as e:
+        return e.code
+    return None
+
+# ---- dependencies
+json.dump({"version": 1, "next_id": 200, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_submit3(name="prep", cmd_or_file="true")                      # 200
+_submit3(name="train", after="200")                             # 201
+_submit3(name="eval", after="201")                              # 202
+_submit3(name="cleanup", after_any="201")                       # 203
+chk("--after stored", rq()["201"]["depends_on"] == [200] and rq()["203"]["depends_mode"] == "any")
+chk("--after an unknown id is refused at submit", _exits(hq.cmd_submit, _ns(after="9999")) == 2)
+wdb({"700": node("n1", 72000), "701": node("n2", 72000), "702": node("n3", 72000)})
+hs.run_one_cycle(); time.sleep(0.5)
+q = rq()
+chk("only the head of the chain is dispatched", q["200"]["state"] in ("running", "done")
+    and [q[k]["state"] for k in ("201", "202", "203")] == ["pending"] * 3)
+chk("the rest say waiting_for_dependency",
+    {q[k].get("pending_reason") for k in ("201", "202", "203")} == {"waiting_for_dependency"})
+_polls = []; _rr = hs.request_repoll; hs.request_repoll = lambda r: _polls.append(r)
+for _ in range(4): hs.run_one_cycle()
+chk("tasks held by a dependency never trigger a starvation re-poll", _polls == [] or rq()["201"]["state"] != "pending")
+hs.request_repoll = _rr
+time.sleep(0.5); hs.run_one_cycle(); time.sleep(0.5); hs.run_one_cycle(); time.sleep(0.5); hs.run_one_cycle()
+time.sleep(0.5); hs.run_one_cycle()
+chk("chain runs to the end in order", all(rq()[k]["state"] == "done" for k in ("200", "201", "202", "203")))
+# failure cascades; --after-any still runs
+json.dump({"version": 1, "next_id": 210, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_submit3(name="boom", cmd_or_file="exit 3")                     # 210
+_submit3(name="needs", after="210", notify=_hook)               # 211
+_submit3(name="needs2", after="211")                            # 212
+_submit3(name="always", after_any="210")                        # 213
+clear_notified()
+hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle()
+q = rq()
+chk("dependency failed -> dependant fails without running (exit 125)",
+    (q["211"]["state"], q["211"]["exit_code"], q["211"].get("fail_reason"), q["211"].get("node"))
+    == ("failed", 125, "dependency_failed", None))
+chk("...and the failure cascades down the chain", q["212"]["state"] == "failed"
+    and q["212"].get("failed_dependency") == 211)
+chk("--after-any runs although its dependency failed", q["213"]["state"] in ("running", "done"))
+chk("hook fires for a task that never ran", notified() == ["211 finish failed 125 dependency_failed needs"])
+chk("its log says why", "did not end `done`" in open(q["211"]["log"]).read())
+# pruned dependency: state comes from the event log
+json.dump({"version": 1, "next_id": 222, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+ev.record("finish", task=220, name="old_ok", state="done", run_secs=5)
+ev.record("finish", task=221, name="old_bad", state="failed", run_secs=5, exit_code=1)
+_submit3(name="after_pruned_ok", after="220")                   # 222
+_submit3(name="after_pruned_bad", after="221")                  # 223
+hs.run_one_cycle(); time.sleep(0.5)
+chk("pruned dependency: final state read from events.jsonl",
+    rq()["222"]["state"] in ("running", "done") and rq()["223"].get("fail_reason") == "dependency_failed")
+
+# ---- arrays
+json.dump({"version": 1, "next_id": 230, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_out = _submit3(name="sweep", array="0-5%2", owner="ag",
+                cmd_or_file=f'echo "idx=$HIVE_ARRAY_INDEX arr=$HIVE_ARRAY_ID id=$HIVE_TASK_ID"; sleep 1.5')
+q = rq()
+chk("array creates one task per index, sharing array_id",
+    sorted(q) == [str(i) for i in range(230, 236)] and {t["array_id"] for t in q.values()} == {230}
+    and [q[str(230 + i)]["array_index"] for i in range(6)] == list(range(6)) and "array #230" in _out)
+wdb({str(700 + i): node(f"n{i}", 72000) for i in range(6)})     # six free nodes
+hs.run_one_cycle()
+q = rq()
+chk("%2 -> two running although six nodes are free",
+    sum(1 for t in q.values() if t["state"] == "running") == 2
+    and sum(1 for t in q.values() if t.get("pending_reason") == "array_limit") == 4)
+time.sleep(0.6)
+chk("the command sees its index", "idx=0 arr=230 id=230" in open(q["230"]["log"]).read())
+chk("hive list shows name[index]", "sweep[3]" in _capture(hq.cmd_list, _ap.Namespace(state=None, all=True, days=None, limit=None, owner="all")))
+_exits(hq.cmd_cancel, _ap.Namespace(id=None, array=230))
+hs.run_one_cycle()
+chk("hive cancel --array cancels every member", {t["state"] for t in rq().values()} == {"cancelled"})
+
+# ---- per-owner cap
+json.dump({"version": 1, "next_id": 240, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+for i in range(3): _submit3(name=f"a{i}", owner="greedy", max_running=1, cmd_or_file="sleep 1.5")
+_submit3(name="b0", owner="other", cmd_or_file="sleep 1.5")
+hs.run_one_cycle()
+q = rq()
+chk("--max-running 1: one task of that owner runs, the other owner is unaffected",
+    [q[k]["state"] for k in ("240", "241", "242", "243")] == ["running", "pending", "pending", "running"]
+    and q["241"].get("pending_reason") == "owner_limit")
+chk("--max-running without an owner is refused", _exits(hq.cmd_submit, _ns(max_running=2)) == 2)
+for k in ("240", "243"): _exits(hq.cmd_cancel, _ap.Namespace(id=int(k), array=None))
+hs.run_one_cycle()
+
+# ---- wait on several
+json.dump({"version": 1, "next_id": 250, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_submit3(name="w", array="0-1", cmd_or_file="true"); _submit3(name="wbad", cmd_or_file="exit 2")
+hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle()
+_b = _io.StringIO()
+try:
+    with _cl.redirect_stdout(_b):
+        hq.cmd_wait_many(_ap.Namespace(interval=0.2, pending_timeout=0), [250, 251, 252])
+    _rc = None
+except SystemExit as e:
+    _rc = e.code
+chk("hive wait ID ID ID: one line per task, exit 1 when one failed",
+    _rc == 1 and "w[0]" in _b.getvalue() and "#252" in _b.getvalue() and "2 done, 1 not" in _b.getvalue())
+_b = _io.StringIO()
+try:
+    with _cl.redirect_stdout(_b):
+        hq.cmd_wait_many(_ap.Namespace(interval=0.2, pending_timeout=0), [250, 251])
+    _rc = None
+except SystemExit as e:
+    _rc = e.code
+chk("...exit 0 when all ended done, and no log is printed", _rc == 0 and "===" not in _b.getvalue())
+open(ev.EVENTS_FILE, "w").close(); wq({}); clear_notified()
+reset_health(); reset_sched_state()
+
 print("== node exclusion: hive submit --exclude, hive pool add --exclude ==")
 chk("expand_nodes: names, ranges, padding, duplicates",
     hh.expand_nodes("evc22,evc[1-3,07],gpu01,evc22") == ["evc22", "evc1", "evc2", "evc3", "evc07", "gpu01"])

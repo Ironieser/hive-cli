@@ -118,8 +118,10 @@ case "$subcommand" in
     submit   "cmd"|job.hive   Submit to task queue (shortcut for queue submit)
                               (--exclude NODES → never run on those nodes)
                               (--timeout 2h → killed after that run time; --notify CMD)
+                              (--after ID → pipeline; --array 0-9%4 → sweep)
                               (--est-runtime 2h|auto → walltime-aware scheduling)
-    wait     ID               Block until task done, print log, exit $?
+    wait     ID [ID…]|--array A  Block until done. One ID: log tail + its exit code.
+                              Several / an array: one line each, exit 1 if any failed
     list                      Show task queue (shortcut for queue list)
     logs     ID [-f]          Show / follow task log
     cancel   ID               Cancel pending or running task

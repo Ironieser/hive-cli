@@ -436,6 +436,48 @@ def task_gpus(task):
         return DEFAULT_TASK_GPUS
 
 
+DEPENDENCY_FAILED_EXIT = 125
+
+
+def pruned_final_states(ids):
+    """{task_id: final state} for tasks that are no longer in queue.json, from the event
+    log — `hive prune` only drops terminal tasks, and their `finish` / `cancel` events
+    stay. Ids the log does not know either are left out."""
+    want, found = set(ids), {}
+    if not want:
+        return found
+    for e in ev.iter_events():
+        tid = e.get("task")
+        if tid in want:
+            if e.get("event") == "finish":
+                found[tid] = e.get("state") or "done"
+            elif e.get("event") == "cancel":
+                found[tid] = "cancelled"
+            elif e.get("event") in ("requeue", "dispatch"):
+                found.pop(tid, None)          # ran again after that finish
+    return found
+
+
+def dependency_status(task, tasks, pruned):
+    """('ready' | 'wait' | 'failed', id of the dependency that decides it).
+
+    `--after`: every dependency must have ended `done`; one that failed or was
+    cancelled fails this task. `--after-any`: they only have to have ended. A
+    dependency hive no longer knows anything about was pruned, hence terminal; it
+    counts as ended, and as `done` — refusing to run on missing history would strand
+    the task for good."""
+    mode = task.get("depends_mode") or "ok"
+    waiting = None
+    for dep in task.get("depends_on") or ():
+        t = tasks.get(str(dep))
+        state = t["state"] if t is not None else pruned.get(dep, "done")
+        if state in ("pending", "running"):
+            waiting = waiting or dep
+        elif state != "done" and mode == "ok":
+            return "failed", dep
+    return ("wait", waiting) if waiting is not None else ("ready", None)
+
+
 def exit_time(task_id):
     """Epoch at which the task's exit file was written; now, if it can't be read."""
     try:
@@ -768,6 +810,15 @@ def dispatch_task(task, slurm_jobid, node_name):
             f'echo "=== gpus: requested 0 — all GPUs hidden ===" >> {lf}\n'
         )
 
+    # What the command can know about itself. HIVE_ARRAY_INDEX is how one command
+    # line becomes a sweep: `python train.py --seed $HIVE_ARRAY_INDEX`.
+    env_line = (f"export HIVE_TASK_ID={q(str(task_id))} "
+                f"HIVE_TASK_NAME={q(str(task.get('name') or ''))} "
+                f"HIVE_TASK_OWNER={q(str(task.get('owner') or ''))}\n")
+    if task.get("array_index") is not None:
+        env_line += (f"export HIVE_ARRAY_ID={q(str(task.get('array_id')))} "
+                     f"HIVE_ARRAY_INDEX={q(str(task['array_index']))}\n")
+
     # ── GPU usage sampler ─────────────────────────────────────────────────────
     # Peak memory / utilisation of the cards the task can see, kept as four running
     # numbers in a small file the scheduler reads at finish (collect_usage). This is
@@ -812,14 +863,18 @@ def dispatch_task(task, slurm_jobid, node_name):
         f"  echo 1 > {xf}\n"
         f"  exit 1\n"
         f"fi\n"
-        + gpu_line +
+        + gpu_line + env_line +
         # ── Heartbeat process (disowned to suppress bash "Terminated" noise) ───
         f"( while true; do date -Iseconds > {hb}; sleep 30; done ) &\n"
         f"_HB_PID=$!\n"
         f"disown $_HB_PID\n"
         + sampler +
         # ── Run the actual command (verbatim: it is the user's shell script) ──
-        f"{cmd} >> {lf} 2>&1\n"
+        # In a subshell: a command that says `exit 3` (or `… || exit 1`) must end
+        # itself, not this wrapper — it used to skip the footer and the exit file, so
+        # the task was requeued as a crash orphan and finally "declared dead" (-1)
+        # instead of failing with its own exit code.
+        f"(\n{cmd}\n) >> {lf} 2>&1\n"
         f"_EC=$?\n"
         # ── Footer (double-quotes so $(date) and $_EC are expanded by bash) ──
         f'echo "" >> {lf}\n'
@@ -1218,8 +1273,61 @@ def run_one_cycle():
         )
 
         dispatched = 0
+        starved = 0          # tasks that wanted a node this cycle and got none
         node_reject = None   # last NODE-level rejection this cycle
+
+        # Running counts for the concurrency caps, kept current as this cycle dispatches.
+        run_by_array, run_by_owner = {}, {}
+        for t in tasks.values():
+            if t["state"] == "running":
+                if t.get("array_id") is not None:
+                    run_by_array[t["array_id"]] = run_by_array.get(t["array_id"], 0) + 1
+                if t.get("owner"):
+                    run_by_owner[t["owner"]] = run_by_owner.get(t["owner"], 0) + 1
+        pruned = pruned_final_states(
+            {d for t in pending for d in (t.get("depends_on") or ()) if str(d) not in tasks})
+
         for task in pending:
+            # ── Gates that need no node (docs/feature_plan.md phase 3) ────────────
+            # `pending` is in dispatch order and a dependant is always submitted after
+            # what it depends on, so a failure cascades down a chain within one cycle.
+            dep, dep_id = dependency_status(task, tasks, pruned)
+            if dep == "failed":
+                task["state"]       = "failed"
+                task["exit_code"]   = DEPENDENCY_FAILED_EXIT
+                task["fail_reason"] = "dependency_failed"
+                task["failed_dependency"] = dep_id
+                task["finished_at"] = now_iso()
+                task["finished_ts"] = now_ts()
+                task.pop("pending_reason", None)
+                append_log_note(task, [
+                    f"=== hive: task #{task['id']} was not run: it was submitted --after "
+                    f"#{dep_id}, which did not end `done` (exit_code="
+                    f"{DEPENDENCY_FAILED_EXIT}) ===",
+                ])
+                changed = True
+                logging.info("Task %d failed without running: dependency %s did not end done",
+                             task["id"], dep_id)
+                ev.record("finish", task=task["id"], name=task.get("name") or None,
+                          state="failed", exit_code=DEPENDENCY_FAILED_EXIT,
+                          reason="dependency_failed", dependency=dep_id)
+                notify(task, "finish")
+                continue
+            held = None
+            if dep == "wait":
+                held = "waiting_for_dependency"
+            elif task.get("array_max_running") and task.get("array_id") is not None \
+                    and run_by_array.get(task["array_id"], 0) >= int(task["array_max_running"]):
+                held = "array_limit"
+            elif task.get("max_running") and task.get("owner") \
+                    and run_by_owner.get(task["owner"], 0) >= int(task["max_running"]):
+                held = "owner_limit"
+            if held:
+                if task.get("pending_reason") != held:
+                    task["pending_reason"] = held
+                    changed = True
+                continue
+
             need_mb = int(task.get("need_mb") or NEED_MB_DEFAULT)
             want_gpus = task_gpus(task)
             excluded = set(task.get("exclude_nodes") or ())
@@ -1394,6 +1502,10 @@ def run_one_cycle():
                     break
                 task["srun_pid"] = srun_pid
                 running_jobids.add(jid)
+                if task.get("array_id") is not None:
+                    run_by_array[task["array_id"]] = run_by_array.get(task["array_id"], 0) + 1
+                if task.get("owner"):
+                    run_by_owner[task["owner"]] = run_by_owner.get(task["owner"], 0) + 1
                 changed = True
                 dispatched += 1
                 placed = True
@@ -1405,6 +1517,7 @@ def run_one_cycle():
                 break
 
             if not placed:
+                starved += 1
                 if task.get("pending_reason") != reason:
                     task["pending_reason"] = reason
                     changed = True
@@ -1413,10 +1526,12 @@ def run_one_cycle():
             hh.save(health)
 
         # ── (3) Starvation watchdog ──────────────────────────────────────────
-        if pending and dispatched == 0:
+        # Only tasks that wanted a node count: one held by a dependency or a
+        # concurrency cap is not helped by re-polling the pool.
+        if starved and dispatched == 0:
             _starve_streak += 1
             if _starve_streak >= _starve_threshold:
-                request_repoll(f"starvation: {len(pending)} pending, 0 dispatched "
+                request_repoll(f"starvation: {starved} pending, 0 dispatched "
                                f"for {_starve_streak} cycles")
                 _starve_streak = 0
                 _starve_threshold = min(_starve_threshold * 2, STARVATION_CYCLES_MAX)

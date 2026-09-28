@@ -167,6 +167,16 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   delayed dispatch by minutes on an idle pool. Verify-before-dispatch is still inline.
   The tests set `hs.HEALTH_ASYNC = False` so one cycle yields one verdict.
 - **A task's finish time is its exit file's mtime**, not the cycle that noticed it.
+- **Dependencies and concurrency caps are gates that need no node.** They are checked
+  before the candidate loop (`waiting_for_dependency`, `array_limit`, `owner_limit`),
+  never consume a candidate, and do not count towards the starvation watchdog. A
+  failed/cancelled `--after` dependency fails the dependant without running it (exit
+  125, `dependency_failed`); a dependency that was pruned is looked up in
+  `events.jsonl`, and one hive knows nothing about counts as `done`. An array is N
+  ordinary tasks sharing `array_id` — same `name`, so history and `auto` still group.
+- **The user's command runs in a subshell** in the dispatch wrapper. Without it a
+  command containing `exit N` ended the wrapper before the footer and the exit file
+  were written, and the task surfaced as a crash orphan / "declared dead" (-1).
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

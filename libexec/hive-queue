@@ -230,6 +230,66 @@ def runs_by_name():
     return by_name
 
 
+ARRAY_MAX_TASKS = 1000    # one --array may not create more tasks than this
+
+
+def parse_id_list(text):
+    """Task ids from '12,13 14'. Raises ValueError on anything that is not an id."""
+    ids = []
+    for part in re.split(r"[,\s]+", str(text).strip()):
+        if not part:
+            continue
+        if not part.isdigit():
+            raise ValueError(f"not a task id: '{part}'")
+        if int(part) not in ids:
+            ids.append(int(part))
+    if not ids:
+        raise ValueError("no task id given")
+    return ids
+
+
+def parse_array(spec):
+    """(indices, max_running | None) from a SLURM-style array spec:
+    '0-9', '1,3,5', '0-20:5', any of them with '%4' = at most 4 running at once."""
+    spec = str(spec).strip()
+    cap = None
+    if "%" in spec:
+        spec, _, cap_s = spec.partition("%")
+        if not cap_s.isdigit() or int(cap_s) < 1:
+            raise ValueError(f"bad concurrency limit '%{cap_s}'")
+        cap = int(cap_s)
+    idx = []
+    for part in spec.split(","):
+        part = part.strip()
+        m = re.fullmatch(r"(\d+)(?:-(\d+)(?::(\d+))?)?", part)
+        if not m:
+            raise ValueError(f"bad array range '{part}'")
+        lo = int(m.group(1))
+        hi = int(m.group(2)) if m.group(2) is not None else lo
+        step = int(m.group(3)) if m.group(3) is not None else 1
+        if hi < lo or step < 1:
+            raise ValueError(f"bad array range '{part}'")
+        for i in range(lo, hi + 1, step):
+            if i not in idx:
+                idx.append(i)
+    if not idx:
+        raise ValueError("empty array")
+    if len(idx) > ARRAY_MAX_TASKS:
+        raise ValueError(f"array has {len(idx)} tasks (limit {ARRAY_MAX_TASKS})")
+    return idx, cap
+
+
+def disp_name(t):
+    """Name as shown to people: array members get their index, `sweep[3]`."""
+    name = t.get("name") or "—"
+    return f"{name}[{t['array_index']}]" if t.get("array_index") is not None else name
+
+
+def array_members(queue, array_id):
+    return sorted((t for t in queue.get("tasks", {}).values()
+                   if t.get("array_id") == array_id), key=lambda t: t["id"])
+
+
 NEED_MB_HEADROOM = 1.10   # --need-mb auto = P90 of past peaks + 10 %, rounded up to 500 MiB
 
 
@@ -351,6 +411,9 @@ def parse_hive_file(path):
         result["est_runtime"] = meta["est_runtime"]   # parsed/resolved in cmd_submit
     if "exclude" in meta:
         result["exclude"] = meta["exclude"]           # expanded in cmd_submit
+    for key in ("after", "after_any", "array", "max_running"):
+        if key in meta:
+            result[key] = meta[key]                   # parsed in cmd_submit
     if "timeout" in meta:
         result["timeout"] = meta["timeout"]           # parsed in cmd_submit
     if "notify" in meta:
@@ -569,6 +632,35 @@ def cmd_submit(args):
             print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
             sys.exit(2)
 
+    # Dependencies, array, concurrency cap (docs/feature_plan.md phase 3).
+    try:
+        after, after_mode = [], "ok"
+        if getattr(args, "after", None) or spec.get("after"):
+            after = parse_id_list(getattr(args, "after", None) or spec["after"])
+        elif getattr(args, "after_any", None) or spec.get("after_any"):
+            after = parse_id_list(getattr(args, "after_any", None) or spec["after_any"])
+            after_mode = "any"
+        arr_raw = getattr(args, "array", None) or spec.get("array")
+        array_idx, array_cap = parse_array(arr_raw) if arr_raw else ([None], None)
+    except ValueError as e:
+        print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
+        sys.exit(2)
+    mr_raw = getattr(args, "max_running", None)
+    if mr_raw is None:
+        mr_raw = spec.get("max_running") or os.environ.get("HIVE_MAX_RUNNING")
+    try:
+        max_running = int(mr_raw) if mr_raw not in (None, "") else None
+        if max_running is not None and max_running < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        print(f"{C_RED}error:{C_RESET} --max-running takes a number >= 1, got '{mr_raw}'",
+              file=sys.stderr)
+        sys.exit(2)
+    if max_running is not None and not spec.get("owner"):
+        print(f"{C_RED}error:{C_RESET} --max-running counts the running tasks of an owner — "
+              f"set --owner or $HIVE_OWNER", file=sys.stderr)
+        sys.exit(2)
+
     # Hard run-time limit: --timeout > #HIVE timeout=. Unlike --est-runtime (a placement
     # hint) this one is enforced: the scheduler kills the step when it is exceeded.
     timeout_secs = None
@@ -616,47 +708,89 @@ def cmd_submit(args):
 
     with QueueLock() as lfd:
         queue = load_queue(lfd)
-        task_id = queue["next_id"]
-        queue["next_id"] += 1
 
-        task = {
-            "id":           task_id,
-            "cmd":          spec["cmd"],
-            "workdir":      spec.get("workdir", os.getcwd()),
-            "name":         spec.get("name", ""),
-            "owner":        spec.get("owner", ""),
-            "state":        "pending",
-            "priority":     spec.get("priority", 0),
-            "submitted_at": now_iso(),
-            "submitted_ts": now_ts(),
-            "started_at":   None,
-            "finished_at":  None,
-            "slurm_jobid":  None,
-            "node":         None,
-            "srun_pid":     None,
-            "exit_code":    None,
-            "need_mb":      spec.get("need_mb", 0),
-            "gpus":         spec.get("gpus", DEFAULT_TASK_GPUS),
-            "exclude_nodes": exclude_nodes,
-            "timeout_secs":  timeout_secs,
-            "notify":        notify,
-            "est_runtime_secs":    est_secs,
-            "est_source":          est_source,
-            "requeue_count":       0,
-            "checkpoint_warning":  False,
-            "node_time_left_secs": None,
-            "duration_secs":       None,
-            "queued_secs":         None,
-            "log":          os.path.join(LOG_DIR, f"task-{task_id}.log"),
-        }
-        queue["tasks"][str(task_id)] = task
+        # A dependency has to be a task hive knows: still in the queue, or pruned and
+        # remembered by the event log. A typo would otherwise hold the task forever.
+        if after:
+            known = {int(k) for k in queue["tasks"]}
+            missing = [i for i in after if i not in known]
+            if missing:
+                seen = {e.get("task") for e in ev.iter_events() if e.get("task") in missing}
+                missing = [i for i in missing if i not in seen]
+            if missing:
+                print(f"{C_RED}error:{C_RESET} unknown task id(s) in --after: "
+                      f"{', '.join(map(str, missing))}", file=sys.stderr)
+                sys.exit(2)
+
+        created = []
+        array_id = None
+        for a_idx in array_idx:
+            task_id = queue["next_id"]
+            queue["next_id"] += 1
+            if a_idx is not None and array_id is None:
+                array_id = task_id            # the array is named after its first task
+
+            task = {
+                "id":           task_id,
+                "cmd":          spec["cmd"],
+                "workdir":      spec.get("workdir", os.getcwd()),
+                "name":         spec.get("name", ""),
+                "owner":        spec.get("owner", ""),
+                "state":        "pending",
+                "priority":     spec.get("priority", 0),
+                "submitted_at": now_iso(),
+                "submitted_ts": now_ts(),
+                "started_at":   None,
+                "finished_at":  None,
+                "slurm_jobid":  None,
+                "node":         None,
+                "srun_pid":     None,
+                "exit_code":    None,
+                "need_mb":      spec.get("need_mb", 0),
+                "gpus":         spec.get("gpus", DEFAULT_TASK_GPUS),
+                "exclude_nodes": exclude_nodes,
+                "timeout_secs":  timeout_secs,
+                "notify":        notify,
+                "depends_on":    after,
+                "depends_mode":  after_mode,
+                "array_id":      array_id,
+                "array_index":   a_idx,
+                "array_max_running": array_cap,
+                "max_running":   max_running,
+                "est_runtime_secs":    est_secs,
+                "est_source":          est_source,
+                "requeue_count":       0,
+                "checkpoint_warning":  False,
+                "node_time_left_secs": None,
+                "duration_secs":       None,
+                "queued_secs":         None,
+                "log":          os.path.join(LOG_DIR, f"task-{task_id}.log"),
+            }
+            queue["tasks"][str(task_id)] = task
+            created.append(task_id)
+            ev.record("submit", task=task_id, name=spec.get("name") or None,
+                      owner=spec.get("owner") or None,
+                      est_runtime_secs=est_secs, need_mb=spec.get("need_mb") or None,
+                      priority=spec.get("priority") or None,
+                      array_id=array_id, array_index=a_idx,
+                      depends_on=after or None)
         save_queue(queue, lfd)
-        ev.record("submit", task=task_id, name=spec.get("name") or None,
-                  owner=spec.get("owner") or None,
-                  est_runtime_secs=est_secs, need_mb=spec.get("need_mb") or None,
-                  priority=spec.get("priority") or None)
 
-    print(f"Submitted task #{task_id}" + (f"  (owner: {spec['owner']})" if spec.get("owner") else ""))
+    owner_s = f"  (owner: {spec['owner']})" if spec.get("owner") else ""
+    if array_id is not None:
+        print(f"Submitted array #{array_id}: {len(created)} tasks "
+              f"#{created[0]}–#{created[-1]}{owner_s}")
+        print(f"  index in $HIVE_ARRAY_INDEX"
+              + (f" · at most {array_cap} running at once" if array_cap else "")
+              + f" · hive wait --array {array_id} · hive cancel --array {array_id}")
+    else:
+        print(f"Submitted task #{task_id}{owner_s}")
+    if after:
+        print(f"  runs after {', '.join('#' + str(i) for i in after)} "
+              + ("finished OK (fails if one of them did not)" if after_mode == "ok"
+                 else "ended, whatever the outcome"))
+    if max_running:
+        print(f"  held while {spec['owner']} has {max_running} task(s) running")
     if timeout_secs:
         print(f"  timeout: {fmt_elapsed(timeout_secs)} of run time, then the task is killed "
               f"(failed, exit 124)")
@@ -777,7 +911,7 @@ def cmd_list(args):
     # Column widths (over everything shown). OWNER column only when it carries
     # information: some shown task has an owner and we're not already filtered to one.
     id_w    = max(len(str(t["id"])) for t in tasks)
-    name_w  = max(len(t.get("name") or "—") for t in tasks)
+    name_w  = max(len(disp_name(t)) for t in tasks)
     name_w  = max(name_w, 6)
     show_owner = (not owner) and any(t.get("owner") for t in tasks)
     owner_w = max((len(t.get("owner") or "—") for t in tasks), default=5) if show_owner else 0
@@ -803,7 +937,7 @@ def cmd_list(args):
 
     def print_row(t):
         tid     = str(t["id"])
-        name    = t.get("name") or "—"
+        name    = disp_name(t)
         state   = t["state"]
         node    = node_display(t)
         elapsed = task_elapsed(t)
@@ -865,6 +999,18 @@ def cmd_list(args):
 # ── Cancel ────────────────────────────────────────────────────────────────────
 
 def cmd_cancel(args):
+    if getattr(args, "array", None) is not None:
+        members = [t["id"] for t in array_members(load_queue(), args.array)
+                   if t["state"] in ("pending", "running")]
+        if not members:
+            print(f"Array #{args.array}: no pending or running task.")
+            return
+        for tid in members:
+            cmd_cancel(argparse.Namespace(id=tid, array=None))
+        return
+    if args.id is None:
+        print("hive cancel: give a task ID or --array ARRAY_ID", file=sys.stderr)
+        sys.exit(2)
     task_id = str(args.id)
     with QueueLock() as lfd:
         queue = load_queue(lfd)
@@ -1153,6 +1299,66 @@ def cmd_stats(args):
           f"(both resolved from the history above).{C_RESET}")
 
 
+def cmd_wait_many(args, ids):
+    """Block until every task in `ids` is terminal. Prints one line per task as it
+    ends and a summary — no logs (that is `hive logs ID`), so waiting on a 50-task
+    sweep costs 50 lines of context. Exit 0 if all ended `done`, else 1; 75 if
+    --pending-timeout expired with nothing running."""
+    poll = max(0.2, getattr(args, "interval", 5.0) or 5.0)
+    pending_timeout = getattr(args, "pending_timeout", 0) or 0
+    ids = list(dict.fromkeys(ids))
+    reported, idle_since = set(), None
+    print(f"Waiting for {len(ids)} task(s): #{ids[0]}–#{ids[-1]}" if len(ids) > 3
+          else f"Waiting for task(s): {', '.join('#' + str(i) for i in ids)}", flush=True)
+    while True:
+        tasks = load_queue().get("tasks", {})
+        states = {}
+        for i in ids:
+            t = tasks.get(str(i))
+            if t is None:
+                states[i] = "gone"                      # pruned / removed: it was terminal
+                if i not in reported:
+                    reported.add(i)
+                    print(f"  #{i} no longer in the queue (pruned)", flush=True)
+                continue
+            states[i] = t["state"]
+            if t["state"] in TERMINAL_STATES and i not in reported:
+                reported.add(i)
+                mark = {"done": f"{C_GREEN}✓", "failed": f"{C_RED}✗",
+                        "cancelled": f"{C_DIM}∅"}[t["state"]]
+                bits = [t["state"]]
+                if t.get("exit_code") not in (None, 0):
+                    bits.append(f"exit {t['exit_code']}")
+                if t.get("fail_reason"):
+                    bits.append(str(t["fail_reason"]))
+                if isinstance(t.get("duration_secs"), int):
+                    bits.append(f"ran {fmt_elapsed(t['duration_secs'])}")
+                if t.get("gpu_peak_mb") is not None:
+                    bits.append(f"gpu peak {fmt_mb(t['gpu_peak_mb'])}")
+                if t.get("node"):
+                    bits.append(f"on {t['node']}")
+                print(f"  {mark} #{i} {disp_name(t)}{C_RESET} · {' · '.join(bits)}", flush=True)
+        if len(reported) == len(ids):
+            break
+        if pending_timeout:
+            if any(s == "running" for s in states.values()):
+                idle_since = None
+            else:
+                idle_since = idle_since or time.time()
+                if time.time() - idle_since > pending_timeout:
+                    left = [i for i in ids if i not in reported]
+                    print(f"  {C_RED}gave up: {len(left)} task(s) still PENDING and none "
+                          f"running after {int(pending_timeout)}s{C_RESET}", flush=True)
+                    sys.exit(75)
+        time.sleep(poll)
+    n_ok = sum(1 for s in states.values() if s == "done")
+    bad = [i for i in ids if states[i] not in ("done", "gone")]
+    print(f"{len(ids)} task(s): {n_ok} done"
+          + (f", {len(bad)} not: {', '.join('#' + str(i) for i in bad)}  (hive logs ID)" if bad else ""),
+          flush=True)
+    sys.exit(1 if bad else 0)
+
+
 # ── Remove ────────────────────────────────────────────────────────────────────
 
 def cmd_rm(args):
@@ -1303,6 +1509,17 @@ def build_parser():
                          f"may own several; extra ones are hidden via CUDA_VISIBLE_DEVICES so "
                          f"frameworks don't auto-DataParallel. Use --gpus 2 for real multi-GPU; "
                          f"the task then only places on a hold job with >= 2 GPUs")
+    ps.add_argument("--after", metavar="ID[,ID]",
+                    help="Run only after these tasks ended `done`. If one of them failed or "
+                         "was cancelled, this task fails too (dependency_failed)")
+    ps.add_argument("--after-any", metavar="ID[,ID]", dest="after_any",
+                    help="Run after these tasks ended, whatever their outcome")
+    ps.add_argument("--array", metavar="SPEC",
+                    help="Submit one task per index: 0-9, 1,3,5, 0-20:5. Append %%N to run at "
+                         "most N at once (0-9%%4). The index is in $HIVE_ARRAY_INDEX")
+    ps.add_argument("--max-running", type=int, metavar="N", dest="max_running",
+                    help="Hold this task while its owner already has N tasks running "
+                         "(needs --owner / $HIVE_OWNER). Default: $HIVE_MAX_RUNNING")
     ps.add_argument("--timeout", metavar="DUR",
                     help="Kill the task after this much RUN time (2h, 90m, 1-12:00:00). "
                          "It ends as failed with exit code 124 and is not retried")
@@ -1335,7 +1552,9 @@ def build_parser():
 
     # cancel
     pc = sub.add_parser("cancel", help="Cancel a pending or running task")
-    pc.add_argument("id", type=int, metavar="ID")
+    pc.add_argument("id", type=int, metavar="ID", nargs="?")
+    pc.add_argument("--array", type=int, metavar="ARRAY_ID",
+                    help="Cancel every pending/running task of this array")
 
     # logs
     pg = sub.add_parser("logs", help="Show task log")
@@ -1374,7 +1593,11 @@ def build_parser():
 
     # wait
     pw = sub.add_parser("wait", help="Block until task finishes, print log, exit with task's exit code")
-    pw.add_argument("id", type=int, metavar="ID")
+    pw.add_argument("id", type=int, metavar="ID", nargs="*",
+                    help="One ID: print its log and exit with its exit code. Several: "
+                         "wait for all of them, one line each, exit 1 if any did not end done")
+    pw.add_argument("--array", type=int, metavar="ARRAY_ID",
+                    help="Wait for every task of this array")
     pw.add_argument("--interval", "-i", type=float, default=5.0, metavar="SEC",
                     help="Poll interval in seconds (default: 5)")
     pw.add_argument("--no-log", action="store_true",
@@ -1423,7 +1646,20 @@ def main():
     elif cmd == "rm":
         cmd_rm(args)
     elif cmd == "wait":
-        cmd_wait(args)
+        ids = list(args.id or [])
+        if getattr(args, "array", None) is not None:
+            ids += [t["id"] for t in array_members(load_queue(), args.array)]
+            if not ids:
+                print(f"Array #{args.array} not found.", file=sys.stderr)
+                sys.exit(1)
+        if not ids:
+            print("hive wait: give a task ID, several, or --array ARRAY_ID", file=sys.stderr)
+            sys.exit(2)
+        if len(ids) == 1 and getattr(args, "array", None) is None:
+            args.id = ids[0]
+            cmd_wait(args)
+        else:
+            cmd_wait_many(args, ids)
     elif cmd == "stats":
         cmd_stats(args)
     elif cmd == "prune":

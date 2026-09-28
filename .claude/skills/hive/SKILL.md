@@ -49,6 +49,9 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--gpus N` | GPUs the task may see (default **1**; extras are hidden so frameworks don't auto-DataParallel) |
 | `--timeout 2h` | kill the task after that much run time (failed, exit 124) — use it for anything that can hang |
 | `--notify CMD` | run CMD when the task finishes or is requeued (`HIVE_TASK_*` env; runs on the scheduler host; default `$HIVE_NOTIFY`) |
+| `--after ID,ID` | pipeline: run only after those tasks ended done (fails with them, exit 125). `--after-any` = whatever their outcome |
+| `--array 0-9%4` | sweep: one task per index (`$HIVE_ARRAY_INDEX`, single-quote the command), at most 4 at once. `hive wait --array ID`, `hive cancel --array ID` |
+| `--max-running N` | don't take more than N nodes at once for this owner |
 | `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
 | `--priority N` | higher dispatches first |
@@ -65,6 +68,7 @@ These commands are sized for agents; prefer them over `cat ~/.hive/…` or `sque
 |---|---|---|
 | my tasks | `hive list` | active + last 10 finished, **only `$HIVE_OWNER`'s when set** (`--owner NAME`, `--owner all`, `--limit N`, `--state failed`) |
 | one task's verdict | `hive wait ID` / `hive logs ID -n 50` | header + tail |
+| several tasks / a sweep | `hive wait ID ID …` / `hive wait --array ID` | one line per task, no logs; exit 1 if any did not end done |
 | is the pool healthy | `hive nodes` | one line per hold job + summary |
 | why is it pending | `hive list` → NODE column shows the `pending_reason` | — |
 | bad nodes | `hive health` | one line per node |
