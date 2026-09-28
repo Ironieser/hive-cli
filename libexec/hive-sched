@@ -835,6 +835,35 @@ def drop_node(candidates, node, i):
     return i - before
 
 
+FAIR_WINDOW_SECS = 24 * 3600
+
+
+def owner_usage(tasks, now=None):
+    """{owner: GPU-seconds used in the last FAIR_WINDOW_SECS}, running tasks included.
+    Coarse on purpose: it only has to say who had less."""
+    now = now if now is not None else time.time()
+    since = now - FAIR_WINDOW_SECS
+    use = {}
+    for t in tasks.values():
+        owner = t.get("owner") or ""
+        t0 = _task_epoch(t, "started")
+        if t0 is None:
+            continue
+        if t["state"] == "running":
+            t1 = now
+        elif t["state"] in ("done", "failed", "cancelled"):
+            t1 = _task_epoch(t, "finished")
+        else:
+            continue
+        if t1 is None or t1 < since:
+            continue
+        gpus = max(1, task_gpus(t))
+        use[owner] = use.get(owner, 0) + max(0.0, t1 - max(t0, since)) * gpus
+    # Bucketed (10 GPU-minutes), so that owners who used about the same stay in
+    # submission order instead of leap-frogging on every finished task.
+    return {o: int(v // 600) for o, v in use.items()}
+
+
 def preferred_partitions():
     """Partitions to dispatch to first, from "prefer_partitions" in pool_config.json."""
     try:
@@ -1010,7 +1039,7 @@ def dispatch_task(task, slurm_jobid, node_name):
     if want_gpus > 0:
         uf = q(use_file)
         sampler = (
-            "( _pk=0; _mu=0; _su=0; _n=0; _k=0\n"
+            "( trap '' USR1; _pk=0; _mu=0; _su=0; _n=0; _k=0\n"
             "  while true; do\n"
             "    _r=$(nvidia-smi --query-gpu=utilization.gpu,memory.used "
             f"--format=csv,noheader,nounits 2>/dev/null | sed -n '{sample}')\n"
@@ -1026,6 +1055,23 @@ def dispatch_task(task, slurm_jobid, node_name):
             "_US_PID=$!\n"
             "disown $_US_PID\n"
         )
+
+    # How the command is started. With --warn-before it runs in the background with
+    # the wrapper waiting for it, because the warning is a SIGUSR1 to the step: a bash
+    # that is in the foreground of a child does not run traps until the child ends,
+    # and one without a trap is killed by the signal — either way the wrapper could
+    # not pass it on and live to write the exit file.
+    if task.get("warn_before_secs"):
+        run_line = (
+            f"bash -c -- {q(cmd)} >> {lf} 2>&1 &\n"
+            "_CMD_PID=$!\n"
+            "trap 'kill -USR1 $_CMD_PID 2>/dev/null' USR1\n"
+            "while :; do wait $_CMD_PID; _EC=$?; kill -0 $_CMD_PID 2>/dev/null || break; done\n"
+            "trap - USR1\n"
+            "( exit $_EC )\n"
+        )
+    else:
+        run_line = f"bash -c -- {q(cmd)} >> {lf} 2>&1\n"
 
     # Shell wrapper that runs on the compute node.
     # All output (including srun-level errors) goes to the task log.
@@ -1045,7 +1091,7 @@ def dispatch_task(task, slurm_jobid, node_name):
         f"fi\n"
         + gpu_line + env_line +
         # ── Heartbeat process (disowned to suppress bash "Terminated" noise) ───
-        f"( while true; do date -Iseconds > {hb}; sleep 30; done ) &\n"
+        f"( trap '' USR1; while true; do date -Iseconds > {hb}; sleep 30; done ) &\n"
         f"_HB_PID=$!\n"
         f"disown $_HB_PID\n"
         + sampler +
@@ -1058,7 +1104,7 @@ def dispatch_task(task, slurm_jobid, node_name):
         # the command (an unbalanced quote or parenthesis) is then that bash's error
         # and exit code, and not a parse error of this wrapper, which used to end without
         # footer or exit file and left the task to be "declared dead" minutes later.
-        f"bash -c -- {q(cmd)} >> {lf} 2>&1\n"
+        "" + run_line +
         f"_EC=$?\n"
         # ── Footer (double-quotes so $(date) and $_EC are expanded by bash) ──
         f'echo "" >> {lf}\n'
@@ -1072,9 +1118,15 @@ def dispatch_task(task, slurm_jobid, node_name):
     # Redirect srun's own stderr to the task log so SLURM-level errors are captured
     # (e.g. "srun: error: job 584954 is no longer running")
     log_fd = open(log_file, 'a')
+    # Per-task CPU / memory (checklist B4): a step inside the hold job's allocation,
+    # so it can never be given more than the hold job has. Without them, as before:
+    # all of the hold job's CPUs, shared, and no memory limit of its own.
+    step = ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1"]
+    if task.get("cpus"):
+        step.append(f"--cpus-per-task={int(task['cpus'])}")
+    step.append(f"--mem={int(task['mem_mb'])}M" if task.get("mem_mb") else "--mem=0")
     proc = subprocess.Popen(
-        ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
-         "bash", "-c", wrapper],
+        step + ["bash", "-c", wrapper],
         stdin=subprocess.DEVNULL,
         stdout=log_fd,
         stderr=log_fd,
@@ -1140,6 +1192,71 @@ def _is_crash_orphan(task):
         return False   # srun still a live process — not an orphan
     age = _task_age(task, "dispatched", "started")
     return age is None or age > ORPHAN_GRACE_SECS
+
+
+# ── Housekeeping (checklist A9) ──────────────────────────────────────────────
+# queue.json is read and written twice per cycle and by every CLI call; at 9000
+# finished tasks it was 8.6 MB. Finished tasks older than `auto_prune_days`
+# (pool_config.json, default 14, 0 = never) are dropped from it once in a while. Their
+# history stays in events.jsonl, and so do `hive stats`, `auto` estimates, `--after`
+# and `hive wait` for them. Task LOGS are only removed if `log_keep_days` is set.
+AUTO_PRUNE_DAYS_DEFAULT = 14
+AUTO_PRUNE_EVERY = 6 * 3600
+_last_auto_prune = 0.0
+
+
+def pool_setting(key, default=None):
+    try:
+        with open(os.path.join(HIVE_DIR, "pool_config.json")) as f:
+            return json.load(f).get(key, default)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return default
+
+
+def auto_prune(queue, now=None):
+    """Drop old terminal tasks from `queue` (in place). Returns how many."""
+    global _last_auto_prune
+    now = now if now is not None else time.time()
+    if now - _last_auto_prune < AUTO_PRUNE_EVERY:
+        return 0
+    _last_auto_prune = now
+    try:
+        days = float(pool_setting("auto_prune_days", AUTO_PRUNE_DAYS_DEFAULT))
+        log_days = float(pool_setting("log_keep_days", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    n = 0
+    if days > 0:
+        tasks = queue.get("tasks", {})
+        for key in [k for k, t in tasks.items()
+                    if t.get("state") in ("done", "failed", "cancelled")
+                    and not t.get("notify_pending")
+                    and (_task_epoch(t, "finished") or now) < now - days * 86400]:
+            for path in (os.path.join(HEARTBEAT_DIR, key), os.path.join(HEARTBEAT_DIR, key + ".exit"),
+                         usage_file(key)):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            del tasks[key]
+            n += 1
+        if n:
+            logging.info("Auto-prune: %d finished task(s) older than %g days left the queue "
+                         "(history stays in events.jsonl)", n, days)
+    if log_days > 0:
+        gone = 0
+        try:
+            for name in os.listdir(LOG_DIR):
+                path = os.path.join(LOG_DIR, name)
+                if name.startswith("task-") and name.endswith(".log") \
+                        and os.path.getmtime(path) < now - log_days * 86400:
+                    os.remove(path)
+                    gone += 1
+        except OSError:
+            pass
+        if gone:
+            logging.info("Auto-prune: removed %d task log(s) older than %g days", gone, log_days)
+    return n
 
 
 PROBE_PARALLEL_MAX = 8      # verify probes run at once, outside queue.lock
@@ -1259,6 +1376,10 @@ def _cycle(probe_cache, final):
             # Hard run-time limit (`hive submit --timeout`). The command's own doing, so
             # never retried and never a strike against the node.
             limit = task.get("timeout_secs")
+            if limit and task.get("node_slow_init_secs"):
+                # On a slow node the first minutes go to CUDA init, which is the
+                # node's doing: the limit is on the task's own run time.
+                limit = float(limit) + float(task["node_slow_init_secs"])
             ran = _task_age(task, "started", "dispatched")
             if limit and ran is not None and ran > float(limit) \
                     and not status.startswith("done:") and not task.get("cancel_requested") \
@@ -1295,6 +1416,30 @@ def _cycle(probe_cache, final):
                           run_secs=task["duration_secs"], queued_secs=task["queued_secs"], **usage_fields(task))
                 notify(task, "finish")
                 continue
+
+            # Node about to expire (`hive submit --warn-before`): one SIGUSR1 to the
+            # step, once, so the command can write a checkpoint while it still can.
+            warn = task.get("warn_before_secs")
+            if warn and not task.get("warned_ts") and status == "alive" and jid in jobs_db:
+                left = db_time_left(jobs_db[jid], db_updated)
+                if left is not None and 0 <= left <= float(warn):
+                    pid = task.get("srun_pid")
+                    sent = False
+                    if pid and _pid_alive(pid):
+                        try:
+                            os.kill(pid, signal.SIGUSR1)       # srun passes it to the step
+                            sent = True
+                        except OSError:
+                            pass
+                    task["warned_ts"] = now_ts()
+                    changed = True
+                    append_log_note(task, [
+                        f"=== hive: node {task.get('node', '?')} will be reclaimed in about "
+                        f"{_fmt_dur(left)} — SIGUSR1 {'sent to' if sent else 'could NOT be sent to'} "
+                        f"the command at {now_iso()} ==="])
+                    logging.info("Task %d warned: node %s expires in %s (SIGUSR1 %s)", task["id"],
+                                 task.get("node", "?"), _fmt_dur(left), "sent" if sent else "not sent")
+                    notify(task, "expiring")
 
             if task.get("cancel_requested") and not status.startswith("done:"):
                 # `hive cancel` may run on ANOTHER node (feedback C5 class): the srun
@@ -1620,9 +1765,15 @@ def _cycle(probe_cache, final):
                                        c[0] in _probe_backoff,
                                        partition_rank(c[1].get("partition"), prefer)))
         n_quarantined_jobs = sum(1 for i in jobs_db.values() if i.get("node") in quarantined)
+        # Order: priority, then — with "fair_share": true in pool_config.json — the
+        # owner who used the pool least in the last FAIR_WINDOW_SECS, then age. Without
+        # it, first come first served: one owner's 50-task sweep then runs to the end
+        # before anybody else's task submitted a minute later.
+        usage = owner_usage(tasks) if pool_setting("fair_share", False) else {}
         pending = sorted(
             [t for t in tasks.values() if t["state"] == "pending"],
-            key=lambda t: (-t.get("priority", 0), t["submitted_at"]),
+            key=lambda t: (-t.get("priority", 0), usage.get(t.get("owner") or "", 0),
+                           t["submitted_at"]),
         )
 
         dispatched = 0
@@ -1701,6 +1852,8 @@ def _cycle(probe_cache, final):
             held = None
             if task.get("held"):
                 held = "held"                       # `hive hold`; until `hive unhold`
+            elif task.get("begin_ts") and time.time() < float(task["begin_ts"]):
+                held = "waiting_for_begin"          # `hive submit --begin`
             elif dep == "wait":
                 held = "waiting_for_dependency"
             elif task.get("array_max_running") and task.get("array_id") is not None \
@@ -1997,6 +2150,10 @@ def _cycle(probe_cache, final):
             _starve_streak = 0
             _starve_threshold = STARVATION_CYCLES
 
+        _watch_exit.clear()
+        _watch_exit.update(t["id"] for t in tasks.values() if t["state"] == "running")
+        if final and auto_prune(queue):
+            changed = True
         if changed:
             save_queue(queue, lfd)
     return wanted
@@ -2087,10 +2244,35 @@ def scheduler_loop():
         except Exception as e:
             logging.error("Cycle error: %s", e, exc_info=True)
         roll_log()
-        for _ in range(POLL_INTERVAL):
-            if stop_requested():
-                shutdown(0)
-            time.sleep(1)
+        idle_wait()
+
+
+# ── Waking up early (checklist A1) ───────────────────────────────────────────
+# A cycle used to start every 30 s whatever happened, so a task submitted right after
+# one waited 30 s for the next, plus the probe: 38–77 s measured on an idle pool. The
+# CLI now touches `sched.wake` whenever the queue changes in a way that may let
+# something run, and a finished task shows as an exit file; either ends the wait.
+SCHED_WAKE     = os.path.join(HIVE_DIR, "sched.wake")
+MIN_CYCLE_GAP  = 3        # seconds between cycles, however many wake-ups arrive
+_watch_exit    = set()    # ids of the tasks that were running at the last pass
+
+
+def woken():
+    try:
+        os.remove(SCHED_WAKE)
+        return True
+    except OSError:
+        pass
+    return any(_has_exit_file(tid) for tid in _watch_exit)
+
+
+def idle_wait():
+    for sec in range(POLL_INTERVAL):
+        if stop_requested():
+            shutdown(0)
+        if sec >= MIN_CYCLE_GAP and woken():
+            return
+        time.sleep(1)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

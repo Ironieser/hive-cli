@@ -235,6 +235,39 @@ def runs_by_name():
 ARRAY_MAX_TASKS = 1000    # one --array may not create more tasks than this
 
 
+def parse_begin(text, now=None):
+    """Epoch for `--begin`: a delay ('2h', '90m'), a date and time
+    ('2026-10-01T08:00', '2026-10-01 08:00:00'), or a time of day ('08:00' — today, or
+    tomorrow if that has passed). None if unreadable."""
+    now = now if now is not None else time.time()
+    text = str(text).strip()
+    if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", text):
+        parts = [int(x) for x in text.split(":")] + [0]
+        if parts[0] > 23 or parts[1] > 59 or parts[2] > 59:
+            return None
+        day = datetime.fromtimestamp(now).replace(hour=parts[0], minute=parts[1],
+                                                  second=parts[2], microsecond=0)
+        if day.timestamp() <= now:
+            day += timedelta(days=1)
+        return day.timestamp()
+    if re.match(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            return datetime.fromisoformat(text.replace(" ", "T")).timestamp()
+        except ValueError:
+            return None
+    secs = parse_duration(text)
+    return now + secs if secs else None
+
+
+def wake_scheduler():
+    """Tell the scheduler that the queue changed in a way that may let something run,
+    so it does not sit out the rest of its 30 s wait."""
+    try:
+        open(os.path.join(HIVE_DIR, "sched.wake"), "w").close()
+    except OSError:
+        pass
+
+
 def parse_id_list(text):
     """Task ids from '12,13 14'. Raises ValueError on anything that is not an id."""
     ids = []
@@ -484,7 +517,8 @@ def parse_hive_file(path):
         result["est_runtime"] = meta["est_runtime"]   # parsed/resolved in cmd_submit
     if "exclude" in meta:
         result["exclude"] = meta["exclude"]           # expanded in cmd_submit
-    for key in ("after", "after_any", "array", "max_running", "allow_slow"):
+    for key in ("after", "after_any", "array", "max_running", "allow_slow", "begin",
+                "cpus", "mem", "warn_before"):
         if key in meta:
             result[key] = meta[key]                   # parsed in cmd_submit
     if "timeout" in meta:
@@ -828,6 +862,40 @@ def _submit(args, out):
               f"set --owner or $HIVE_OWNER", file=sys.stderr)
         sys.exit(2)
 
+    # Delayed start, CPU / memory of the step, warning before the node expires.
+    begin_ts = None
+    b_raw = getattr(args, "begin", None) or spec.get("begin")
+    if b_raw:
+        begin_ts = parse_begin(b_raw)
+        if begin_ts is None:
+            print(f"{C_RED}error:{C_RESET} could not parse --begin '{b_raw}' (try 2h, 30m, "
+                  f"2026-10-01T08:00, 08:00)", file=sys.stderr)
+            sys.exit(2)
+    def _int_opt(name, flag, lo=1):
+        raw = getattr(args, name, None)
+        if raw is None:
+            raw = spec.get(name)
+        if raw in (None, ""):
+            return None
+        try:
+            val = int(raw)
+            if val < lo:
+                raise ValueError
+            return val
+        except (TypeError, ValueError):
+            print(f"{C_RED}error:{C_RESET} {flag} takes a whole number >= {lo}, got '{raw}'",
+                  file=sys.stderr)
+            sys.exit(2)
+    cpus = _int_opt("cpus", "--cpus")
+    mem_mb = _int_opt("mem", "--mem")
+    warn_before = None
+    w_raw = getattr(args, "warn_before", None) or spec.get("warn_before")
+    if w_raw:
+        warn_before = parse_duration(w_raw)
+        if not warn_before:
+            print(f"{C_RED}error:{C_RESET} could not parse --warn-before '{w_raw}'", file=sys.stderr)
+            sys.exit(2)
+
     # Slow nodes (usable, but CUDA takes minutes to initialise): --allow-slow /
     # --no-slow > #HIVE allow_slow= > decided from the runtime estimate (None).
     allow_slow = getattr(args, "allow_slow", None)
@@ -955,6 +1023,10 @@ def _submit(args, out):
                 "array_max_running": array_cap,
                 "max_running":   max_running,
                 "allow_slow":    allow_slow,
+                "begin_ts":      begin_ts,
+                "cpus":          cpus,
+                "mem_mb":        mem_mb,
+                "warn_before_secs": warn_before,
                 "est_runtime_secs":    est_secs,
                 "est_source":          est_source,
                 "requeue_count":       0,
@@ -974,6 +1046,7 @@ def _submit(args, out):
                       depends_on=after or None)
         save_queue(queue, lfd)
 
+    wake_scheduler()
     if getattr(args, "quiet", False):
         print(array_id if array_id is not None else task_id, file=out)   # for $(...)
         if not is_sched_running():
@@ -997,6 +1070,13 @@ def _submit(args, out):
                  else "ended, whatever the outcome"))
     if max_running:
         print(f"  held while {spec['owner']} has {max_running} task(s) running")
+    if begin_ts:
+        print(f"  not before {datetime.fromtimestamp(begin_ts).strftime('%Y-%m-%d %H:%M:%S')}")
+    if cpus or mem_mb:
+        print("  step limits: " + ", ".join(x for x in (f"{cpus} CPUs" if cpus else "",
+                                                           f"{mem_mb} MiB memory" if mem_mb else "") if x))
+    if warn_before:
+        print(f"  SIGUSR1 to the command {fmt_elapsed(warn_before)} before its node expires")
     if timeout_secs:
         print(f"  timeout: {fmt_elapsed(timeout_secs)} of run time, then the task is killed "
               f"(failed, exit 124)")
@@ -1265,6 +1345,7 @@ def cmd_cancel(args):
                 # --notify hook. Killing srun from here skipped all three.
                 task["cancel_requested"] = now_iso()
                 save_queue(queue, lfd)
+                wake_scheduler()
                 print(f"Task #{task_id} cancel requested — the scheduler on "
                       f"{sched_host or '?'} owns the srun step and will stop it within "
                       f"~30s (hive list shows CANCELLING until then).")
@@ -1573,6 +1654,7 @@ def cmd_hold(args, hold=True):
                 ev.record(verb, task=t["id"], name=t.get("name") or None)
         if changed:
             save_queue(queue, lfd)
+            wake_scheduler()
     what = "held" if hold else "released for dispatch"
     print(f"{len(changed)} task(s) {what}" + (": " + ", ".join(f"#{i}" for i in changed) if changed else "."))
     if not targets:
@@ -1591,6 +1673,7 @@ def cmd_priority(args):
                       priority=args.priority, was=old)
         if targets:
             save_queue(queue, lfd)
+            wake_scheduler()
     print(f"{len(targets)} task(s) now at priority {args.priority}"
           + (": " + ", ".join(f"#{t['id']}" for t in targets) if targets else "."))
     if not targets:
@@ -1881,6 +1964,16 @@ def build_parser():
                          "then runs normally). Default: yes when --est-runtime is 1h or more")
     ps.add_argument("--no-slow", dest="allow_slow", action="store_false",
                     help="Never run on a slow node, however long the task")
+    ps.add_argument("--begin", metavar="WHEN",
+                    help="Do not start before: a delay (2h, 30m), a date and time "
+                         "(2026-10-01T08:00) or a time of day (08:00)")
+    ps.add_argument("--cpus", type=int, metavar="N",
+                    help="CPUs for the task (default: all of the hold job's, shared)")
+    ps.add_argument("--mem", type=int, metavar="MB",
+                    help="Memory limit of the task in MiB (default: none of its own)")
+    ps.add_argument("--warn-before", metavar="DUR", dest="warn_before",
+                    help="Send SIGUSR1 to the command this long before its node expires, "
+                         "so it can checkpoint (it must handle the signal)")
     ps.add_argument("--timeout", metavar="DUR",
                     help="Kill the task after this much RUN time (2h, 90m, 1-12:00:00). "
                          "It ends as failed with exit code 124 and is not retried")

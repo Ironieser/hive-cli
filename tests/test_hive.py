@@ -1156,7 +1156,8 @@ def _rc(fn, *a, **k):
 def _nsR(**kw):
     base = dict(cmd_or_file="true", workdir=None, priority=None, name=None, owner=None, need_mb=None,
                 gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
-                after_any=None, array=None, max_running=None, allow_slow=None, quiet=False)
+                after_any=None, array=None, max_running=None, allow_slow=None, quiet=False,
+                begin=None, cpus=None, mem=None, warn_before=None)
     base.update(kw); return _apR.Namespace(**base)
 def _new():
     return max(rq().values(), key=lambda t: t["id"])
@@ -1590,6 +1591,158 @@ wq({"750": dict(task(750, name="dash"), cmd="-notacommand 2>/dev/null; echo afte
 hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle()
 chk("a command starting with '-' runs as a command", "after-dash" in open(rq()["750"]["log"]).read())
 hs._freed_at.clear(); hs._task_skip.clear()
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
+
+print("== checklist round 2: wake-up, prune, begin, step limits, warning, fair share ==")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
+_cfg = os.path.join(hs.HIVE_DIR, "pool_config.json")
+def cfg(**kw):
+    json.dump(kw, open(_cfg, "w"))
+
+# A1 — the scheduler's wait ends on a submit and on a task's exit
+try: os.remove(hs.SCHED_WAKE)
+except OSError: pass
+hs._watch_exit.clear()
+chk("nothing happened -> keep waiting", hs.woken() is False)
+_rc(hq.cmd_submit, _nsR(name="wakes"))
+chk("a submit leaves sched.wake", os.path.exists(hs.SCHED_WAKE))
+chk("...which ends the wait, once", hs.woken() is True and hs.woken() is False)
+hs._watch_exit.add(801); open(os.path.join(hs.HEARTBEAT_DIR, "801.exit"), "w").write("0")
+chk("the exit file of a running task ends the wait", hs.woken() is True)
+os.remove(os.path.join(hs.HEARTBEAT_DIR, "801.exit")); hs._watch_exit.clear()
+_sl = []; _ts = hs.time.sleep; hs.time.sleep = lambda x: _sl.append(x)
+open(hs.SCHED_WAKE, "w").close(); hs.idle_wait()
+chk("but never sooner than MIN_CYCLE_GAP after the last cycle", len(_sl) == hs.MIN_CYCLE_GAP)
+_sl.clear(); hs.idle_wait()
+chk("without a wake-up the full interval is waited", len(_sl) == hs.POLL_INTERVAL)
+hs.time.sleep = _ts
+
+# A9 — auto-prune
+old_t = dict(task(810, name="old", state="done"), finished_ts=time.time() - 20 * 86400, exit_code=0)
+new_t = dict(task(811, name="new", state="done"), finished_ts=time.time() - 86400, exit_code=0)
+owed = dict(task(812, name="owed", state="failed"), finished_ts=time.time() - 20 * 86400, notify_pending="finish")
+q_ = {"version": 1, "next_id": 900, "tasks": {"810": old_t, "811": new_t, "812": owed,
+                                              "813": task(813, name="pend")}}
+open(os.path.join(hs.LOG_DIR, "task-810.log"), "w").write("x")
+hs._last_auto_prune = 0
+chk("tasks finished more than auto_prune_days ago leave the queue",
+    hs.auto_prune(q_) == 1 and sorted(q_["tasks"]) == ["811", "812", "813"])
+chk("their logs stay (log_keep_days is not set)", os.path.exists(os.path.join(hs.LOG_DIR, "task-810.log")))
+q_["tasks"]["810"] = old_t
+chk("not again before AUTO_PRUNE_EVERY", hs.auto_prune(q_) == 0)
+cfg(auto_prune_days=0); hs._last_auto_prune = 0
+chk("auto_prune_days: 0 switches it off", hs.auto_prune(q_) == 0 and "810" in q_["tasks"])
+cfg(auto_prune_days=14, log_keep_days=10); hs._last_auto_prune = 0
+_o = time.time() - 11 * 86400; os.utime(os.path.join(hs.LOG_DIR, "task-810.log"), (_o, _o))
+hs.auto_prune(q_)
+chk("log_keep_days removes old logs", not os.path.exists(os.path.join(hs.LOG_DIR, "task-810.log")))
+os.remove(_cfg); hs._last_auto_prune = time.time()
+
+# B3 — --begin
+_n = time.time()
+chk("parse_begin: delay, date-time, time of day",
+    abs(hq.parse_begin("2h", _n) - (_n + 7200)) < 1
+    and hq.parse_begin("2030-01-02T03:04") == datetime.datetime(2030, 1, 2, 3, 4).timestamp()
+    and 0 < hq.parse_begin("00:00", _n) - _n <= 86400 and hq.parse_begin("25:00") is None
+    and hq.parse_begin("soon") is None)
+json.dump({"version": 1, "next_id": 820, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="later", begin="1h")); _rc(hq.cmd_submit, _nsR(name="now"))
+wdb({"700": node("n0", 72000), "701": node("n1", 72000)})
+hs.run_one_cycle(); time.sleep(0.3)
+chk("--begin holds the task (waiting_for_begin); the one behind it runs",
+    rq()["820"].get("pending_reason") == "waiting_for_begin" and rq()["821"]["state"] in ("running", "done"))
+q_ = rq(); q_["820"]["begin_ts"] = time.time() - 1; wq(q_)
+hs.run_one_cycle(); time.sleep(0.3)
+chk("...and runs once its time has come", rq()["820"]["state"] in ("running", "done"))
+chk("--begin that cannot be read is an error", _rc(hq.cmd_submit, _nsR(begin="soon"))[0] == 2)
+
+# B4 — CPUs / memory of the step
+_argv = []
+_pop = hs.subprocess.Popen
+class _Spy:
+    def __init__(self, a, **k):
+        _argv.append(list(a)); self._p = _pop(["true"]); self.pid = self._p.pid
+hs.subprocess.Popen = _Spy
+hs.dispatch_task(dict(task(830, name="lim"), cpus=2, mem_mb=16000), "700", "n0")
+hs.dispatch_task(task(831, name="nolim"), "700", "n0")
+hs.subprocess.Popen = _pop
+chk("--cpus / --mem become limits of the srun step",
+    "--cpus-per-task=2" in _argv[0] and "--mem=16000M" in _argv[0] and "--mem=0" not in _argv[0])
+chk("without them the step is launched as before",
+    "--mem=0" in _argv[1] and not any(a.startswith("--cpus") for a in _argv[1]))
+chk("--cpus 0 is refused", _rc(hq.cmd_submit, _nsR(cpus=0))[0] == 2)
+_rc(hq.cmd_submit, _nsR(name="l2", cpus=3, mem=8000, warn_before="10m"))
+chk("stored on the task", (_new()["cpus"], _new()["mem_mb"], _new()["warn_before_secs"]) == (3, 8000, 600))
+
+# B2 — warning before the node expires
+_flag = os.path.join(hs.HIVE_DIR, "got_usr1")
+_cmdw = f"trap 'echo caught > {_flag}; exit 0' USR1; for i in $(seq 100); do sleep 0.1; done; exit 5"
+wdb({"700": node("expiring", 400)})                       # 400 s of walltime left
+clear_notified()
+wq({"840": dict(task(840, name="warned"), cmd=_cmdw, warn_before_secs=600, notify=_hook)})
+hs.run_one_cycle()                                        # dispatched
+chk("dispatched with the waiting wrapper", rq()["840"]["state"] == "running")
+time.sleep(1.0)
+hs.run_one_cycle()                                        # walltime 400 s <= 600 s -> warn
+t = rq()["840"]
+chk("the task is warned once", t.get("warned_ts") and "will be reclaimed" in open(t["log"]).read())
+for _ in range(40):
+    if os.path.exists(_flag): break
+    time.sleep(0.1)
+chk("the command received SIGUSR1 and handled it", os.path.exists(_flag))
+time.sleep(0.5); hs.run_one_cycle()
+t = rq()["840"]
+chk("the wrapper survived the signal: exit code and footer are there",
+    (t["state"], t["exit_code"]) == ("done", 0) and "finished at" in open(t["log"]).read())
+chk("hook called with event `expiring`", any(l.startswith("840 expiring") for l in notified()))
+_w = open(t["log"]).read().count("will be reclaimed")
+chk("...and only once", _w == 1)
+clear_notified()
+wq({"841": dict(task(841, name="plenty"), cmd="sleep 1", warn_before_secs=600)})
+wdb({"700": node("fresh", 72000)})
+hs.run_one_cycle(); time.sleep(0.4); hs.run_one_cycle()
+chk("no warning while the node has time left", not rq()["841"].get("warned_ts"))
+time.sleep(1.0); hs.run_one_cycle()
+
+# B7 — fair share
+_now = time.time()
+hist = {"850": dict(task(850, name="h", state="done"), owner="greedy", started_ts=_now - 7200,
+                    finished_ts=_now - 600, duration_secs=6600),
+        "851": dict(task(851, name="h2", state="done"), owner="modest", started_ts=_now - 700,
+                    finished_ts=_now - 650, duration_secs=50),
+        "852": dict(task(852, name="old", state="done"), owner="modest", started_ts=_now - 3 * 86400,
+                    finished_ts=_now - 3 * 86400 + 90000, duration_secs=90000)}
+u = hs.owner_usage(hist, _now)
+chk("usage counts the last 24 h only, in coarse buckets", u.get("greedy", 0) > u.get("modest", 0) == 0)
+pend = {"860": dict(task(860, name="g1", sub=loc(-30)), owner="greedy", cmd="sleep 1"),
+        "861": dict(task(861, name="g2", sub=loc(-20)), owner="greedy", cmd="sleep 1"),
+        "862": dict(task(862, name="m1", sub=loc(-10)), owner="modest", cmd="sleep 1"),
+        "863": dict(task(863, name="urgent", sub=loc(-5), priority=5), owner="greedy", cmd="sleep 1")}
+wdb({"700": node("n0", 72000), "701": node("n1", 72000)})
+wq(dict(hist, **pend)); hs.run_one_cycle()
+chk("without fair_share: first come first served (after priority)",
+    sorted(k for k in pend if rq()[k]["state"] == "running") == ["860", "863"])
+for k in pend: _rc(hq.cmd_cancel, _apR.Namespace(id=int(k), array=None, force=True))
+cfg(fair_share=True)
+wdb({"700": node("n0", 72000), "701": node("n1", 72000)})
+wq(dict(hist, **pend)); hs.run_one_cycle()
+chk("with fair_share: priority first, then the owner who used less",
+    sorted(k for k in pend if rq()[k]["state"] == "running") == ["862", "863"])
+for k in pend: _rc(hq.cmd_cancel, _apR.Namespace(id=int(k), array=None, force=True))
+os.remove(_cfg)
+
+# A7 — a timeout does not count the CUDA init of a slow node
+t = dict(task(870, name="slowstart", state="running", jid="700", node="n0", st=loc(-200)),
+         timeout_secs=120, node_slow_init_secs=180, gpu_slots=[0])
+t["started_ts"] = time.time() - 200
+open(os.path.join(hs.HEARTBEAT_DIR, "870"), "w").write("x")
+wdb({"700": node("n0", 72000, st="busy")}); wq({"870": t}); hs.run_one_cycle()
+chk("200 s into a 120 s timeout on a node with 180 s of init: not killed", rq()["870"]["state"] == "running")
+q_ = rq(); q_["870"]["started_ts"] = time.time() - 320; wq(q_); hs.run_one_cycle()
+chk("...killed once its own 120 s are over", rq()["870"].get("fail_reason") == "timeout")
+try: os.remove(_flag)
+except OSError: pass
+hs.run_one_cycle(); time.sleep(0.3)
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
 
 print("== a dead scheduler is restarted by list / wait (feedback #18/#19) ==")

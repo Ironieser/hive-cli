@@ -60,3 +60,49 @@ Track occupancy per (hold job, GPU index) in `queue.json` rather than per hold j
 wrapper picks the assigned entries of `CUDA_VISIBLE_DEVICES` instead of the first N. The
 live probe has to report per-GPU readings. Needs the Phase 2 sampler to tell which
 card a running task actually uses.
+
+---
+
+# Checklist, round 2 (2026-09-28)
+
+Everything that was still open after the five phases: weak spots of what exists, the
+SLURM features that had been left out, and housekeeping. One row per item; the status
+column is updated as each lands. "Live" = tried on the real cluster, not only offline.
+
+## A. What exists, made better
+
+| # | Item | Status |
+|---|---|---|
+| A1 | Dispatch latency: wake the scheduler on submit and on a task's exit instead of waiting out the 30 s cycle | open |
+| A2 | `hive top`: SLOW state, several tasks on one hold job, array index | open |
+| A3 | `hive nodes`: GPU% / MEM over all cards of a hold job, not only card 0 | open |
+| A4 | Canary jobs wait hours in a busy partition | open |
+| A5 | "healthy probes → node released" never seen live | open |
+| A6 | Steady-state speed of slow nodes has no healthy same-model reference | open |
+| A7 | `--timeout` counts the CUDA init time of a slow node | open |
+| A8 | Every array member is a full task record | open |
+| A9 | `queue.json` and task logs grow without bound unless `hive prune` is run by hand | open |
+| A10 | `--need-mb auto` / `--est-runtime auto` need one finished run | open |
+
+## B. SLURM features that were left out
+
+| # | Item | Status |
+|---|---|---|
+| B1 | Pool autoscale: replace hold jobs before they expire, keep N nodes | open |
+| B2 | Warn a task before its node expires (`--signal`-like) | open |
+| B3 | Delayed start (`--begin`) | open |
+| B4 | CPU / memory per task | open |
+| B5 | Multi-node tasks | open |
+| B6 | Preemption | open |
+| B7 | Fair share between owners | open |
+
+## C. Housekeeping
+
+| # | Item | Status |
+|---|---|---|
+| C1 | README.md / README_zh.md describe none of the new features | open |
+| C2 | docs/architecture.md: two-pass cycle, GPU slots, node health states | open |
+| C3 | Feedback #18, #19, #27, #33 | open |
+| C4 | Red-team round 3 on everything in this checklist | open |
+| C5 | Install, live validation | open |
+| C6 | Push the branch, open the pull request | open |
