@@ -161,6 +161,12 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   `finish` event carries it — that event is the history behind `hive stats` and
   `--need-mb auto`. Read `gpus` through `task_gpus()`: `task.get("gpus") or DEFAULT`
   turned an explicit 0 into 1.
+- **Health probes of quarantined nodes run in background threads** (`start_health_probe`
+  / `finished_health_probes`); the cycle starts one and applies its verdict on a later
+  cycle. They target nodes known to be slow or wedged (60–150 s each) and, run inline,
+  delayed dispatch by minutes on an idle pool. Verify-before-dispatch is still inline.
+  The tests set `hs.HEALTH_ASYNC = False` so one cycle yields one verdict.
+- **A task's finish time is its exit file's mtime**, not the cycle that noticed it.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

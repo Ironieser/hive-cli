@@ -14,7 +14,7 @@ daemon restart. Status is updated here as phases land.
 | 3 | Per-owner concurrency cap | `--max-running N` per owner, so one sweep cannot take the pool | planned |
 | 4 | GPU-slot scheduling | several tasks on one multi-GPU hold job, one card each | planned |
 | 5 | Queue control | `hive hold` / `release` / `reprioritize`; `hive wait ID ID …` | planned |
-| 5 | Probes outside `queue.lock` | `hive submit` / `cancel` never wait on a node probe | planned |
+| 5 | Probes outside `queue.lock` | `hive submit` / `cancel` never wait on a node probe | health checks done (background threads); verify-before-dispatch still inline |
 | 5 | Reap after scheduler death | feedback #18/#19 | planned |
 
 Not planned: multi-node tasks (a step cannot span hold jobs; needs a per-node launcher

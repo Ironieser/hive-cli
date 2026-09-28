@@ -16,6 +16,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -381,6 +382,38 @@ def note_probe_result(jid, answered, reason="probe_unverifiable"):
     _probe_backoff[jid] = (fails, time.time() + wait, reason)
 
 
+# Health checks of quarantined nodes run in the background. They probe nodes that are
+# known to be slow or wedged — 60 to 150 s each — and running them inside the cycle
+# held queue.lock and delayed everything behind them: measured on an idle pool, a task
+# waited 2m25s to be dispatched and its finish was noticed 75 s late. The cycle only
+# starts a probe and, on a later cycle, applies its verdict.
+HEALTH_ASYNC = True
+_health_inflight = {}     # node → {"jid", "thread", "result": [(verdict, detail)] once done}
+
+
+def start_health_probe(node, jid):
+    slot = {"jid": jid, "result": []}
+    def run():
+        try:
+            slot["result"].append(health_probe(jid))
+        except Exception as e:                      # never lose the slot to an exception
+            slot["result"].append(("unknown", f"probe_error: {e}"))
+    slot["thread"] = threading.Thread(target=run, name=f"health-{node}", daemon=True)
+    _health_inflight[node] = slot
+    slot["thread"].start()
+
+
+def finished_health_probes():
+    """[(node, jid, verdict, detail)] of background probes that have completed."""
+    done = []
+    for node, slot in list(_health_inflight.items()):
+        if slot["result"]:
+            verdict, detail = slot["result"][0]
+            done.append((node, slot["jid"], verdict, detail))
+            del _health_inflight[node]
+    return done
+
+
 def health_probe(slurm_jobid):
     """(verdict, detail) for the periodic check of a quarantined node — the same
     guarded probe as verify-before-dispatch, so a wedged driver reads `fail` here too
@@ -401,6 +434,14 @@ def task_gpus(task):
         return DEFAULT_TASK_GPUS if g is None else max(0, int(g))
     except (TypeError, ValueError):
         return DEFAULT_TASK_GPUS
+
+
+def exit_time(task_id):
+    """Epoch at which the task's exit file was written; now, if it can't be read."""
+    try:
+        return os.path.getmtime(os.path.join(HEARTBEAT_DIR, f"{task_id}.exit"))
+    except OSError:
+        return time.time()
 
 
 def usage_file(task_id):
@@ -964,8 +1005,11 @@ def run_one_cycle():
                 ec = int(status.split(":")[1])
                 task["state"]       = "done" if ec == 0 else "failed"
                 task["exit_code"]   = ec
-                task["finished_at"] = now_iso()
-                task["finished_ts"] = now_ts()
+                # When the command ended, not when this cycle noticed: the wrapper writes
+                # the exit file last, and a cycle can be a minute late.
+                ended = exit_time(task["id"])
+                task["finished_at"] = datetime.fromtimestamp(ended).strftime('%Y-%m-%dT%H:%M:%S')
+                task["finished_ts"] = ended
                 task["duration_secs"] = _duration_secs(task)   # run time → runtime history
                 collect_usage(task)
                 task["queued_secs"]   = _queued_secs(task)     # wait time → feedback
@@ -1120,8 +1164,23 @@ def run_one_cycle():
         # release it, a failed probe re-arms the hold. This is what keeps the
         # bad-node list self-maintaining instead of a manual blacklist.
         now = time.time()
+
+        def apply_check(node_name, jid, verdict, detail):
+            nonlocal health_changed
+            outcome = hh.record_check(health, node_name, verdict, detail)
+            health_changed = True
+            logging.info("Health check %s via %s: %s %s%s", node_name, jid, verdict, detail,
+                         f" → {outcome}" if outcome else "")
+            if outcome == "released":
+                quarantined.discard(node_name)
+                ev.record("release", node=node_name, source="auto", detail=detail)
+
+        for node_name, jid, verdict, detail in finished_health_probes():
+            if node_name in health.get("nodes", {}):
+                apply_check(node_name, jid, verdict, detail)
+
         for node_name, rec in list(health.get("nodes", {}).items()):
-            if not hh.due_for_check(rec, now):
+            if node_name in _health_inflight or not hh.due_for_check(rec, now):
                 continue
             jid = next((j for j, i in jobs_db.items()
                         if i.get("node") == node_name and j not in running_jobids), None)
@@ -1141,14 +1200,10 @@ def run_one_cycle():
                 continue
             if jobs_db[jid].get("partition"):
                 rec["partition"] = jobs_db[jid]["partition"]   # where a canary would go
-            verdict, detail = health_probe(jid)
-            outcome = hh.record_check(health, node_name, verdict, detail)
-            health_changed = True
-            logging.info("Health check %s via %s: %s %s%s", node_name, jid, verdict, detail,
-                         f" → {outcome}" if outcome else "")
-            if outcome == "released":
-                quarantined.discard(node_name)
-                ev.record("release", node=node_name, source="auto", detail=detail)
+            if HEALTH_ASYNC:
+                start_health_probe(node_name, jid)   # verdict applied on a later cycle
+            else:
+                apply_check(node_name, jid, *health_probe(jid))
 
         # ── (2) Dispatch pending tasks ───────────────────────────────────────
         # Candidate nodes are tried per task with a verify-before-dispatch live

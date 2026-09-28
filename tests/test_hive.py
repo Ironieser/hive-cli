@@ -24,6 +24,8 @@ dbp = SourceFileLoader("dbp", os.path.join(LIB, "hive-dbpost")).load_module()
 
 for d in (hs.HIVE_DIR, hs.HEARTBEAT_DIR, hs.LOG_DIR):
     os.makedirs(d, exist_ok=True)
+hs.HEALTH_ASYNC = False   # health probes inline, so one cycle = one verdict; the
+                          # background path has its own test
 
 P = {"pass": 0, "fail": 0}
 
@@ -782,6 +784,36 @@ os.environ.pop("HIVE_NOTIFY")
 open(os.path.join(hs.HIVE_DIR, "t.hive"), "w").write("#HIVE timeout=2h\n#HIVE notify=echo hi\necho x\n")
 _pf = hq.parse_hive_file(os.path.join(hs.HIVE_DIR, "t.hive"))
 chk("#HIVE timeout= / notify= parsed", _pf.get("timeout") == "2h" and _pf.get("notify") == "echo hi")
+reset_health(); reset_sched_state()
+
+print("== health checks run in the background; finish time is the command's ==")
+reset_health(); reset_sched_state()
+hs.HEALTH_ASYNC = True
+_real_hp = hs.health_probe
+def _slow_probe(jid):
+    time.sleep(1.5); return ("ok", "")
+hs.health_probe = _slow_probe
+d = hh.load(); hh.quarantine(d, "slowq", "wedged", "verify")
+d["nodes"]["slowq"].update(since=time.time() - 7200, until=time.time() - 3600, last_check=0); hh.save(d)
+wdb({"700": node("slowq", 72000), "701": node("fastnode", 72000)})
+wq({"190": dict(task(190, name="prompt"), cmd="true")})
+_t0 = time.time(); hs.run_one_cycle(); _dt = time.time() - _t0
+chk("a slow health probe does not hold up the cycle", _dt < 1.2)
+chk("...and the task is dispatched in that same cycle", rq()["190"].get("node") == "fastnode")
+chk("probe is in flight, nothing recorded yet", "slowq" in hs._health_inflight
+    and hh.load()["nodes"]["slowq"].get("ok_streak", 0) == 0)
+hs.run_one_cycle()
+chk("no second probe while one is in flight", len(hs._health_inflight) == 1)
+time.sleep(1.8); hs.run_one_cycle()
+chk("verdict applied on a later cycle", hh.load()["nodes"]["slowq"]["ok_streak"] == 1
+    and "slowq" not in hs._health_inflight)
+hs.health_probe = _real_hp; hs.HEALTH_ASYNC = False
+t = task(191, name="late", state="running", jid="700", node="fastnode", st=loc(-100)); t["started_ts"] = time.time() - 100
+_xf = os.path.join(hs.HEARTBEAT_DIR, "191.exit"); open(_xf, "w").write("0")
+os.utime(_xf, (time.time() - 60, time.time() - 60))          # command ended a minute ago
+wq({"191": t}); hs.run_one_cycle()
+chk("duration ends when the command did, not when the cycle noticed",
+    38 <= rq()["191"]["duration_secs"] <= 42)
 reset_health(); reset_sched_state()
 
 print("== GPU usage accounting: sampler -> task -> events -> stats / --need-mb auto ==")
