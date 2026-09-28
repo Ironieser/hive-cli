@@ -8,7 +8,7 @@ daemon restart. Status is updated here as phases land.
 |---|---|---|---|
 | 1 | Task timeout | `hive submit --timeout 2h` / `#HIVE timeout=` | done |
 | 1 | Completion notification | `--notify CMD` / `#HIVE notify=` / `$HIVE_NOTIFY` | done |
-| 2 | Resource usage accounting | peak GPU memory / utilisation per task in `hive stats`; `--need-mb auto` | planned |
+| 2 | Resource usage accounting | peak GPU memory / utilisation per task in `hive stats`, `hive wait`; `--need-mb auto` | done |
 | 3 | Dependencies | `hive submit --after ID[,ID]` (`afterok`), `--after-any` | planned |
 | 3 | Sweeps | `hive submit --array 0-9%4` with `$HIVE_ARRAY_INDEX`; `%N` caps concurrency | planned |
 | 3 | Per-owner concurrency cap | `--max-running N` per owner, so one sweep cannot take the pool | planned |
@@ -36,11 +36,13 @@ environment variables, runs detached under a 60 s limit, and its output goes to
 
 ## Phase 2 — design notes
 
-Sample inside the dispatch wrapper (it already runs a heartbeat loop on the node):
-`nvidia-smi` every 30 s into a per-task file, reduced to peak memory / mean utilisation
-at finish and written to the `finish` event. `--need-mb auto` = P90 peak of the name's
-history × 1.1, the same shape as `--est-runtime auto`. Sampling must use the guarded
-query: normal-partition nodes answer `nvidia-smi` in up to 25 s.
+Sampled inside the dispatch wrapper (it already runs a heartbeat loop on the node):
+`nvidia-smi` every 10 s for the first minute, then every 30 s, kept as four running
+numbers in `heartbeat/<id>.usage`, moved onto the task at finish and written to the
+`finish` event. `--need-mb auto` = P90 peak of the name's
+history × 1.1, the same shape as `--est-runtime auto`. The sampler is its own
+background loop, so a node that answers `nvidia-smi` slowly (up to 25 s measured) or
+never only costs samples, not the task.
 
 ## Phase 3 — design notes
 

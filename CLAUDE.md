@@ -155,6 +155,12 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   `notify(task, event)` is called on every terminal transition and on requeue; it must
   stay non-blocking (it runs inside the `queue.lock` cycle) and must never be able to
   change a task's state. Pending tasks cancelled by the CLI do not fire it.
+- **GPU usage is sampled by the wrapper, reduced by the scheduler.** The dispatch wrapper
+  keeps `heartbeat/<id>.usage` (`peak_mb max_util sum_util samples`, first `gpus` cards
+  only); `collect_usage()` moves it onto the task at every terminal transition and the
+  `finish` event carries it — that event is the history behind `hive stats` and
+  `--need-mb auto`. Read `gpus` through `task_gpus()`: `task.get("gpus") or DEFAULT`
+  turned an explicit 0 into 1.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

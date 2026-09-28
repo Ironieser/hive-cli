@@ -81,6 +81,8 @@ cat > "$TMP/bin/nvidia-smi" <<'EOF'
 # (the old --id=0 probe would have missed GPU1). The sched live_probe asks without
 # 'index' (util,used,total) — keep that single + idle/clean so dispatch tests still place.
 if [[ "$*" == *"--query-gpu"* ]]; then
+  # the dispatch wrapper's usage sampler asks for util + memory.used only
+  if [[ "$*" != *"memory.total"* ]]; then printf '%b\n' "${MOCK_USAGE:-37, 41234}"; exit 0; fi
   if [[ "$*" == *"index"* ]]; then
     printf '0, 0, 10, 81920\n1, 85, 40000, 81920\n'
   elif [[ -n "${MOCK_LIVE_GPU:-}" ]]; then

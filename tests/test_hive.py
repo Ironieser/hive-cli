@@ -784,6 +784,66 @@ _pf = hq.parse_hive_file(os.path.join(hs.HIVE_DIR, "t.hive"))
 chk("#HIVE timeout= / notify= parsed", _pf.get("timeout") == "2h" and _pf.get("notify") == "echo hi")
 reset_health(); reset_sched_state()
 
+print("== GPU usage accounting: sampler -> task -> events -> stats / --need-mb auto ==")
+reset_health(); reset_sched_state()
+open(ev.EVENTS_FILE, "w").close()
+wdb({"700": node("nodeX", 72000)})
+wq({"180": dict(task(180, name="acct"), cmd="sleep 1.2", notify=f'echo "$HIVE_TASK_GPU_PEAK_MB" >> {_nf}')})
+clear_notified()
+hs.run_one_cycle()
+for _ in range(40):
+    if os.path.exists(os.path.join(hs.HEARTBEAT_DIR, "180.exit")): break
+    time.sleep(0.1)
+chk("wrapper wrote the usage file on the node",
+    open(hs.usage_file(180)).read().split() == ["41234", "37", "37", "1"])
+hs.run_one_cycle()
+t = rq()["180"]
+chk("peak / util recorded on the task",
+    (t["state"], t.get("gpu_peak_mb"), t.get("gpu_avg_util"), t.get("gpu_max_util")) == ("done", 41234, 37, 37))
+chk("usage file consumed", not os.path.exists(hs.usage_file(180)))
+chk("finish event carries the usage",
+    any(e["event"] == "finish" and e.get("gpu_peak_mb") == 41234 and e.get("gpu_avg_util") == 37
+        for e in ev.iter_events()))
+chk("hook sees HIVE_TASK_GPU_PEAK_MB", notified() == ["41234"])
+clear_notified()
+os.environ["MOCK_USAGE"] = "0, 10\\n90, 60000"          # 2-GPU hold job, task sees 1 card
+wq({"181": dict(task(181, name="acct"), cmd="sleep 0.3")})
+hs.run_one_cycle(); time.sleep(1.0); hs.run_one_cycle()
+chk("only the cards the task can see are sampled (gpus=1 -> first line)",
+    rq()["181"].get("gpu_peak_mb") == 10)
+os.environ.pop("MOCK_USAGE")
+t0 = dict(task(182, name="cpu"), cmd="sleep 0.3", gpus=0)
+wq({"182": t0}); hs.run_one_cycle(); time.sleep(1.0); hs.run_one_cycle()
+chk("gpus=0 task: nothing sampled, fields unset",
+    rq()["182"]["state"] == "done" and "gpu_peak_mb" not in rq()["182"])
+wq({})
+for i, pk in enumerate((40000, 42000, 50000)):
+    ev.record("finish", task=900 + i, name="big", state="done", run_secs=100, gpu_peak_mb=pk, gpu_avg_util=80)
+chk("history_need_mb = P90 peak + 10 %, rounded up to 500 MiB",
+    hq.history_need_mb("big") == (53500, 3) and hq.history_need_mb("nohistory") == (None, 0))
+def _sub(**kw):
+    ns = __import__("argparse").Namespace(cmd_or_file="true", workdir=None, priority=None, name=kw.get("name"),
+            owner=None, need_mb=kw.get("need_mb"), gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None)
+    with _cl.redirect_stdout(_io.StringIO()):
+        hq.cmd_submit(ns)
+    return max(rq().values(), key=lambda t: t["id"])
+chk("--need-mb auto resolves from history", _sub(name="big", need_mb="auto")["need_mb"] == 53500)
+chk("--need-mb auto without history -> 0 (no constraint)", _sub(name="nohistory", need_mb="auto")["need_mb"] == 0)
+chk("--need-mb 30000 still a plain number", _sub(name="x", need_mb="30000")["need_mb"] == 30000)
+open(os.path.join(hs.HIVE_DIR, "n.hive"), "w").write("#HIVE name=big\n#HIVE need_mb=auto\necho x\n")
+ns = __import__("argparse").Namespace(cmd_or_file=os.path.join(hs.HIVE_DIR, "n.hive"), workdir=None, priority=None,
+        name=None, owner=None, need_mb=None, gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None)
+with _cl.redirect_stdout(_io.StringIO()):
+    hq.cmd_submit(ns)
+chk("#HIVE need_mb=auto", max(rq().values(), key=lambda t: t["id"])["need_mb"] == 53500)
+_buf = _io.StringIO()
+with _cl.redirect_stdout(_buf):
+    hq.cmd_stats(__import__("argparse").Namespace(name="big"))
+chk("hive stats shows GPU peak (P90) and mean util", "GPU-PEAK" in _buf.getvalue()
+    and "47.3G" in _buf.getvalue() and "80%" in _buf.getvalue())
+open(ev.EVENTS_FILE, "w").close(); wq({})
+reset_health(); reset_sched_state()
+
 print("== node exclusion: hive submit --exclude, hive pool add --exclude ==")
 chk("expand_nodes: names, ranges, padding, duplicates",
     hh.expand_nodes("evc22,evc[1-3,07],gpu01,evc22") == ["evc22", "evc1", "evc2", "evc3", "evc07", "gpu01"])

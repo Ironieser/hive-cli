@@ -393,6 +393,47 @@ def health_probe(slurm_jobid):
     return p.get("cuda") or "unknown", p.get("cuda_detail") or ""
 
 
+def task_gpus(task):
+    """GPUs the task may see. Absent (queued by an older hive) → the default; an
+    explicit 0 means "hide every GPU" and must not fall back to it (`or` did)."""
+    g = task.get("gpus")
+    try:
+        return DEFAULT_TASK_GPUS if g is None else max(0, int(g))
+    except (TypeError, ValueError):
+        return DEFAULT_TASK_GPUS
+
+
+def usage_file(task_id):
+    return os.path.join(HEARTBEAT_DIR, f"{task_id}.usage")
+
+
+def collect_usage(task):
+    """Move the GPU usage the wrapper sampled on the node (`<id>.usage`: peak memory
+    MiB, max util %, sum of util, samples) onto the task. Absent file = nothing
+    sampled (gpus=0, or the task died before the first sample): fields stay unset."""
+    path = usage_file(task["id"])
+    try:
+        with open(path) as f:
+            peak, mx, total, n = (int(x) for x in f.read().split()[:4])
+    except (OSError, ValueError):
+        return
+    if n > 0:
+        task["gpu_peak_mb"]  = peak
+        task["gpu_max_util"] = mx
+        task["gpu_avg_util"] = round(total / n)
+        task["gpu_samples"]  = n
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def usage_fields(task):
+    """GPU usage for a finish/cancel event (None-valued fields are dropped)."""
+    return {"gpu_peak_mb": task.get("gpu_peak_mb"), "gpu_avg_util": task.get("gpu_avg_util"),
+            "gpu_max_util": task.get("gpu_max_util")}
+
+
 NOTIFY_TIMEOUT_SECS = 60
 NOTIFY_LOG = os.path.join(LOG_DIR, "notify.log")
 
@@ -411,7 +452,8 @@ def notify(task, event):
               "NODE": task.get("node") or task.get("last_node"),
               "DURATION_SECS": task.get("duration_secs"), "LOG": task.get("log"),
               "WORKDIR": task.get("workdir"), "FAIL_REASON": task.get("fail_reason"),
-              "REQUEUE_COUNT": task.get("requeue_count"), "EVENT": event}
+              "REQUEUE_COUNT": task.get("requeue_count"), "EVENT": event,
+              "GPU_PEAK_MB": task.get("gpu_peak_mb"), "GPU_AVG_UTIL": task.get("gpu_avg_util")}
     for k, v in fields.items():
         env[f"HIVE_TASK_{k}"] = "" if v is None else str(v)
     try:
@@ -608,9 +650,10 @@ def dispatch_task(task, slurm_jobid, node_name):
 
     hb_file   = os.path.join(HEARTBEAT_DIR, str(task_id))
     exit_file = os.path.join(HEARTBEAT_DIR, f"{task_id}.exit")
+    use_file  = usage_file(task_id)
 
     # Remove stale files from a previous run
-    for fpath in (hb_file, exit_file):
+    for fpath in (hb_file, exit_file, use_file):
         try:
             os.remove(fpath)
         except FileNotFoundError:
@@ -664,7 +707,7 @@ def dispatch_task(task, slurm_jobid, node_name):
     # indices or UUIDs. If CUDA_VISIBLE_DEVICES is unset (CPU-only hold job) we
     # leave it alone. The resulting visibility is logged so a device-count surprise
     # is one line in the log instead of a 40-minute mystery.
-    want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
+    want_gpus = task_gpus(task)
     if want_gpus > 0:
         gpu_line = (
             # Log the visibility SLURM handed us *before* narrowing — that is the line
@@ -682,6 +725,34 @@ def dispatch_task(task, slurm_jobid, node_name):
         gpu_line = (
             f'export CUDA_VISIBLE_DEVICES=""\n'
             f'echo "=== gpus: requested 0 — all GPUs hidden ===" >> {lf}\n'
+        )
+
+    # ── GPU usage sampler ─────────────────────────────────────────────────────
+    # Peak memory / utilisation of the cards the task can see, kept as four running
+    # numbers in a small file the scheduler reads at finish (collect_usage). This is
+    # what `hive stats` and `--need-mb auto` are built on. Sampled every 10 s for the
+    # first minute — a model load is where the peak usually is, and short tasks would
+    # otherwise get one sample — then every 30 s. A node whose nvidia-smi is slow or
+    # hangs only stalls this loop, never the task.
+    sampler = ""
+    if want_gpus > 0:
+        uf = q(use_file)
+        sampler = (
+            "( _pk=0; _mu=0; _su=0; _n=0; _k=0\n"
+            "  while true; do\n"
+            "    _r=$(nvidia-smi --query-gpu=utilization.gpu,memory.used "
+            f"--format=csv,noheader,nounits 2>/dev/null | head -n {want_gpus})\n"
+            "    while IFS=, read -r _u _m; do\n"
+            '      _u="${_u// /}"; _m="${_m// /}"\n'
+            '      case "$_u$_m" in ""|*[!0-9]*) continue;; esac\n'
+            '      [ "$_m" -gt "$_pk" ] && _pk=$_m; [ "$_u" -gt "$_mu" ] && _mu=$_u\n'
+            "      _su=$((_su+_u)); _n=$((_n+1))\n"
+            '    done <<< "$_r"\n'
+            f'    [ "$_n" -gt 0 ] && echo "$_pk $_mu $_su $_n" > {uf}.tmp && mv {uf}.tmp {uf}\n'
+            "    _k=$((_k+1)); if [ \"$_k\" -le 6 ]; then sleep 10; else sleep 30; fi\n"
+            "  done ) >/dev/null 2>&1 &\n"
+            "_US_PID=$!\n"
+            "disown $_US_PID\n"
         )
 
     # Shell wrapper that runs on the compute node.
@@ -705,13 +776,14 @@ def dispatch_task(task, slurm_jobid, node_name):
         f"( while true; do date -Iseconds > {hb}; sleep 30; done ) &\n"
         f"_HB_PID=$!\n"
         f"disown $_HB_PID\n"
+        + sampler +
         # ── Run the actual command (verbatim: it is the user's shell script) ──
         f"{cmd} >> {lf} 2>&1\n"
         f"_EC=$?\n"
         # ── Footer (double-quotes so $(date) and $_EC are expanded by bash) ──
         f'echo "" >> {lf}\n'
         f'echo "=== hive task #{task_id} finished at $(date -Iseconds)  exit_code=$_EC ===" >> {lf}\n'
-        f"kill $_HB_PID 2>/dev/null\n"
+        f"kill $_HB_PID $_US_PID 2>/dev/null\n"
         f"rm -f {hb}\n"
         f"echo $_EC > {xf}\n"
     )
@@ -836,6 +908,7 @@ def run_one_cycle():
                 task["finished_at"]   = now_iso()
                 task["finished_ts"]   = now_ts()
                 task["duration_secs"] = _duration_secs(task)
+                collect_usage(task)
                 task["queued_secs"]   = _queued_secs(task)
                 append_log_note(task, [
                     "",
@@ -852,7 +925,7 @@ def run_one_cycle():
                 ev.record("finish", task=task["id"], name=task.get("name") or None,
                           state="failed", exit_code=124, reason="timeout",
                           node=task.get("node"), slurm_jobid=jid,
-                          run_secs=task["duration_secs"], queued_secs=task["queued_secs"])
+                          run_secs=task["duration_secs"], queued_secs=task["queued_secs"], **usage_fields(task))
                 notify(task, "finish")
                 continue
 
@@ -872,6 +945,7 @@ def run_one_cycle():
                 task["finished_at"]   = now_iso()
                 task["finished_ts"]   = now_ts()
                 task["duration_secs"] = _duration_secs(task)
+                collect_usage(task)
                 task["queued_secs"]   = _queued_secs(task)
                 task.pop("cancel_requested", None)
                 if jid:
@@ -882,7 +956,7 @@ def run_one_cycle():
                              task["id"], pid, task.get("node", "?"))
                 ev.record("cancel", task=task["id"], name=task.get("name") or None,
                           node=task.get("node"), slurm_jobid=jid,
-                          run_secs=task["duration_secs"])
+                          run_secs=task["duration_secs"], **usage_fields(task))
                 notify(task, "finish")
                 continue
 
@@ -893,6 +967,7 @@ def run_one_cycle():
                 task["finished_at"] = now_iso()
                 task["finished_ts"] = now_ts()
                 task["duration_secs"] = _duration_secs(task)   # run time → runtime history
+                collect_usage(task)
                 task["queued_secs"]   = _queued_secs(task)     # wait time → feedback
                 if jid:
                     running_jobids.discard(jid)
@@ -904,7 +979,7 @@ def run_one_cycle():
                 ev.record("finish", task=task["id"], name=task.get("name") or None,
                           state=task["state"], exit_code=ec, node=task.get("node"),
                           slurm_jobid=jid, run_secs=task["duration_secs"],
-                          queued_secs=task["queued_secs"])
+                          queued_secs=task["queued_secs"], **usage_fields(task))
 
                 _requeued_for_node = False
                 # ── Node health feedback (hive_health) ───────────────────────
@@ -1026,6 +1101,7 @@ def run_one_cycle():
                     task["finished_at"] = now_iso()
                     task["finished_ts"] = now_ts()
                     task["duration_secs"] = _duration_secs(task)
+                    collect_usage(task)
                     task["queued_secs"]   = _queued_secs(task)
                     if jid:
                         running_jobids.discard(jid)
@@ -1035,7 +1111,7 @@ def run_one_cycle():
                     ev.record("finish", task=task["id"], name=task.get("name") or None,
                               state="failed", exit_code=-1, node=task.get("node"),
                               slurm_jobid=jid, run_secs=task["duration_secs"],
-                              queued_secs=task["queued_secs"])
+                              queued_secs=task["queued_secs"], **usage_fields(task))
                     notify(task, "finish")
 
         # ── (1b) Periodic health checks of quarantined nodes ─────────────────
@@ -1090,7 +1166,7 @@ def run_one_cycle():
         node_reject = None   # last NODE-level rejection this cycle
         for task in pending:
             need_mb = int(task.get("need_mb") or NEED_MB_DEFAULT)
-            want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
+            want_gpus = task_gpus(task)
             excluded = set(task.get("exclude_nodes") or ())
             # Say what is actually wrong instead of the generic reason: the pool has no
             # hold job at all, its nodes are quarantined, or every candidate was

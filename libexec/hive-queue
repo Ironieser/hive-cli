@@ -230,6 +230,44 @@ def runs_by_name():
     return by_name
 
 
+NEED_MB_HEADROOM = 1.10   # --need-mb auto = P90 of past peaks + 10 %, rounded up to 500 MiB
+
+
+def peaks_by_name():
+    """{name: [gpu_peak_mb, ...]} of `done` runs, from the event log merged with the
+    queue (same sources and dedup as runs_by_name)."""
+    merged = {}
+    try:
+        for e in ev.iter_events():
+            if e.get("event") == "finish" and e.get("state") == "done" \
+                    and isinstance(e.get("gpu_peak_mb"), int) and e["gpu_peak_mb"] > 0:
+                merged[e.get("task")] = (e.get("name") or "", e["gpu_peak_mb"], e.get("gpu_avg_util"))
+    except Exception:
+        pass
+    for t in load_queue().get("tasks", {}).values():
+        if t.get("state") == "done" and isinstance(t.get("gpu_peak_mb"), int) and t["gpu_peak_mb"] > 0:
+            merged.setdefault(t["id"], (t.get("name") or "", t["gpu_peak_mb"], t.get("gpu_avg_util")))
+    by_name = {}
+    for _tid, (nm, pk, au) in merged.items():
+        by_name.setdefault(nm, []).append((pk, au))
+    return by_name
+
+
+def history_need_mb(name):
+    """(need_mb, sample_n) for `--need-mb auto`; (None, 0) without history."""
+    if not name:
+        return None, 0
+    peaks = sorted(p for p, _ in peaks_by_name().get(name, []))
+    if not peaks:
+        return None, 0
+    want = _percentile(peaks, 90) * NEED_MB_HEADROOM
+    return int(-(-want // 500) * 500), len(peaks)
+
+
+def fmt_mb(mb):
+    return "—" if mb is None else (f"{mb / 1024:.1f}G" if mb >= 1024 else f"{mb}M")
+
+
 def history_estimate(name):
     """Conservative runtime estimate (secs) for a task name from completed history:
     the p90 of past `done` run durations. Returns (est_secs, sample_n); (None, 0) if no
@@ -303,10 +341,7 @@ def parse_hive_file(path):
     if "owner" in meta:
         result["owner"] = meta["owner"]
     if "need_mb" in meta:
-        try:
-            result["need_mb"] = int(meta["need_mb"])
-        except ValueError:
-            pass
+        result["need_mb"] = meta["need_mb"]           # int or 'auto'; resolved in cmd_submit
     if "gpus" in meta:
         try:
             result["gpus"] = int(meta["gpus"])
@@ -487,8 +522,28 @@ def cmd_submit(args):
     elif "owner" not in spec and os.environ.get("HIVE_OWNER"):
         spec["owner"] = os.environ["HIVE_OWNER"].strip()
 
-    if getattr(args, "need_mb", None) is not None:
-        spec["need_mb"] = args.need_mb
+    # Free GPU memory required: --need-mb > #HIVE need_mb=. `auto` = what this name
+    # actually peaked at in past runs (P90 + 10 %).
+    nm_raw = getattr(args, "need_mb", None)
+    if nm_raw is None:
+        nm_raw = spec.get("need_mb")
+    spec.pop("need_mb", None)
+    if nm_raw is not None:
+        if str(nm_raw).strip().lower() == "auto":
+            auto_mb, n = history_need_mb(spec.get("name", ""))
+            if auto_mb:
+                spec["need_mb"] = auto_mb
+                print(f"(auto need-mb {auto_mb} MiB from the GPU peak of {n} past "
+                      f"'{spec.get('name')}' run(s))")
+            else:
+                print("(no GPU usage history for this name yet — submitting without --need-mb)")
+        else:
+            try:
+                spec["need_mb"] = int(nm_raw)
+            except (TypeError, ValueError):
+                print(f"{C_RED}error:{C_RESET} --need-mb takes MiB or 'auto', got '{nm_raw}'",
+                      file=sys.stderr)
+                sys.exit(2)
 
     # GPU count. CLI --gpus > #HIVE gpus= > DEFAULT_TASK_GPUS (1).
     # Defaulting to 1 is deliberate: a hold job may own several GPUs, and a
@@ -1021,6 +1076,10 @@ def cmd_wait(args):
         parts.append(f"ran {fmt_elapsed(rs)}")
     if task.get("requeue_count"):
         parts.append(f"re-disp x{task['requeue_count']}")
+    if task.get("fail_reason"):
+        parts.append(str(task["fail_reason"]))
+    if task.get("gpu_peak_mb") is not None:
+        parts.append(f"gpu peak {fmt_mb(task['gpu_peak_mb'])}, avg util {task.get('gpu_avg_util', 0)}%")
     detail = " · ".join(parts)
     print(f"{mark} task #{task_id} {state}{C_RESET}"
           + (f" · {detail}" if detail else "")
@@ -1071,8 +1130,9 @@ def cmd_stats(args):
 
     name_w = max([len(k) for k in groups], default=4)
     name_w = max(name_w, 4)
+    peaks = {(k or "—"): v for k, v in peaks_by_name().items()}
     header = (f"  {'NAME':<{name_w}}  {'N':>3}  {'MIN':>8}  {'MED':>8}  "
-              f"{'P90':>8}  {'MAX':>8}")
+              f"{'P90':>8}  {'MAX':>8}  {'GPU-PEAK':>8}  {'UTIL':>5}")
     print(f"{C_BOLD}{header}{C_RESET}")
     print("  " + "─" * (len(header) - 2))
     for nm in sorted(groups):
@@ -1080,11 +1140,17 @@ def cmd_stats(args):
         n = len(durs)
         mn, md = durs[0], _percentile(durs, 50)
         p90, mx = _percentile(durs, 90), durs[-1]
+        pk = sorted(p for p, _ in peaks.get(nm, []))
+        ut = [u for _, u in peaks.get(nm, []) if isinstance(u, (int, float))]
+        pk_s = fmt_mb(_percentile(pk, 90)) if pk else "—"
+        ut_s = f"{round(sum(ut) / len(ut))}%" if ut else "—"
         print(f"  {nm:<{name_w}}  {n:>3}  {fmt_elapsed(mn):>8}  {fmt_elapsed(md):>8}  "
-              f"{fmt_elapsed(p90):>8}  {fmt_elapsed(mx):>8}")
+              f"{fmt_elapsed(p90):>8}  {fmt_elapsed(mx):>8}  {pk_s:>8}  {ut_s:>5}")
     print()
-    print(f"  {C_DIM}Tip: hive submit --name <NAME> --est-runtime auto  "
-          f"(uses P90 above so the scheduler avoids soon-expiring nodes).{C_RESET}")
+    print(f"  {C_DIM}GPU-PEAK = P90 of peak GPU memory, UTIL = mean utilisation (tasks run "
+          f"since usage sampling was added).{C_RESET}")
+    print(f"  {C_DIM}Tip: hive submit --name <NAME> --est-runtime auto --need-mb auto  "
+          f"(both resolved from the history above).{C_RESET}")
 
 
 # ── Remove ────────────────────────────────────────────────────────────────────
@@ -1229,7 +1295,7 @@ def build_parser():
     ps.add_argument("--owner", "-o", metavar="OWNER",
                     help="Who this task belongs to (agent / project name) — filter later with "
                          "`hive list --owner OWNER`. Default: #HIVE owner= or $HIVE_OWNER")
-    ps.add_argument("--need-mb", type=int, metavar="MB", dest="need_mb",
+    ps.add_argument("--need-mb", metavar="MB|auto", dest="need_mb",
                     help="Min free GPU memory (MiB) required before dispatch; "
                          "the scheduler holds the task PENDING until a node has it free")
     ps.add_argument("--gpus", type=int, metavar="N",
