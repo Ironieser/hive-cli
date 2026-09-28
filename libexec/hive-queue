@@ -460,6 +460,29 @@ def is_sched_running():
     return False
 
 
+_sched_checked = 0.0
+
+
+def ensure_sched(queue, every=60):
+    """Start the scheduler if it is down while tasks are pending or running.
+
+    Only `submit` used to do this. A scheduler that died (node reboot, OOM kill) left
+    finished tasks showing RUNNING for a day and pending ones undispatched until
+    somebody submitted again (feedback #18/#19) — while the agents watching them were
+    sitting in `hive wait` / `hive list`. Checked at most once per `every` seconds."""
+    global _sched_checked
+    if time.time() - _sched_checked < every:
+        return False
+    _sched_checked = time.time()
+    active = [t for t in queue.get("tasks", {}).values() if t.get("state") in ("pending", "running")]
+    if not active or is_sched_running():
+        return False
+    print(f"{C_YELLOW}scheduler was not running with {len(active)} active task(s) — "
+          f"starting it{C_RESET}", file=sys.stderr, flush=True)
+    cmd_daemon(argparse.Namespace(subcmd="start"))
+    return True
+
+
 def cmd_daemon(args):
     sub = args.subcmd if hasattr(args, 'subcmd') else "status"
 
@@ -835,6 +858,7 @@ def _date_label(d):
 
 def cmd_list(args):
     queue = load_queue()
+    ensure_sched(queue, every=0)
     all_tasks = list(queue.get("tasks", {}).values())
 
     filter_state = args.state.lower() if args.state else None
@@ -1143,6 +1167,7 @@ def cmd_wait(args):
     pending_since = None
     while True:
         queue = load_queue()
+        ensure_sched(queue)
         task  = queue["tasks"].get(task_id)
         if not task:
             print(f"Task #{task_id} not found.", file=sys.stderr)
@@ -1311,7 +1336,9 @@ def cmd_wait_many(args, ids):
     print(f"Waiting for {len(ids)} task(s): #{ids[0]}–#{ids[-1]}" if len(ids) > 3
           else f"Waiting for task(s): {', '.join('#' + str(i) for i in ids)}", flush=True)
     while True:
-        tasks = load_queue().get("tasks", {})
+        _q = load_queue()
+        ensure_sched(_q)
+        tasks = _q.get("tasks", {})
         states = {}
         for i in ids:
             t = tasks.get(str(i))

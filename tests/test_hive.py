@@ -898,6 +898,24 @@ chk("...once, not every cycle", not os.path.exists(_upd))
 os.remove(os.path.join(hs.HIVE_DIR, "mock_pending"))
 reset_health(); reset_sched_state()
 
+print("== a dead scheduler is restarted by list / wait (feedback #18/#19) ==")
+_started = []
+_real_daemon, _real_running = hq.cmd_daemon, hq.is_sched_running
+hq.cmd_daemon = lambda a: _started.append(a.subcmd)
+hq.is_sched_running = lambda: False
+with _cl.redirect_stderr(_io.StringIO()):
+    hq._sched_checked = 0
+    chk("dead scheduler + nothing active -> left alone",
+        hq.ensure_sched({"tasks": {"1": {"state": "done"}}}, every=0) is False and _started == [])
+    chk("dead scheduler + a running task -> started",
+        hq.ensure_sched({"tasks": {"1": {"state": "running"}}}, every=0) is True and _started == ["start"])
+    chk("...checked at most once per interval",
+        hq.ensure_sched({"tasks": {"1": {"state": "running"}}}, every=60) is False and _started == ["start"])
+    hq.is_sched_running = lambda: True
+    chk("live scheduler -> nothing to do",
+        hq.ensure_sched({"tasks": {"1": {"state": "pending"}}}, every=0) is False and _started == ["start"])
+hq.cmd_daemon, hq.is_sched_running = _real_daemon, _real_running
+
 print("== phase 3: dependencies, arrays, concurrency caps ==")
 import argparse as _ap
 def _capture(fn, *a):

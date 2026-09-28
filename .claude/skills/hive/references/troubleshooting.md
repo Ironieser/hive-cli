@@ -13,7 +13,7 @@
 | Task FAILED in < 1 min | `hive logs ID -n 40` | CUDA-init errors → node problem: `hive health` (probably already quarantined); `hive health report NODE` if not. Otherwise it is your command. |
 | Task FAILED, log ends abruptly, no footer | top of log / `hive list` | `srun` error at the top = hold job died; hive requeues those (`infra_failure_redispatch`) |
 | `hive wait` prints ⚠ re-dispatched | — | node reclaimed mid-run; the new run started from scratch — make the command resume from its checkpoint |
-| `hive list` shows RUNNING for hours but the log has a `finished` footer | `hive queue daemon status` | scheduler died before reaping; `hive queue daemon start` reaps it on the next cycle |
+| `hive list` shows RUNNING for hours but the log has a `finished` footer | `hive queue daemon status` | scheduler died before reaping. `hive list` / `hive wait` restart it by themselves when tasks are active; otherwise `hive queue daemon start` |
 | Node shows `PFAIL` | `hive poll` | probe failed; `probe_detail` in `node_monitor.json` says why (`srun_failed` = couldn't run, `gpu_unresponsive` / `no_gpu_devices` = broken node). hive still verifies before dispatch |
 | Node shows `QUAR` | `hive health` | quarantined; auto-released after 2 healthy probes, or `hive health clear NODE` |
 | Quarantined node with no hold job on it | `hive health` RESULT column | the health monitor takes over: released when SLURM reports the node **rebooted** since the quarantine, or when a `hive_canary` job (10 min, 1 GPU, every 6 h, pinned to the node) probes healthy twice. `canary_pending` = waiting in the SLURM queue. Don't cancel `hive_canary` jobs |
