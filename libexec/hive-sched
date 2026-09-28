@@ -748,12 +748,71 @@ def live_probe(slurm_jobid, cuda_deadline=None, skip_cuda=False, timeout=None):
     if agg is None:
         return {"ok": False}
     util, used, total = agg
+    per_gpu = []
+    for ln in lines:                       # one reading per card, in nvidia-smi order
+        one = _max_gpu([ln])
+        if one is not None:
+            per_gpu.append(one)
     # The CUDA verdict rides in the same srun step: `fail` means creating a context on
     # the hold job's GPU failed (co-tenant / broken node), `unknown` means the probe
     # couldn't run (no python / libcuda) and is never treated as a fault.
     cuda, cuda_detail = hh.parse_cuda_probe(cuda_part.splitlines())
     return {"ok": True, "util": util, "mem_used": used, "mem_total": total,
-            "cuda": cuda, "cuda_detail": cuda_detail}
+            "gpus": per_gpu, "cuda": cuda, "cuda_detail": cuda_detail}
+
+
+# ── GPU slots (docs/feature_plan.md phase 4) ─────────────────────────────────
+# A hold job with N cards is N slots, not one. A slot is a POSITION in the hold job's
+# CUDA_VISIBLE_DEVICES list (and the same position in its nvidia-smi listing); a running
+# task records the slots it holds in `gpu_slots`. A task without that field was
+# dispatched by an older scheduler, which gave it the first cards and assumed it had the
+# hold job to itself: it counts as holding every slot.
+
+def slot_count(info):
+    return max(1, len(info.get("gpu") or []))
+
+
+def slots_in_use(tasks):
+    """({jid: set of slots held}, {jids held entirely}) from the running tasks."""
+    used, full = {}, set()
+    for t in tasks.values():
+        if t.get("state") != "running" or not t.get("slurm_jobid"):
+            continue
+        jid = t["slurm_jobid"]
+        slots = t.get("gpu_slots")
+        if slots is None:
+            full.add(jid)
+        else:
+            used.setdefault(jid, set()).update(int(s) for s in slots)
+    return used, full
+
+
+def pick_slots(readings, taken, want, need_mb):
+    """(slots, reason, usable): `want` free, clean slots with `need_mb` free memory
+    each, or None and why not. `usable` counts the free slots that are clean at all —
+    when it is 0 the hold job has nothing for anybody (node-level), otherwise it just
+    does not fit THIS task (task-level)."""
+    if want <= 0:
+        return [], None, len(readings)
+    fit, usable, why = [], 0, None
+    for s, (util, used, total) in enumerate(readings):
+        if s in taken:
+            continue
+        if util >= 5 and used >= 500:
+            why = why or "node_busy_on_verify"      # in use by something hive did not start
+        elif used > GPU_CLEAN_MB:
+            why = why or "gpu_dirty"                # zombie / co-tenant memory resident
+        else:
+            usable += 1
+            if total and need_mb and (total - used) < need_mb:
+                why = why or "waiting_for_mem"
+            else:
+                fit.append(s)
+    if len(fit) >= want:
+        return fit[:want], None, usable
+    if usable >= want or (usable and why == "waiting_for_mem"):
+        return None, "waiting_for_mem" if why == "waiting_for_mem" else "waiting_for_gpu", usable
+    return None, why or "waiting_for_gpu", usable
 
 
 def drop_node(candidates, node, i):
@@ -778,7 +837,7 @@ def partition_rank(partition, prefer):
     return prefer.index(partition) if partition in prefer else len(prefer)
 
 
-def get_candidates(jobs_db, used_jobids, freed, quarantined=frozenset()):
+def get_candidates(jobs_db, used_jobids, freed, quarantined=frozenset(), partial=frozenset()):
     """Candidate hold-jobs for dispatch, each (jid, info, needs_verify).
 
     Hold jobs on a `quarantined` physical node (hive health) are never candidates.
@@ -805,10 +864,13 @@ def get_candidates(jobs_db, used_jobids, freed, quarantined=frozenset()):
         # older hive self-heal without hand-editing. needs_verify is always set
         # for it, so live_probe() rejects any node that is genuinely busy.
         is_uncertain = st in ("probe_failed", "unknown", "warning")
-        if not (is_idle or is_uncertain or forced):
+        # A hold job running a hive task reads `busy`, and still has free slots when it
+        # owns more cards than its tasks hold (`partial`). Verified like an uncertain one.
+        shared = jid in partial
+        if not (is_idle or is_uncertain or forced or shared):
             continue
         stale = (_age_seconds(info.get("polled_at")) or 0) > NODE_DB_STALE_SECS
-        needs_verify = bool(forced or is_uncertain or info.get("carried_forward") or stale)
+        needs_verify = bool(forced or is_uncertain or shared or info.get("carried_forward") or stale)
         cands.append((jid, info, needs_verify))
     cands.sort(key=lambda c: c[2])   # False (no verify) first
     return cands
@@ -892,6 +954,11 @@ def dispatch_task(task, slurm_jobid, node_name):
     # leave it alone. The resulting visibility is logged so a device-count surprise
     # is one line in the log instead of a 40-minute mystery.
     want_gpus = task_gpus(task)
+    # Positions (1-based, for cut / sed) of the cards this task holds. Without
+    # `gpu_slots` — a task claimed by an older scheduler — the first N, as before.
+    slots = task.get("gpu_slots")
+    fields = ",".join(str(int(s) + 1) for s in slots) if slots else f"1-{want_gpus}"
+    sample = ";".join(f"{int(s) + 1}p" for s in slots) if slots else f"1,{want_gpus}p"
     if want_gpus > 0:
         gpu_line = (
             # Log the visibility SLURM handed us *before* narrowing — that is the line
@@ -900,7 +967,7 @@ def dispatch_task(task, slurm_jobid, node_name):
             # list, not a count, so it is deliberately not used as one here.
             f'_HIVE_CVD_ALL="${{CUDA_VISIBLE_DEVICES:-<unset>}}"\n'
             f'if [ -n "${{CUDA_VISIBLE_DEVICES:-}}" ]; then\n'
-            f'  export CUDA_VISIBLE_DEVICES=$(echo "$CUDA_VISIBLE_DEVICES" | cut -d, -f1-{want_gpus})\n'
+            f'  export CUDA_VISIBLE_DEVICES=$(echo "$CUDA_VISIBLE_DEVICES" | cut -d, -f{fields})\n'
             f'fi\n'
             f'echo "=== gpus: requested {want_gpus}, visible=[${{CUDA_VISIBLE_DEVICES:-<unset>}}]'
             f' (hold job provided [$_HIVE_CVD_ALL]) ===" >> {lf}\n'
@@ -934,7 +1001,7 @@ def dispatch_task(task, slurm_jobid, node_name):
             "( _pk=0; _mu=0; _su=0; _n=0; _k=0\n"
             "  while true; do\n"
             "    _r=$(nvidia-smi --query-gpu=utilization.gpu,memory.used "
-            f"--format=csv,noheader,nounits 2>/dev/null | head -n {want_gpus})\n"
+            f"--format=csv,noheader,nounits 2>/dev/null | sed -n '{sample}')\n"
             "    while IFS=, read -r _u _m; do\n"
             '      _u="${_u// /}"; _m="${_m// /}"\n'
             '      case "$_u$_m" in ""|*[!0-9]*) continue;; esac\n'
@@ -1276,6 +1343,7 @@ def _cycle(probe_cache, final):
                                 task["last_node"]      = node_name
                                 task["state"]          = "pending"
                                 task["pending_reason"] = "node_quarantined_redispatch"
+                                task.pop("gpu_slots", None)
                                 task["slurm_jobid"]    = None
                                 task["node"]           = None
                                 task["srun_pid"]       = None
@@ -1304,6 +1372,7 @@ def _cycle(probe_cache, final):
                     task["attempts"]      = task.get("attempts", 0) + 1
                     task["state"]         = "pending"
                     task["pending_reason"] = "redispatched_after_crash"
+                    task.pop("gpu_slots", None)
                     task["slurm_jobid"]   = None
                     task["node"]          = None
                     task["srun_pid"]      = None
@@ -1333,6 +1402,7 @@ def _cycle(probe_cache, final):
                     task["last_node"]          = prev_node
                     task["state"]              = "pending"
                     task["pending_reason"]     = "infra_failure_redispatch"
+                    task.pop("gpu_slots", None)
                     task["slurm_jobid"]        = None
                     task["node"]               = None
                     task["srun_pid"]           = None
@@ -1379,6 +1449,18 @@ def _cycle(probe_cache, final):
                               slurm_jobid=jid, run_secs=task["duration_secs"],
                               queued_secs=task["queued_secs"], **usage_fields(task))
                     notify(task, "finish")
+
+        # Occupancy as it is after step (1). Recomputed from the tasks rather than
+        # patched up along the way: with several tasks on one hold job, one of them
+        # finishing must not make the hold job look free.
+        used_slots, full_jids = slots_in_use(tasks)
+        running_jobids = set(used_slots) | full_jids | {
+            t["slurm_jobid"] for t in tasks.values()
+            if t["state"] == "running" and t.get("slurm_jobid")}
+        for jid in list(used_slots):
+            if jid in jobs_db and len(used_slots[jid]) >= slot_count(jobs_db[jid]):
+                full_jids.add(jid)
+        partial_jids = {j for j in running_jobids if j not in full_jids}
 
         # ── (1b) Periodic health checks of quarantined nodes ─────────────────
         # Re-probe each quarantined node (through one of its hold jobs that isn't
@@ -1469,7 +1551,7 @@ def _cycle(probe_cache, final):
         for state in (_probe_backoff, _reject_logged):
             for gone in [j for j in state if j not in jobs_db]:
                 del state[gone]
-        candidates = get_candidates(jobs_db, running_jobids, freed_jobids, quarantined)
+        candidates = get_candidates(jobs_db, full_jids, freed_jobids, quarantined, partial_jids)
         # Fast nodes first, preferred partitions first ("prefer_partitions" in
         # pool_config.json); the sort is stable, so trusted-idle-first is kept within.
         prefer = preferred_partitions()
@@ -1598,10 +1680,13 @@ def _cycle(probe_cache, final):
             i = 0
             while i < len(candidates):
                 jid, info, needs_verify = candidates[i]
-                if "_live" in info:
-                    used, total = info["_live"]       # verified earlier this cycle
-                else:
-                    used, total = db_gpu_mem(info)
+                taken = used_slots.get(jid, set())
+                # Per-card readings: live ones if this hold job was verified earlier
+                # this cycle, else the poller's.
+                readings = info.get("_live") or [
+                    (int(g.get("util", 0) or 0), int(g.get("mem_used", 0) or 0),
+                     int(g.get("mem_total", 0) or 0)) for g in (info.get("gpu") or [])
+                ] or [(0, 0, 0)]
 
                 # Slow-node gate (task-level): only tasks that can live with a start
                 # delayed by minutes.
@@ -1623,6 +1708,11 @@ def _cycle(probe_cache, final):
                 have_gpus = len(info.get("gpu") or [])
                 if have_gpus and want_gpus > have_gpus:
                     reason = "insufficient_gpus"
+                    i += 1
+                    continue
+                # …and enough of them must be free of other hive tasks (task-level).
+                if taken and want_gpus > len(readings) - len(taken):
+                    reason = "waiting_for_gpu"
                     i += 1
                     continue
 
@@ -1681,17 +1771,10 @@ def _cycle(probe_cache, final):
                         log_reject(jid, node_name, reason,
                                    f"no answer within {LIVE_PROBE_TIMEOUT}s or srun failed")
                         continue
-                    used, total = p["mem_used"], p["mem_total"]
-                    # A node the DB called idle but that is actually occupied:
-                    if p["util"] >= 5 and used >= 500:
-                        reason = node_reject = "node_busy_on_verify"
-                        # Step aside for a while: a task takes the FIRST node that is
-                        # not yet verified, so a node that keeps being rejected would
-                        # be probed again every cycle and the ones behind it never.
-                        note_probe_result(jid, False, reason, cap=PROBE_BACKOFF_BUSY)
-                        candidates.pop(i)      # node-level
-                        log_reject(jid, node_name, reason, f"util={p['util']}% used={used}MiB")
-                        continue
+                    # One reading per card; a probe that only gave totals (older
+                    # format) is taken to describe every card.
+                    readings = list(p.get("gpus") or []) or \
+                        [(p["util"], p["mem_used"], p["mem_total"])] * len(readings)
                     if p.get("cuda") == "fail":
                         # nvidia-smi says free, but a CUDA context can't be created:
                         # co-tenant outside our cgroup or a broken node. No user code
@@ -1718,19 +1801,28 @@ def _cycle(probe_cache, final):
                         health_changed = True
                     # Verified clean: keep the live reading so the next task doesn't
                     # pay for another srun probe on the same node this cycle.
-                    info = dict(info, _live=(used, total))
+                    info = dict(info, _live=readings)
                     candidates[i] = (jid, info, False)
 
-                if used > GPU_CLEAN_MB:
-                    reason = node_reject = "gpu_dirty"   # zombie / co-tenant memory resident
-                    note_probe_result(jid, False, reason, cap=PROBE_BACKOFF_BUSY)
-                    candidates.pop(i)          # node-level
-                    log_reject(jid, info.get("node", "?"), reason, f"used={used}MiB")
+                # Which cards. Nothing usable at all on this hold job is the NODE's
+                # state (busy or dirty: drop it for everyone and step aside for a while
+                # — a task takes the first unverified node, so one that keeps being
+                # rejected would be probed every cycle and the ones behind it never).
+                # Usable, but not for this task, is the TASK's.
+                slots, why, usable = pick_slots(readings, taken, want_gpus, need_mb)
+                if slots is None:
+                    reason = why
+                    if usable == 0 and why in ("node_busy_on_verify", "gpu_dirty"):
+                        node_reject = why
+                        note_probe_result(jid, False, why, cap=PROBE_BACKOFF_BUSY)
+                        candidates.pop(i)
+                        log_reject(jid, info.get("node", "?"), why, "; ".join(
+                            f"gpu{s}: util={u}% used={m}MiB" for s, (u, m, _t) in enumerate(readings)
+                            if s not in taken))
+                    else:
+                        i += 1
                     continue
-                if total and need_mb and (total - used) < need_mb:
-                    reason = "waiting_for_mem"    # task-level
-                    i += 1
-                    continue
+                used = max((readings[s][1] for s in slots), default=0)
 
                 # Walltime gate (task-level; only when the task carries a runtime
                 # estimate — see WALLTIME_MARGIN_SECS): never place a long task on a
@@ -1747,12 +1839,17 @@ def _cycle(probe_cache, final):
                     i += 1
                     continue
 
-                # This node is taken (whether or not the launch below succeeds).
-                candidates.pop(i)
+                # These slots are taken (whether or not the launch below succeeds); the
+                # hold job stays a candidate while it has others left.
+                taken = used_slots.setdefault(jid, set())
+                taken.update(slots)
+                if want_gpus <= 0 or len(taken) >= len(readings):
+                    candidates.pop(i)
                 node_name = info.get("node", "?")
-                logging.info("Dispatching task %d → %s (slurm jobid %s, used=%dMiB, "
-                             "node_walltime=%s)", task["id"], node_name, jid, used,
-                             _fmt_dur(node_left))
+                logging.info("Dispatching task %d → %s (slurm jobid %s, gpu slot%s %s, "
+                             "used=%dMiB, node_walltime=%s)", task["id"], node_name, jid,
+                             "" if len(slots) == 1 else "s",
+                             ",".join(map(str, slots)) or "none", used, _fmt_dur(node_left))
                 # Crash-safe: persist the claim BEFORE launching the srun step so a
                 # scheduler killed mid-dispatch can't orphan a step (feedback OPT-E).
                 task["state"]        = "running"
@@ -1762,6 +1859,7 @@ def _cycle(probe_cache, final):
                 task["started_at"]   = now_iso()
                 task["dispatched_at"] = now_iso()
                 task["started_ts"]   = task["dispatched_ts"] = now_ts()
+                task["gpu_slots"]    = slots
                 task["node_time_left_secs"] = node_left
                 task["node_slow_init_secs"] = (health["nodes"].get(node_name, {})
                                                .get("slow_init_secs") if is_slow else None)
@@ -1774,6 +1872,7 @@ def _cycle(probe_cache, final):
                     task["state"] = "pending"
                     task["slurm_jobid"] = task["node"] = task["srun_pid"] = None
                     task["started_at"] = task["started_ts"] = task["dispatched_ts"] = None
+                    task.pop("gpu_slots", None)
                     save_queue(queue, lfd)
                     reason = "dispatch_error"
                     placed = True   # consumed the candidate; stop trying for this task

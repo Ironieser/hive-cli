@@ -231,13 +231,17 @@ if health_path:
 
 # Build slurm_jobid → task map for running hive tasks
 jobid_to_task = {}
+jobid_tasks = {}
 if queue_path:
     try:
         with open(queue_path) as _qf:
             _q = json.load(_qf)
         for _t in _q.get("tasks", {}).values():
             if _t.get("state") == "running" and _t.get("slurm_jobid"):
-                jobid_to_task[str(_t["slurm_jobid"])] = _t
+                # A multi-GPU hold job can run several tasks (GPU slots): the row
+                # shows the first and how many more.
+                jobid_tasks.setdefault(str(_t["slurm_jobid"]), []).append(_t)
+                jobid_to_task.setdefault(str(_t["slurm_jobid"]), _t)
     except Exception:
         pass
 try:
@@ -339,9 +343,15 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
     if qt:
         tid    = qt["id"]
         name   = qt.get("name") or ""
+        if name and qt.get("array_index") is not None:
+            name = f"{name}[{qt['array_index']}]"
         owner  = qt.get("owner") or ""
         qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
-        prefix = f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
+        more   = len(jobid_tasks.get(jobid, [])) - 1
+        n_gpu  = len(gpus)
+        held   = sum(len(t.get("gpu_slots") or []) for t in jobid_tasks.get(jobid, []))
+        share  = f"(+{more} more, {held}/{n_gpu} GPUs) " if more > 0 else ""
+        prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
         task_cmd = prefix + qcmd
         # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
         # busy: cold import / model load, or a poll older than the dispatch. The

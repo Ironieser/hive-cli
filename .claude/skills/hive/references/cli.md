@@ -59,7 +59,7 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--owner` / `-o` | `$HIVE_OWNER` | owner tag (agent or project name). Precedence: `--owner` > `#HIVE owner=` > `$HIVE_OWNER`. Shown as an OWNER column in `hive list --owner all` and as `[owner]` in the `hive nodes` TASK column |
 | `--est-runtime` | — | `2h`, `90m`, `1-12:00:00`, seconds, or `auto` (P90 of NAME's history). With an estimate the scheduler never places the task on a node whose remaining walltime < estimate + 10 min (`insufficient_walltime`). Without one the task is walltime-blind. |
 | `--need-mb` | 0 | minimum **free** GPU memory (MiB), or `auto` = P90 of the GPU peak this NAME reached in past runs + 10 %. Task waits (`waiting_for_mem`) until a card has it |
-| `--gpus` | 1 | GPUs the task may see. A hold job may own more; hive narrows `CUDA_VISIBLE_DEVICES` to the first N so frameworks don't auto-`DataParallel` over cards you didn't ask for. `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`). |
+| `--gpus` | 1 | GPUs the task gets. A hold job with N cards is N slots: it runs several tasks at once, each seeing only its own cards in `CUDA_VISIBLE_DEVICES` (so frameworks don't auto-`DataParallel` over cards you didn't ask for). `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`) of which 2 are free (`waiting_for_gpu`). `--gpus 0` hides every GPU. |
 | `--timeout` | — | hard limit on **run** time (`2h`, `90m`). Over it the task is killed and ends `failed`, exit code 124, `fail_reason: timeout`; not retried. Unlike `--est-runtime`, which only steers placement |
 | `--notify` | `$HIVE_NOTIFY` | shell command run when the task finishes (done / failed / cancelled / timeout) or is requeued after a node loss. See [Notification hook](#notification-hook) |
 | `--quiet` / `-q` | — | print only the new id on stdout (notes go to stderr): `ID=$(hive submit -q …)` |
@@ -172,6 +172,7 @@ hive submit --notify 'curl -s -d "task $HIVE_TASK_NAME: $HIVE_TASK_STATE" https:
 | `array_limit` / `owner_limit` | The array's `%N` / the owner's `--max-running` is reached; it starts when one of them ends |
 | `node_slow` | Only SLOW nodes are free and the task does not accept them → `--allow-slow`, or give an `--est-runtime` ≥ 1 h, or wait for a fast node |
 | `verifying_node` | The node it would take is being probed; decided within a cycle (~30 s) |
+| `waiting_for_gpu` | The hold jobs with enough cards have them taken by other hive tasks; it starts when one ends |
 | `held` | `hive hold` was used on it; `hive unhold ID` lets it go |
 | `node_excluded` | The only free nodes are in the task's `--exclude` list |
 | `insufficient_gpus` | No hold job owns `--gpus N` cards → add a `--gres=gpu:N` hold job or lower N |

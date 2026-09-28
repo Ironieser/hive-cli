@@ -199,19 +199,28 @@ hs.run_one_cycle()
 time.sleep(0.4)
 chk("old task + old node DB dispatch cleanly", rq()["20"]["state"] in ("running", "done"))
 
-print("== integration: multi-GPU node, one GPU dirty -> held (Phase 1) ==")
-# Phase 1 treats a multi-GPU hold-job as ONE slot: it must NOT dispatch while ANY of its
-# GPUs is dirty (db_gpu_mem takes the max). GPU0 clean, GPU1 has 40GB resident.
+print("== integration: multi-GPU node, one GPU dirty (GPU slots) ==")
+# A hold job with N cards is N slots. GPU0 clean, GPU1 has 40GB resident: a 1-GPU task
+# takes GPU0 (it used to be held, the hold job being one slot judged by its worst
+# card); a 2-GPU task cannot be placed.
 multi = node("multi", 72000)
 multi["gpu"] = [{"index": 0, "util": 0,  "mem_used": 10,    "mem_total": 81920},
                 {"index": 1, "util": 90, "mem_used": 40000, "mem_total": 81920}]
-wdb({"700": multi})
-wq({"30": task(30, name="m", est=300)})
 os.environ["MOCK_LIVE_GPU"] = "0, 10, 81920\\n0, 40000, 81920"   # live probe sees GPU1 dirty (memory resident, no util)
+wdb({"700": multi})
+wq({"31": dict(task(31, name="m2", est=300), gpus=2)})
 hs.run_one_cycle()
+chk("2-GPU task on a hold job with one dirty card is held (gpu_dirty)",
+    rq()["31"]["state"] == "pending" and rq()["31"].get("pending_reason") == "gpu_dirty")
+wdb({"700": multi})
+wq({"30": dict(task(30, name="m", est=300), cmd="echo cvd=$CUDA_VISIBLE_DEVICES")})
+os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-aaa,GPU-bbb"
+hs.run_one_cycle(); time.sleep(0.5)
+os.environ.pop("CUDA_VISIBLE_DEVICES")
+chk("1-GPU task takes the clean card", rq()["30"]["state"] in ("running", "done")
+    and rq()["30"].get("gpu_slots") == [0] and "cvd=GPU-aaa\n" in open(rq()["30"]["log"]).read())
 os.environ.pop("MOCK_LIVE_GPU", None)
-chk("2-GPU node with one dirty GPU held as gpu_dirty (not dispatched)",
-    rq()["30"]["state"] == "pending" and rq()["30"].get("pending_reason") == "gpu_dirty")
+hs.run_one_cycle()
 
 print("== regression #10: `warning` must be transient, never a terminal state ==")
 # A hold job that finishes a task and goes quiet used to be pinned at `warning`
@@ -299,10 +308,12 @@ two_gpu["gpu"] = [{"index": 0, "util": 0, "mem_used": 10, "mem_total": 81920},
                   {"index": 1, "util": 0, "mem_used": 10, "mem_total": 81920}]
 wdb({"700": two_gpu})
 wq({"51": dict(task(51, name="two", est=300), gpus=2)})
+os.environ["MOCK_LIVE_GPU"] = "0, 10, 81920\\n0, 10, 81920"      # the probe lists both cards
 hs.run_one_cycle()
 time.sleep(0.4)
+os.environ.pop("MOCK_LIVE_GPU")
 chk("gpus=2 task dispatches onto a 2-GPU hold job",
-    rq()["51"]["state"] in ("running", "done"))
+    rq()["51"]["state"] in ("running", "done") and rq()["51"].get("gpu_slots") == [0, 1])
 
 # A task queued by an OLDER hive has no "gpus" key -> must still dispatch (default 1).
 wdb({"700": node("g3", 72000)})
@@ -1055,6 +1066,79 @@ os.remove(_upd); hs.run_one_cycle()
 chk("...once, not every cycle", not os.path.exists(_upd))
 os.remove(os.path.join(hs.HIVE_DIR, "mock_pending"))
 reset_health(); reset_sched_state()
+
+print("== GPU slots: several tasks on one multi-GPU hold job ==")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close()
+def gpus(n, used=10, util=0):
+    return [{"index": i, "util": util, "mem_used": used, "mem_total": 81920} for i in range(n)]
+chk("pick_slots: first free clean cards", hs.pick_slots([(0, 10, 81920)] * 4, {1}, 2, 0) == ([0, 2], None, 3))
+chk("pick_slots: a busy card is skipped, not fatal",
+    hs.pick_slots([(90, 40000, 81920), (0, 10, 81920)], set(), 1, 0) == ([1], None, 1))
+chk("pick_slots: nothing usable -> node-level reason, usable 0",
+    hs.pick_slots([(90, 40000, 81920)], set(), 1, 0) == (None, "node_busy_on_verify", 0))
+chk("pick_slots: clean but too little memory -> waiting_for_mem",
+    hs.pick_slots([(0, 4000, 81920)], set(), 1, 80000) == (None, "waiting_for_mem", 1))
+chk("pick_slots: gpus=0 needs no card", hs.pick_slots([(90, 40000, 81920)], set(), 0, 0)[0] == [])
+four = dict(node("quad", 72000), gpu=gpus(4))
+os.environ["MOCK_LIVE_GPU"] = "\\n".join(["0, 10, 81920"] * 4)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+wdb({"700": four})
+wq({str(610 + i): dict(task(610 + i, name=f"s{i}", sub=loc(i)), cmd="echo cvd=$CUDA_VISIBLE_DEVICES; sleep 2")
+    for i in range(5)})
+_pr = []
+_lp4 = hs.live_probe
+def _count(jid, **kw):
+    _pr.append(jid); return _lp4(jid, **kw)
+hs.live_probe = _count
+hs.run_one_cycle()
+q = rq()
+chk("four 1-GPU tasks run at once on ONE 4-GPU hold job, one card each",
+    [q[str(610 + i)].get("gpu_slots") for i in range(4)] == [[0], [1], [2], [3]]
+    and all(q[str(610 + i)]["state"] == "running" for i in range(4)))
+chk("the fifth waits for a card", q["614"]["state"] == "pending"
+    and q["614"].get("pending_reason") in ("no_dispatchable_node", "waiting_for_gpu"))
+chk("one probe served all four placements", _pr == ["700"])
+time.sleep(0.6)
+chk("each task sees only its own card",
+    ["cvd=%d\n" % i in open(q[str(610 + i)]["log"]).read() for i in range(4)] == [True] * 4)
+# while they run the poller calls the hold job busy; one finishing frees ONE slot
+busy4 = dict(node("quad", 72000, st="busy"), gpu=gpus(4, used=30000, util=80))
+wdb({"700": busy4})
+os.environ["MOCK_LIVE_GPU"] = "\\n".join(["80, 30000, 81920"] * 4)
+hs.run_one_cycle()
+chk("a full hold job is not a candidate", rq()["614"]["state"] == "pending")
+open(os.path.join(hs.HEARTBEAT_DIR, "611.exit"), "w").write("0")      # task on slot 1 ends
+os.environ["MOCK_LIVE_GPU"] = "80, 30000, 81920\\n0, 10, 81920\\n80, 30000, 81920\\n80, 30000, 81920"
+hs.run_one_cycle()
+q = rq()
+chk("the freed slot goes to the waiting task; the others keep running",
+    q["614"].get("gpu_slots") == [1] and q["614"]["state"] == "running"
+    and all(q[k]["state"] == "running" for k in ("610", "612", "613")))
+# a task from an older scheduler (no gpu_slots) holds the whole hold job
+wdb({"700": four})
+os.environ["MOCK_LIVE_GPU"] = "\\n".join(["0, 10, 81920"] * 4)
+old_t = task(620, name="legacy", state="running", jid="700", node="quad", st=loc(-30)); old_t["started_ts"] = time.time() - 30
+open(os.path.join(hs.HEARTBEAT_DIR, "620"), "w").write("x")
+wq({"620": old_t, "621": dict(task(621, name="new"), cmd="true")})
+hs.run_one_cycle()
+chk("a running task without gpu_slots holds every slot", rq()["621"]["state"] == "pending")
+# 2-GPU task next to a 1-GPU task
+wdb({"700": four})
+wq({"630": dict(task(630, name="a"), cmd="sleep 1"), "631": dict(task(631, name="b", sub=loc(1)), cmd="echo cvd=$CUDA_VISIBLE_DEVICES", gpus=2)})
+try: os.remove(os.path.join(hs.HEARTBEAT_DIR, "620"))
+except OSError: pass
+hs.run_one_cycle(); time.sleep(0.5)
+chk("a 2-GPU task gets the next two cards", rq()["630"].get("gpu_slots") == [0] and rq()["631"].get("gpu_slots") == [1, 2]
+    and "cvd=1,2\n" in open(rq()["631"]["log"]).read())
+# requeue drops the slots
+t = dict(task(640, name="rq", state="running", jid="2001", node="gone", st=loc(-450), sub=loc(-500), dispatched=loc(-450)), gpu_slots=[2])
+stale_hb(640); open(os.path.join(hs.LOG_DIR, "task-640.log"), "w").write("x")
+wdb({}); wq({"640": t}); hs.run_one_cycle()
+chk("a requeued task gives its slots back", rq()["640"]["state"] == "pending" and "gpu_slots" not in rq()["640"])
+hs.live_probe = _lp4
+os.environ.pop("MOCK_LIVE_GPU"); os.environ.pop("CUDA_VISIBLE_DEVICES")
+hs.run_one_cycle(); time.sleep(0.3)
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
 
 print("== red team, round 1: regressions for what it found ==")
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close()

@@ -199,6 +199,25 @@ _nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')   # strip 
 if grep -q "CLAIM" <<<"$_nodes" && grep -q "#1 warm: python train.py" <<<"$_nodes" && grep -q "claimed: 1" <<<"$_nodes"; then
   echo "  [OK] running task on a GPU-idle hold job shows CLAIM + task name + claimed count"
 else echo "  [FAIL] CLAIM display"; echo "$_nodes" | tail -8; fail=1; fi
+# Two tasks sharing a 2-GPU hold job (GPU slots), one of them an array member.
+"$PY" - <<'PY'
+import json, os, time
+H = os.environ['HIVE_DIR']
+now = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
+g = {"util": 0, "mem_used": 0, "mem_total": 81920}
+json.dump({"updated": now, "jobs": {"700": {"node": "nodeX", "partition": "gpu", "job_elapsed": "1h",
+    "gpu": [dict(g, index=0), dict(g, index=1)], "processes": [], "status": "idle",
+    "gpu_idle_since": None, "time_left_secs": 72000, "polled_at": now}}}, open(H + "/node_monitor.json", "w"))
+t = lambda i, **k: dict({"id": i, "name": "sw", "cmd": "python train.py", "state": "running",
+    "slurm_jobid": "700", "node": "nodeX", "submitted_at": now, "started_at": now,
+    "log": H + f"/logs/task-{i}.log"}, **k)
+json.dump({"version": 1, "next_id": 3, "tasks": {"1": t(1, gpu_slots=[0], array_id=1, array_index=0),
+    "2": t(2, gpu_slots=[1], array_id=1, array_index=1)}}, open(H + "/queue.json", "w"))
+PY
+_nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+if grep -q "(+1 more, 2/2 GPUs) #1 sw\[0\]: python train.py" <<<"$_nodes"; then
+  echo "  [OK] a shared hold job shows how many tasks and cards, and the array index"
+else echo "  [FAIL] shared hold job display"; echo "$_nodes" | tail -8; fail=1; fi
 
 echo
 if [[ $fail -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi

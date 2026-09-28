@@ -47,7 +47,7 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--name NAME` | groups runtime history → `hive stats NAME`, `--est-runtime auto` |
 | `--est-runtime 2h\|90m\|auto` | walltime-aware placement (`auto` = P90 of NAME's history) |
 | `--need-mb 60000\|auto` | hold until a GPU has that much free memory (`auto` = measured peak of NAME's past runs + 10 %) |
-| `--gpus N` | GPUs the task may see (default **1**; extras are hidden so frameworks don't auto-DataParallel) |
+| `--gpus N` | GPUs the task gets (default **1**). A multi-GPU hold job runs several tasks at once, one set of cards each; your task sees only its own |
 | `--timeout 2h` | kill the task after that much run time (failed, exit 124) — use it for anything that can hang |
 | `--notify CMD` | run CMD when the task finishes or is requeued (`HIVE_TASK_*` env; runs on the scheduler host; default `$HIVE_NOTIFY`) |
 | `--after ID,ID` | pipeline: run only after those tasks ended done (fails with them, exit 125). `--after aN` = after the whole array N. `--after-any` = whatever their outcome |

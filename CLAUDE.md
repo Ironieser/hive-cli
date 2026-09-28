@@ -217,6 +217,16 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   placed on a node expiring within `est + WALLTIME_MARGIN_SECS`; a task *without* an
   estimate stays walltime-blind, so existing behaviour is unchanged. `-1`=unlimited and
   `null`=unknown never block.
+- **A hold job with N cards is N slots.** A slot is a position in the hold job's
+  `CUDA_VISIBLE_DEVICES` list and in its `nvidia-smi` listing; a running task records
+  the ones it holds in `gpu_slots` and the wrapper keeps exactly those (`cut -f`).
+  Occupancy is recomputed from the tasks each pass (`slots_in_use`), never patched as
+  tasks finish. A running task WITHOUT `gpu_slots` was dispatched by an older
+  scheduler and holds the whole hold job. `pick_slots()` decides per card; "nothing
+  usable on this hold job" is node-level (pop + backoff), "usable but not for this
+  task" is task-level. A partially used hold job reads `busy` to the poller and is
+  still a candidate (`partial`). Validated offline only: the pool has had no
+  multi-GPU hold job to try it on.
 - **GPU visibility is narrowed, never widened.** SLURM's cgroup already scopes an
   `srun --overlap` step to the hold-job's own GPUs, renumbered `0..N-1` — verified on
   multi-tenant nodes, so hive never needs `--gres`/`--gpu-bind` on the step. But a hold
