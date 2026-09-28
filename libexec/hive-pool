@@ -325,6 +325,44 @@ def cmd_init(args):
     print(f"  hive pool add       # submit one hold job")
 
 
+def cmd_autoscale(args):
+    """Show what pool autoscale is set to and what it would do now. It is switched on
+    and off in pool_config.json ("autoscale": {"enabled": …}); the scheduler acts on it."""
+    import hive_autoscale as hauto
+    cfg = hauto.settings()
+    state = hauto.load_state()
+    if cfg is None:
+        print(f"autoscale: {C_DIM}off{C_RESET}  (not enabled in {CONFIG_FILE}, incomplete, "
+              f"or past its `until`)")
+        print('  to switch it on, add e.g.  "autoscale": {"enabled": true, "preset": "highgpu",')
+        print('      "min_nodes": 6, "max_nodes": 8, "time": "7-00:00:00", "renew_before": "12h",')
+        print('      "until": "2026-12-31"}')
+        return
+    print(f"autoscale: {C_GREEN}on{C_RESET}  preset {cfg['preset']}, keep {cfg['min_nodes']} usable, "
+          f"at most {cfg['max_nodes']} hold jobs, each {cfg['time'] or 'as in the script'}, "
+          f"replaced {int(cfg['renew_before'] // 3600)}h before it expires"
+          + (f", until {cfg['until']}" if cfg["until"] else ", with no end date"))
+    try:
+        with open(NODE_DB) as f:
+            db = json.load(f)
+        jobs = db.get("jobs", {})
+        from datetime import datetime, timezone
+        upd = datetime.fromisoformat(db.get("updated")).replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - upd).total_seconds()
+    except Exception:
+        jobs, age = {}, 0
+    health = hh.load()
+    pending = hh.pending_hold_jobs()
+    n, why = hauto.plan(cfg, jobs, age, None if pending is None else len(pending),
+                        hh.quarantined_nodes(health) | hh.slow_nodes(health),
+                        state.get("submitted") or [])
+    print(f"  now: would submit {n} — {why}")
+    day = [t for t in (state.get("submitted") or []) if __import__("time").time() - t < 86400]
+    print(f"  submitted by autoscale in the last 24 h: {len(day)} (limit {hauto.MAX_PER_DAY})")
+    if state.get("last_decision"):
+        print(f"  last decision of the scheduler: {state['last_decision']}")
+
+
 def cmd_config(args):
     config = load_config()
     presets = config.get("presets", {})
@@ -405,6 +443,9 @@ def build_parser():
     # init
     sub.add_parser("init", help=f"Create {CONFIG_FILE} from example")
 
+    # autoscale
+    sub.add_parser("autoscale", help="Show the autoscale setting and what it would do now")
+
     # config
     pcfg = sub.add_parser("config", help="Show current preset configuration")
     pcfg.add_argument("--no-validate", action="store_true",
@@ -425,6 +466,8 @@ def main():
         cmd_init(args)
     elif args.command == "config":
         cmd_config(args)
+    elif args.command == "autoscale":
+        cmd_autoscale(args)
 
 
 if __name__ == "__main__":

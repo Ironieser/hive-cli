@@ -131,7 +131,7 @@ case "$subcommand" in
     prune    [--older-than D] Drop old terminal tasks from the queue (history kept)
     queue    submit|list|wait|cancel|logs|rm|stats|prune|daemon
                               Full task queue interface
-    pool     add|release|init|config
+    pool     add|release|init|config|autoscale
                               Manage node pool (sbatch hold jobs / scancel)
     feedback "text" | submit|list|show|triage
                               File / manage feedback for the hive-cli repo

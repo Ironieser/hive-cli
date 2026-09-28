@@ -268,15 +268,19 @@ except Exception:
 def mem_gb(mib):
     return f"{round(int(mib) / 1024)}G"
 
-def is_job_stale(polled_at):
+def job_age(polled_at):
+    """Seconds since this row was last probed successfully, or None."""
     try:
         pts = datetime.fromisoformat(polled_at)
         if pts.tzinfo is None:
             pts = pts.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        return (now - pts).total_seconds() > 600
+        return (datetime.now(timezone.utc) - pts).total_seconds()
     except Exception:
-        return False
+        return None
+
+def is_job_stale(polled_at):
+    age = job_age(polled_at)
+    return age is not None and age > 600
 
 def _updated_age():
     try:
@@ -319,16 +323,20 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
     status   = j.get("status", "idle")
     polled_at= j.get("polled_at", "")
 
+    # Over ALL of the hold job's cards: the busiest card's utilisation and the memory
+    # of all of them together. Card 0 alone said "0%  0G/80G" for a hold job whose
+    # second card was at 90%.
     gpus = j.get("gpu", [])
     if gpus:
-        g = gpus[0]
-        gpu_util  = int(g.get("util",  0))
-        mem_used  = int(g.get("mem_used",  0))
-        mem_total = int(g.get("mem_total", 0))
+        gpu_util  = max(int(g.get("util", 0) or 0) for g in gpus)
+        mem_used  = sum(int(g.get("mem_used", 0) or 0) for g in gpus)
+        mem_total = sum(int(g.get("mem_total", 0) or 0) for g in gpus)
     else:
         gpu_util = mem_used = mem_total = 0
 
     mem_str = f"{mem_gb(mem_used)}/{mem_gb(mem_total)}"
+    if len(gpus) > 1:
+        mem_str += f" x{len(gpus)}"
 
     procs = j.get("processes", [])
     task_cmd = ""
@@ -372,6 +380,13 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
         task_cmd = task_cmd[:54] + "…"
 
     stale_flag = "1" if is_job_stale(polled_at) else "0"
+    # A stale row says HOW stale (feedback #27): a WARN or IDLE row read 20 minutes
+    # ago was taken for the node's state now, and a busy node for an idle one.
+    if stale_flag == "1":
+        age = int(job_age(polled_at) or 0)
+        old = f"{age // 3600}h{age % 3600 // 60:02d}m" if age >= 3600 else f"{age // 60}m"
+        task_cmd = f"[read {old} ago] " + (task_cmd if task_cmd != "—" else "")
+        task_cmd = task_cmd.strip()
     left = fmt_left(j.get("time_left_secs"))
 
     # task_cmd MUST be last: bash IFS=$'\t' read collapses consecutive tabs
@@ -509,6 +524,9 @@ show_table() {
         local task_text task_color
         if [[ ( "$status" == "busy" || "$status" == "claimed" ) && -n "$task_cmd" ]]; then
             task_text="$task_cmd"; task_color=""
+        elif [[ "$task_cmd" == "[read "* ]]; then
+            # a stale row of an idle-looking job: how old the reading is (feedback #27)
+            task_text="$task_cmd"; task_color="${DIM}"
         else
             task_text="—"; task_color="$DIM"
         fi

@@ -218,6 +218,36 @@ _nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 if grep -q "(+1 more, 2/2 GPUs) #1 sw\[0\]: python train.py" <<<"$_nodes"; then
   echo "  [OK] a shared hold job shows how many tasks and cards, and the array index"
 else echo "  [FAIL] shared hold job display"; echo "$_nodes" | tail -8; fail=1; fi
+# GPU% / MEM over all cards; SLOW; how old a stale row is (feedback #27)
+"$PY" - <<'PY'
+import json, os, time
+H = os.environ['HIVE_DIR']
+now = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
+old = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time() - 25 * 60))
+job = lambda node, gpu, polled=now, st="idle": {"node": node, "partition": "gpu", "job_elapsed": "1h",
+    "gpu": gpu, "processes": [], "status": st, "gpu_idle_since": None, "time_left_secs": 72000, "polled_at": polled}
+json.dump({"updated": now, "jobs": {
+    "700": job("two", [{"index": 0, "util": 0, "mem_used": 0, "mem_total": 81920},
+                       {"index": 1, "util": 90, "mem_used": 40960, "mem_total": 81920}], st="busy"),
+    "701": job("slown", [{"index": 0, "util": 0, "mem_used": 0, "mem_total": 81920}]),
+    "702": job("oldrow", [{"index": 0, "util": 0, "mem_used": 0, "mem_total": 81920}], polled=old, st="warning")}},
+    open(H + "/node_monitor.json", "w"))
+json.dump({"version": 1, "next_id": 1, "tasks": {}}, open(H + "/queue.json", "w"))
+json.dump({"nodes": {"slown": {"state": "slow", "slow_init_secs": 184, "strikes": 0, "history": []}}},
+          open(H + "/node_health.json", "w"))
+PY
+_nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+if grep -E "^ +700 +two.* BUSY +90% +40G/160G x2" <<<"$_nodes" >/dev/null; then
+  echo "  [OK] GPU% is the busiest card, MEM the sum over all cards"
+else echo "  [FAIL] multi-card columns"; echo "$_nodes" | tail -8; fail=1; fi
+if grep -E "^ +701 +slown.* SLOW " <<<"$_nodes" >/dev/null && grep -q "slow: 1" <<<"$_nodes"; then
+  echo "  [OK] a slow node shows SLOW"
+else echo "  [FAIL] SLOW display"; echo "$_nodes" | tail -8; fail=1; fi
+if grep -E "^ +702 +oldrow.*\[read 2[45]m ago\]" <<<"$_nodes" >/dev/null; then
+  echo "  [OK] a stale row says how old its reading is"
+else echo "  [FAIL] stale age"; echo "$_nodes" | tail -8; fail=1; fi
+rm -f "$HIVE_DIR/node_health.json"
+"$PY" -m py_compile "$REPO/libexec/hive-top" && echo "  [OK] hive top compiles" || { echo "  [FAIL] hive top"; fail=1; }
 
 echo
 if [[ $fail -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi

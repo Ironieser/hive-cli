@@ -265,20 +265,24 @@ class NodeTop:
 
         # Quarantined nodes (hive health)
         self.quarantined = set()
+        self.slow = set()          # usable, but CUDA takes minutes to initialise
         try:
             with open(os.path.join(HIVE_DIR, "node_health.json")) as _hf:
-                self.quarantined = {n for n, r in json.load(_hf).get("nodes", {}).items()
-                                    if r.get("state") == "quarantined"}
+                _hn = json.load(_hf).get("nodes", {})
+            self.quarantined = {n for n, r in _hn.items() if r.get("state") == "quarantined"}
+            self.slow = {n for n, r in _hn.items() if r.get("state") == "slow"}
         except Exception:
             pass
         # Load queue: build slurm_jobid → task map for running hive tasks
         self.jobid_to_task = {}
+        self.jobid_tasks = {}      # every running task of a hold job (GPU slots)
         try:
             with open(QUEUE_PATH) as f:
                 q = json.load(f)
             for t in q.get("tasks", {}).values():
                 if t.get("state") == "running" and t.get("slurm_jobid"):
-                    self.jobid_to_task[str(t["slurm_jobid"])] = t
+                    self.jobid_tasks.setdefault(str(t["slurm_jobid"]), []).append(t)
+                    self.jobid_to_task.setdefault(str(t["slurm_jobid"]), t)
         except Exception:
             pass
 
@@ -395,9 +399,10 @@ class NodeTop:
             procs  = jdata.get("processes", [])
 
             # GPU util / mem
-            util = gpus[0].get("util", 0) if gpus else 0
-            mem_used  = gpus[0].get("mem_used", 0) if gpus else 0
-            mem_total = gpus[0].get("mem_total", 0) if gpus else 0
+            # over all the hold job's cards: busiest card, memory of all (as hive nodes)
+            util = max((int(g.get("util", 0) or 0) for g in gpus), default=0)
+            mem_used  = sum(int(g.get("mem_used", 0) or 0) for g in gpus)
+            mem_total = sum(int(g.get("mem_total", 0) or 0) for g in gpus)
             mem_str   = fmt_mem(mem_used, mem_total) if gpus else "?"
 
             # Main task command — prefer authoritative queue data, fall back to probe
@@ -414,9 +419,14 @@ class NodeTop:
             if qt:
                 tid    = qt["id"]
                 name   = qt.get("name") or ""
+                if name and qt.get("array_index") is not None:
+                    name = f"{name}[{qt['array_index']}]"
                 owner  = qt.get("owner") or ""
                 qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
-                prefix = f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
+                _all   = self.jobid_tasks.get(jid, [])
+                _held  = sum(len(t.get("gpu_slots") or []) for t in _all)
+                share  = f"(+{len(_all) - 1} more, {_held}/{len(gpus)} GPUs) " if len(_all) > 1 else ""
+                prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
                 task_cmd = prefix + qcmd
                 # Slot taken by a running hive task even if the GPU isn't busy yet
                 # (same rule as hive nodes — feedback #4/#7/#17/#32).
@@ -424,6 +434,8 @@ class NodeTop:
                     status = "CLAIMED"
             if node in self.quarantined and status not in ("BUSY", "CLAIMED"):
                 status = "QUAR"
+            elif node in self.slow and status not in ("BUSY", "CLAIMED"):
+                status = "SLOW"
 
             task_cmd_short = short_cmd(task_cmd, task_w)
 
@@ -454,6 +466,8 @@ class NodeTop:
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_BUSY))
                 elif status == "QUAR":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_STALE) | curses.A_BOLD)
+                elif status == "SLOW":
+                    self._safe_addstr(row, status_x, status, curses.color_pair(C_WARN))
                 elif status == "WARNING":
                     self._safe_addstr(row, status_x, status, curses.color_pair(C_WARN) | curses.A_BOLD | curses.A_BLINK)
                 elif status == "CPU":
