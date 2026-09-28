@@ -1157,7 +1157,8 @@ def _nsR(**kw):
     base = dict(cmd_or_file="true", workdir=None, priority=None, name=None, owner=None, need_mb=None,
                 gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
                 after_any=None, array=None, max_running=None, allow_slow=None, quiet=False,
-                begin=None, cpus=None, mem=None, warn_before=None)
+                begin=None, cpus=None, mem=None, warn_before=None, nodes=None,
+                preempt=None, preemptible=None)
     base.update(kw); return _apR.Namespace(**base)
 def _new():
     return max(rq().values(), key=lambda t: t["id"])
@@ -1743,6 +1744,172 @@ chk("...killed once its own 120 s are over", rq()["870"].get("fail_reason") == "
 try: os.remove(_flag)
 except OSError: pass
 hs.run_one_cycle(); time.sleep(0.3)
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
+
+print("== checklist round 2: multi-node tasks, preemption, autoscale ==")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
+hauto = SourceFileLoader("hive_autoscale", os.path.join(LIB, "hive_autoscale.py")).load_module()
+
+# B5 — multi-node task ("gang")
+json.dump({"version": 1, "next_id": 900, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_c, _o = _rc(hq.cmd_submit, _nsR(name="ddp", nodes=3, owner="o",
+             cmd_or_file='echo "rank=$HIVE_GANG_RANK/$HIVE_GANG_SIZE hosts=$HIVE_GANG_HOSTS"; sleep 1.5'))
+q = rq()
+chk("--nodes 3 creates three members that share an id",
+    sorted(q) == ["900", "901", "902"] and {t["array_id"] for t in q.values()} == {900}
+    and {t["gang_size"] for t in q.values()} == {3} and re.findall(r"#(\d+)", _o) == ["900"])
+chk("--nodes with --array, or --nodes 1, is refused",
+    _rc(hq.cmd_submit, _nsR(nodes=2, array="0-3"))[0] == 2 and _rc(hq.cmd_submit, _nsR(nodes=1))[0] == 2)
+wdb({"700": node("a", 72000), "701": node("b", 72000)})               # only two nodes
+hs.run_one_cycle()
+chk("two nodes for three members: nobody starts (waiting_for_gang)",
+    [rq()[k]["state"] for k in ("900", "901", "902")] == ["pending"] * 3
+    and {rq()[k].get("pending_reason") for k in ("900", "901", "902")} == {"waiting_for_gang"})
+wq(dict(rq(), **{"905": dict(task(905, name="single", sub=loc(5)), cmd="sleep 1.5")}))
+hs.run_one_cycle()
+chk("the cards a gang reserved and gave back are free for others", rq()["905"]["state"] == "running")
+_rc(hq.cmd_cancel, _apR.Namespace(id=905, array=None, force=True))
+two = dict(node("a", 72000), gpu=[{"index": i, "util": 0, "mem_used": 10, "mem_total": 81920} for i in range(2)])
+os.environ["MOCK_LIVE_GPU"] = "0, 10, 81920\\n0, 10, 81920"
+wdb({"700": two, "701": node("b", 72000)})
+hs.run_one_cycle()
+chk("two cards on ONE node do not count as two nodes",
+    [rq()[k]["state"] for k in ("900", "901", "902")] == ["pending"] * 3)
+os.environ.pop("MOCK_LIVE_GPU")
+wdb({"700": node("a", 72000), "701": node("b", 72000), "702": node("c", 72000)})
+hs.run_one_cycle(); time.sleep(0.5)
+q = rq()
+chk("three nodes: all members start in the same cycle, one node each",
+    sorted(q[k]["node"] for k in ("900", "901", "902")) == ["a", "b", "c"]
+    and len({q[k]["started_at"] for k in ("900", "901", "902")}) <= 2)
+_hosts = q["900"]["gang_hosts"]
+chk("every member knows its rank and all the hosts",
+    all(f"rank={i}/3 hosts={_hosts}" in open(q[str(900 + i)]["log"]).read() for i in range(3))
+    and sorted(_hosts.split(",")) == ["a", "b", "c"])
+time.sleep(1.5); hs.run_one_cycle()
+chk("all done", [rq()[k]["state"] for k in ("900", "901", "902")] == ["done"] * 3)
+# one member fails -> the others are stopped
+json.dump({"version": 1, "next_id": 910, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="ddp2", nodes=2,
+    cmd_or_file='[ "$HIVE_GANG_RANK" = 0 ] && exit 4; sleep 30'))
+wdb({"700": node("a", 72000), "701": node("b", 72000)})
+hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle()
+q = rq()
+chk("a failed member takes the running ones with it",
+    q["910"]["state"] == "failed" and q["910"]["exit_code"] == 4
+    and (q["911"]["state"] == "cancelled" or q["911"].get("cancel_requested")))
+hs.run_one_cycle()
+chk("...recorded as gang_member_failed", rq()["911"]["state"] == "cancelled"
+    and rq()["911"].get("fail_reason") == "gang_member_failed")
+# a member loses its node -> no partial restart
+t0 = dict(task(920, name="g", state="running", jid="2001", node="gone", st=loc(-450), sub=loc(-500),
+               dispatched=loc(-450)), array_id=920, array_index=0, gang_size=2, gpu_slots=[0])
+t1 = dict(task(921, name="g", state="running", jid="700", node="a", st=loc(-450), sub=loc(-500),
+               dispatched=loc(-450)), array_id=920, array_index=1, gang_size=2, gpu_slots=[0])
+stale_hb(920); open(os.path.join(hs.HEARTBEAT_DIR, "921"), "w").write("x")
+for i in (920, 921): open(os.path.join(hs.LOG_DIR, f"task-{i}.log"), "w").write("x")
+wdb({"700": node("a", 72000, st="busy")}); wq({"920": t0, "921": t1})
+hs.run_one_cycle()
+q = rq()
+chk("a member that lost its node is not re-run alone; the gang ends",
+    q["920"]["state"] == "failed" and q["920"].get("fail_reason") == "gang_member_failed"
+    and (q["921"].get("cancel_requested") or q["921"]["state"] == "cancelled"))
+hs.run_one_cycle()
+
+# B6 — preemption
+reset_health(); reset_sched_state()
+def _running(i, prio, **kw):
+    t = dict(task(i, name=f"r{i}", state="running", jid=kw.pop("jid", "700"), node=kw.pop("node", "a"),
+                  st=loc(-60), priority=prio), gpu_slots=[0], **kw)
+    t["started_ts"] = time.time() - kw.get("age", 60)
+    open(os.path.join(hs.HEARTBEAT_DIR, str(i)), "w").write("x")
+    open(t["log"], "w").write("x\n")
+    return t
+T = {"930": _running(930, 0, preemptible=True), "931": _running(931, 0, jid="701", node="b"),
+     "932": dict(task(932, name="urgent", priority=9), preempt=True, cmd="sleep 1.5")}
+chk("victim: lower priority AND preemptible", hs.pick_victim(T["932"], T, set(), set())["id"] == 930)
+chk("no victim among tasks that did not agree",
+    hs.pick_victim(T["932"], {"931": T["931"], "932": T["932"]}, set(), set()) is None)
+chk("no victim of equal or higher priority",
+    hs.pick_victim(dict(T["932"], priority=0), T, set(), set()) is None)
+chk("the latest started of the lowest priority is chosen",
+    hs.pick_victim(T["932"], {"1": dict(T["930"], id=1, started_ts=time.time() - 5000),
+                              "2": dict(T["930"], id=2, started_ts=time.time() - 50),
+                              "3": dict(T["930"], id=3, priority=4, started_ts=time.time() - 5)},
+                   set(), set())["id"] == 2)
+busy = lambda n: node(n, 72000, st="busy")
+wdb({"700": busy("a"), "701": busy("b")}); wq(T)
+clear_notified()
+hs.run_one_cycle()
+q = rq()
+chk("no free node: the preemptible task is asked to stop, the other is left alone",
+    q["930"].get("cancel_requested") and q["930"].get("preempted_by") == 932
+    and not q["931"].get("cancel_requested") and q["932"].get("pending_reason") == "preempting")
+hs.run_one_cycle()
+q = rq()
+chk("the victim is REQUEUED, not cancelled", q["930"]["state"] == "pending"
+    and q["930"].get("preempt_count") == 1 and q["930"].get("checkpoint_warning")
+    and "PREEMPTED" in open(q["930"]["log"]).read())
+hs.live_probe = lambda jid, **kw: _ok()
+hs.run_one_cycle(); time.sleep(0.3)
+chk("...and the urgent task has its node", rq()["932"].get("node") == "a")
+chk("preempt / requeue events recorded",
+    {"preempt"} <= {e["event"] for e in ev.iter_events()}
+    and any(e["event"] == "requeue" and e.get("reason") == "preempted" for e in ev.iter_events()))
+wq({"940": _running(940, 0, preemptible=True, preempt_count=hs.MAX_PREEMPTIONS),
+    "941": dict(task(941, name="u2", priority=9), preempt=True)})
+wdb({"700": busy("a")}); hs.run_one_cycle()
+chk("a task preempted MAX_PREEMPTIONS times is left alone", not rq()["940"].get("cancel_requested"))
+wq({"942": _running(942, 0, preemptible=True), "943": dict(task(943, name="plain", priority=9))})
+wdb({"700": busy("a")}); hs.run_one_cycle()
+chk("a task without --preempt never preempts", not rq()["942"].get("cancel_requested"))
+hs.live_probe = _lpR
+_rc(hq.cmd_submit, _nsR(name="pp", preempt=True, preemptible=True))
+chk("--preempt / --preemptible stored", _new()["preempt"] is True and _new()["preemptible"] is True)
+
+# B1 — autoscale
+C = {"preset": "highgpu", "min_nodes": 4, "max_nodes": 6, "time": "7-00:00:00",
+     "renew_before": 12 * 3600, "until": None}
+def J(n, left=500000, nodes=None, **kw):
+    return {str(700 + i): dict(node((nodes or [f"n{i}"] * n)[i] if nodes else f"n{i}", left), **kw)
+            for i in range(n)}
+chk("enough usable nodes -> nothing", hauto.plan(C, J(4), 0, 0, set(), [])[0] == 0)
+chk("two short -> two submitted", hauto.plan(C, J(2), 0, 0, set(), [])[0] == 2)
+chk("at most MAX_PER_RUN at a time", hauto.plan(C, {}, 0, 0, set(), [])[0] == hauto.MAX_PER_RUN)
+chk("queued hold jobs count as on their way", hauto.plan(C, J(2), 0, 2, set(), [])[0] == 0)
+chk("hold jobs about to expire are replaced before they do",
+    hauto.plan(C, J(4, left=6 * 3600), 0, 0, set(), [])[0] == 2)
+chk("...judged by the walltime left NOW, not when the DB was written",
+    hauto.plan(C, J(4, left=13 * 3600), 2 * 3600, 0, set(), [])[0] == 2)
+chk("hold jobs on quarantined or slow nodes do not count as usable",
+    hauto.plan(C, J(4, nodes=["bad", "bad", "g1", "g2"]), 0, 0, {"bad"}, [])[0] == 2)
+chk("...but they do count towards max_nodes",
+    hauto.plan(C, J(6, nodes=["bad"] * 4 + ["g1", "g2"]), 0, 0, {"bad"}, [])[0] == 0)
+chk("daily limit", hauto.plan(C, {}, 0, 0, set(), [time.time() - 60] * hauto.MAX_PER_DAY)[0] == 0)
+chk("SLURM could not be asked -> nothing (never guess)", hauto.plan(C, {}, 0, None, set(), [])[0] == 0)
+json.dump({"autoscale": {"enabled": False, "min_nodes": 4, "preset": "highgpu"}}, open(_cfg, "w"))
+chk("off unless enabled", hauto.settings() is None)
+json.dump({"autoscale": {"enabled": True, "min_nodes": 4, "preset": "highgpu", "until": "2020-01-01"}}, open(_cfg, "w"))
+chk("off after `until`", hauto.settings() is None)
+json.dump({"autoscale": {"enabled": True, "min_nodes": 4, "max_nodes": 2, "preset": "highgpu"}}, open(_cfg, "w"))
+chk("off when max_nodes < min_nodes", hauto.settings() is None)
+json.dump({"default": "normal", "presets": {"highgpu": {"script": os.path.join(hs.HIVE_DIR, "hold.slurm")}},
+           "autoscale": {"enabled": True, "min_nodes": 3, "max_nodes": 5, "preset": "highgpu",
+                         "time": "7-00:00:00", "renew_before": "12h", "until": "2099-01-01"}}, open(_cfg, "w"))
+open(os.path.join(hs.HIVE_DIR, "hold.slurm"), "w").write("#!/bin/bash\n#SBATCH -p highgpu\nsleep 1\n")
+for f in ("mock_sbatch.log", "autoscale_state.json"):
+    try: os.remove(os.path.join(hs.HIVE_DIR, f))
+    except OSError: pass
+_n, _why = hauto.run(J(1), 0, set())
+_sb = open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read().splitlines()
+chk("run(): submits through hive pool add, with the configured time",
+    _n == 2 and sum(1 for l in _sb if "--test-only" not in l) == 2 and all("--time 7-00:00:00" in l for l in _sb))
+chk("...and not again before EVERY_SECS", hauto.run(J(1), 0, set()) == (0, "not due"))
+chk("what it did is kept", len(hauto.load_state().get("submitted", [])) == 2)
+os.remove(_cfg)
+for f in ("mock_sbatch.log", "autoscale_state.json", "hold.slurm"):
+    try: os.remove(os.path.join(hs.HIVE_DIR, f))
+    except OSError: pass
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
 
 print("== a dead scheduler is restarted by list / wait (feedback #18/#19) ==")

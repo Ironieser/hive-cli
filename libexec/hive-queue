@@ -232,6 +232,7 @@ def runs_by_name():
     return by_name
 
 
+GANG_MAX_NODES  = 16      # members of one multi-node task
 ARRAY_MAX_TASKS = 1000    # one --array may not create more tasks than this
 
 
@@ -518,7 +519,7 @@ def parse_hive_file(path):
     if "exclude" in meta:
         result["exclude"] = meta["exclude"]           # expanded in cmd_submit
     for key in ("after", "after_any", "array", "max_running", "allow_slow", "begin",
-                "cpus", "mem", "warn_before"):
+                "cpus", "mem", "warn_before", "nodes", "preempt", "preemptible"):
         if key in meta:
             result[key] = meta[key]                   # parsed in cmd_submit
     if "timeout" in meta:
@@ -862,6 +863,31 @@ def _submit(args, out):
               f"set --owner or $HIVE_OWNER", file=sys.stderr)
         sys.exit(2)
 
+    # Multi-node task: N members that start together, each on a node of its own.
+    gang = getattr(args, "nodes", None)
+    if gang is None and spec.get("nodes") is not None:
+        gang = spec["nodes"]
+    try:
+        gang = int(gang) if gang not in (None, "") else None
+        if gang is not None and not 2 <= gang <= GANG_MAX_NODES:
+            raise ValueError
+    except (TypeError, ValueError):
+        print(f"{C_RED}error:{C_RESET} --nodes takes a number from 2 to {GANG_MAX_NODES}",
+              file=sys.stderr)
+        sys.exit(2)
+    if gang and arr_raw:
+        print(f"{C_RED}error:{C_RESET} --nodes and --array cannot be combined", file=sys.stderr)
+        sys.exit(2)
+    if gang:
+        array_idx, array_cap = list(range(gang)), None
+
+    def _flag(name):
+        val = getattr(args, name, None)
+        if val is None and spec.get(name) is not None:
+            val = str(spec[name]).strip().lower() in ("1", "true", "yes", "on")
+        return bool(val)
+    preempt, preemptible = _flag("preempt"), _flag("preemptible")
+
     # Delayed start, CPU / memory of the step, warning before the node expires.
     begin_ts = None
     b_raw = getattr(args, "begin", None) or spec.get("begin")
@@ -1023,6 +1049,9 @@ def _submit(args, out):
                 "array_max_running": array_cap,
                 "max_running":   max_running,
                 "allow_slow":    allow_slow,
+                "gang_size":     gang,
+                "preempt":       preempt,
+                "preemptible":   preemptible,
                 "begin_ts":      begin_ts,
                 "cpus":          cpus,
                 "mem_mb":        mem_mb,
@@ -1053,7 +1082,14 @@ def _submit(args, out):
             cmd_daemon(argparse.Namespace(subcmd="start"))
         return
     owner_s = f"  (owner: {spec['owner']})" if spec.get("owner") else ""
-    if array_id is not None:
+    if gang:
+        print(f"Submitted multi-node task #{array_id}: {gang} members "
+              f"(ids {created[0]}-{created[-1]}){owner_s}")
+        print(f"  they start together, each on its own node; every member runs the command "
+              f"with $HIVE_GANG_RANK (0..{gang - 1}), $HIVE_GANG_SIZE and $HIVE_GANG_HOSTS")
+        print(f"  if one member fails the others are stopped · hive wait --array {array_id} · "
+              f"hive cancel --array {array_id}")
+    elif array_id is not None:
         # One `#N` per submit, on the first line: `grep -oP '#\\K\\d+'` is how agents
         # have been told to capture the id, and it must keep yielding exactly one.
         print(f"Submitted array #{array_id}: {len(created)} tasks "
@@ -1068,6 +1104,11 @@ def _submit(args, out):
         print(f"  runs after task {shown} "
               + ("finished OK (fails if one of them did not)" if after_mode == "ok"
                  else "ended, whatever the outcome"))
+    if preempt:
+        print("  may preempt lower-priority tasks that were submitted --preemptible")
+    if preemptible:
+        print("  may be preempted by a --preempt task of higher priority (it is then requeued "
+              "and starts afresh)")
     if max_running:
         print(f"  held while {spec['owner']} has {max_running} task(s) running")
     if begin_ts:
@@ -1964,6 +2005,16 @@ def build_parser():
                          "then runs normally). Default: yes when --est-runtime is 1h or more")
     ps.add_argument("--no-slow", dest="allow_slow", action="store_false",
                     help="Never run on a slow node, however long the task")
+    ps.add_argument("--nodes", type=int, metavar="N",
+                    help="Multi-node task: N members that start together, each on a node of "
+                         "its own, all running the command with $HIVE_GANG_RANK / "
+                         "$HIVE_GANG_SIZE / $HIVE_GANG_HOSTS. If one fails the rest is stopped")
+    ps.add_argument("--preempt", action="store_true", default=None,
+                    help="If no node is free, stop a running lower-priority task that was "
+                         "submitted --preemptible (it is requeued)")
+    ps.add_argument("--preemptible", action="store_true", default=None,
+                    help="This task may be stopped and requeued for a --preempt task of "
+                         "higher priority. Make the command resume from its checkpoint")
     ps.add_argument("--begin", metavar="WHEN",
                     help="Do not start before: a delay (2h, 30m), a date and time "
                          "(2026-10-01T08:00) or a time of day (08:00)")
