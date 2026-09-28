@@ -328,6 +328,11 @@ def _duration_secs(task):
     if t0 is None or t1 is None:
         return None
     d = t1 - t0
+    # The end is the exit file's mtime, stamped by the file server; the start is this
+    # host's clock. For a task of a second or two the two can be a moment apart the
+    # wrong way round, which is a duration of 0, not an unknown one.
+    if -30 < d < 0:
+        return 0
     return int(d) if d >= 0 else None
 
 

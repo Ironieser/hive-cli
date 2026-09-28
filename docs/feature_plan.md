@@ -77,7 +77,7 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 | A2 | `hive top`: SLOW state, several tasks on one hold job, array index | done |
 | A3 | `hive nodes`: GPU% / MEM over all cards of a hold job, not only card 0 | done — busiest card, memory summed, `xN` |
 | A4 | Canary jobs wait hours in a busy partition | not fixable in hive: the canary is already the smallest job SLURM accepts (1 CPU, 4 GB, 1 GPU, 15 min); in a busy partition it waits for priority like any job. Reboot detection does not depend on it |
-| A5 | "healthy probes → node released" never seen live | open until C5 |
+| A5 | "healthy probes → node released" never seen live | still open: needs a node to recover, or a test hold job to be reported and watched for over an hour; the V100 test hold jobs were still queued |
 | A6 | Steady-state speed of slow nodes has no healthy same-model reference | cannot be verified: every H100-PCIe node tried was slow or wedged, so there is no healthy reference |
 | A7 | `--timeout` counts the CUDA init time of a slow node | done |
 | A8 | Every array member is a full task record | not changed: members stay full task records (1000 members ≈ 15 MB of queue.json). Bounded by the 1000-member limit and by A9 |
@@ -104,5 +104,5 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 | C2 | docs/architecture.md: two-pass cycle, GPU slots, node health states | done |
 | C3 | Feedback #18, #19, #27, #33 | done — #33 wontfix (not reproduced) |
 | C4 | Red-team round 3 on everything in this checklist | done — 29 findings, 8 high; fixed, see the commits "red-team round 3" and "fix(autoscale)" |
-| C5 | Install, live validation | open |
-| C6 | Push the branch, open the pull request | open |
+| C5 | Install, live validation | done 2026-09-28 on evc102–104: dispatch 8 s after submit; `--cpus 2 --mem 8000` → nproc 2, 8 GB limit; `--begin 1m`; `--nodes 2` on two nodes and `--same-node` on two hold jobs of one node; preemption (victim requeued, preemptor running 23 s after submit); SIGUSR1 through a real srun step to a python handler behind a compound command. Not live: the warning being triggered by a real expiry, A5 |
+| C6 | Push the branch, open the pull request | done |
