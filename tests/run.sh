@@ -26,7 +26,10 @@ cat > "$TMP/bin/squeue" <<'EOF'
 # a 20h TimeLeft, in either the poll (%i|...|%L) or daemon (%i|...|%L|%j) format.
 jid=""; prev=""
 for a in "$@"; do [[ "$prev" == "-j" ]] && jid="$a"; prev="$a"; done
-if [[ -n "$jid" ]]; then case ",$jid," in *",700,"*|*",9001,"*) echo "$jid";; esac; exit 0; fi
+if [[ -n "$jid" ]]; then
+  # canary jobs (42xx): state comes from $HIVE_DIR/mock_canary_state, empty = finished
+  if [[ "$jid" == 42* ]]; then cat "$HIVE_DIR/mock_canary_state" 2>/dev/null; exit 0; fi
+  case ",$jid," in *",700,"*|*",9001,"*) echo "$jid";; esac; exit 0; fi
 fmt=""; for a in "$@"; do [[ "$a" == "%i|"* ]] && fmt="$a"; done
 if [[ "$fmt" == *"%j" ]]; then
   echo "700|nodeX|gpu|1:00:00|20:00:00|hold"
@@ -36,6 +39,31 @@ EOF
 cat > "$TMP/bin/srun" <<'EOF'
 #!/usr/bin/env bash
 a=("$@"); for i in "${!a[@]}"; do [[ "${a[$i]}" == "bash" ]] && exec "${a[@]:$i}"; done; exit 0
+EOF
+# scontrol show node: booted long ago unless $HIVE_DIR/mock_boot holds another BootTime.
+cat > "$TMP/bin/scontrol" <<'EOF'
+#!/usr/bin/env bash
+node="${@: -1}"
+boot="$(cat "$HIVE_DIR/mock_boot" 2>/dev/null || echo 2020-01-01T00:00:00)"
+state="$(cat "$HIVE_DIR/mock_node_state" 2>/dev/null || echo IDLE)"
+printf 'NodeName=%s Arch=x86_64\n   Gres=gpu:h100:2(S:0-1)\n   State=%s ThreadsPerCore=2\n   Partitions=gpu,preemptable \n   BootTime=%s SlurmdStartTime=2026-01-01T00:00:00\n' "$node" "$state" "$boot"
+EOF
+# sbatch: never submits. Records its argv, and for a canary runs the script (stdin)
+# locally into the --output file, as job 4242.
+cat > "$TMP/bin/sbatch" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$HIVE_DIR/mock_sbatch.log"
+out=""; for a in "$@"; do [[ "$a" == --output=* ]] && out="${a#--output=}"; done
+[[ "$*" == *"--test-only"* ]] && exit 0
+if [[ "$*" == *"hive_canary"* ]]; then
+  SLURM_JOB_ID=4242 bash -s > "${out//%j/4242}" 2>&1 </dev/stdin
+  echo 4242; exit 0
+fi
+echo "Submitted batch job 4300"
+EOF
+cat > "$TMP/bin/scancel" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$HIVE_DIR/mock_scancel.log"
 EOF
 cat > "$TMP/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
@@ -92,6 +120,10 @@ print("  [OK] poller sees BOTH GPUs (idx 0,1); node busy because GPU1 is busy")
 assert '801' not in d['jobs'], sorted(d['jobs'])
 print("  [OK] hive-poll filters cursor_ssh_proxy like the daemon (was: no %j column, grep never matched)")
 PY
+printf '700|nodeX|gpu|1:00:00|20:00:00|hold\n4242|nodeX|gpu|0:01|9:00|hive_canary\n' \
+  | grep -vE "$(grep -o "grep -vE '[^']*'" "$REPO/libexec/hive-daemon" | sed "s/grep -vE '//;s/'$//")" | grep -q hive_canary \
+  && { echo "  [FAIL] poller filter lets hive_canary into the pool"; fail=1; } \
+  || echo "  [OK] pollers keep hive_canary jobs out of the pool"
 echo "[poll] wedged GPU driver is a probe failure with a reason, never cpu/idle"
 # (the previous poll left this job `busy`: a node fault must not be carried forward)
 # HANG goes last: under the mock srun the stuck query is a local child that inherits the

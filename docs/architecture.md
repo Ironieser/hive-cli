@@ -111,6 +111,7 @@ node_monitor.json    # DB written by daemon/poll (+ hive-dbpost), read by nodes/
       "processes": [{"pid":1234, "cpu":242, "mem":5.4, "elapsed":"1d2h", "cmd":"python ..."}],
       "status": "idle|busy|warning|cpu|probe_failed",   # see docs/status_model.md
       "probe_detail": "",               # srun_failed | gpu_unresponsive | no_gpu_devices
+      # jobs named cursor_ssh_proxy / hive_canary (health monitor) are never listed
       "gpu_idle_since": null,                            # busy→idle grace timer
       "carried_forward": true,                           # (optional) last-good reused after a probe miss
       "time_left_secs": 79200,                           # remaining hold-job walltime (squeue %L); -1=unlimited, null=unknown

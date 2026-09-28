@@ -139,6 +139,14 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   `build_exclude()` re-reads the script's list and merges it; never pass a bare one.
   Task-level `exclude_nodes` (`hive submit --exclude`) is a task-level rejection
   (`node_excluded`, `i += 1`).
+- **A quarantined node must have a way back that needs no hold job.** Since `pool add`
+  excludes it, the through-a-hold-job check never runs there again. The scheduler's
+  health step then calls `hh.check_without_hold_job`: release if `scontrol` reports a
+  `BootTime` after the quarantine, else a `hive_canary` batch job pinned to the node
+  (two probes; one outstanding per node; every `CANARY_INTERVAL_SECS`; opt out with
+  `"health_canary": false` in `pool_config.json`). The pollers filter `hive_canary` out
+  by job name, or a canary would show up as a hold job. The offline suite mocks
+  `scontrol`/`sbatch`/`scancel` — keep it that way, the real ones are on `PATH`.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

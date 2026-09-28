@@ -281,7 +281,7 @@ main() {
     # daemon did. KEEP IN SYNC with hive-daemon.
     local squeue_out
     squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%j" 2>/dev/null \
-        | grep -v cursor_ssh_proxy \
+        | grep -vE '\|(cursor_ssh_proxy|hive_canary)$' \
         | sed 's/|[^|]*$//')   # strip job name column after filtering
 
     if [[ -z "$squeue_out" ]]; then

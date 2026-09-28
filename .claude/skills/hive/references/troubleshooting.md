@@ -16,6 +16,7 @@
 | `hive list` shows RUNNING for hours but the log has a `finished` footer | `hive queue daemon status` | scheduler died before reaping; `hive queue daemon start` reaps it on the next cycle |
 | Node shows `PFAIL` | `hive poll` | probe failed; `probe_detail` in `node_monitor.json` says why (`srun_failed` = couldn't run, `gpu_unresponsive` / `no_gpu_devices` = broken node). hive still verifies before dispatch |
 | Node shows `QUAR` | `hive health` | quarantined; auto-released after 2 healthy probes, or `hive health clear NODE` |
+| Quarantined node with no hold job on it | `hive health` RESULT column | the health monitor takes over: released when SLURM reports the node **rebooted** since the quarantine, or when a `hive_canary` job (10 min, 1 GPU, every 6 h, pinned to the node) probes healthy twice. `canary_pending` = waiting in the SLURM queue. Don't cancel `hive_canary` jobs |
 | Node shows `CLAIM` with 0 % GPU | — | normal: a task is in cold import / model load; the slot is taken |
 | `hive nodes` looks stale (`node!`, old "last polled") | `hive poll` | forces a poll; dispatch never trusts the table alone |
 | `hive submit` errors "cmd must not contain srun" | — | drop the `srun` prefix; hive dispatches itself |

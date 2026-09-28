@@ -217,6 +217,177 @@ def cuda_probe(slurm_jobid, timeout=CUDA_PROBE_TIMEOUT):
     return parse_cuda_probe((out.stdout or "").splitlines())
 
 
+def full_probe_shell():
+    """The whole verify probe — guarded GPU query, then the CUDA-context probe (skipped
+    when the query hung: it would block in the same driver call). One definition for
+    verify-before-dispatch, the periodic check and the canary job."""
+    return (gpu_query_shell()
+            + f"echo {CUDA_MARKER}; "
+            + 'if [ -n "$_HIVE_GPU_HUNG" ]; then echo "CUDA_PROBE unknown gpu_hung"; else\n'
+            + cuda_probe_shell() + "\nfi")
+
+
+def parse_full_probe(text):
+    """('ok'|'fail'|'unknown', detail) for one full_probe_shell() output."""
+    gpu_part, _, cuda_part = (text or "").partition(CUDA_MARKER)
+    csv, granted, fault = parse_gpu_query(gpu_part.splitlines())
+    if fault:
+        return "fail", fault
+    if granted is None or not csv:
+        return "unknown", "no_gpu_output"
+    return parse_cuda_probe(cuda_part.splitlines())
+
+
+# ── Recovery without a hold job: the health monitor ─────────────────────────
+# `hive pool add` keeps new hold jobs off quarantined nodes, so the periodic check —
+# which probes THROUGH a hold job — never runs there again and the node would stay
+# quarantined for good. Two other ways back:
+#
+#   1. Reboot: a wedged driver is cured by a reboot. If SLURM reports the node booted
+#      after it was quarantined, release it; the first verify probe on it decides.
+#   2. Canary: every CANARY_INTERVAL_SECS submit a small batch job pinned to the node
+#      that runs the probe twice. Two healthy answers release the node, a failure
+#      re-arms the quarantine. At most one canary per node is outstanding.
+#
+# `"health_canary": false` in pool_config.json (or HIVE_HEALTH_CANARY=0) turns the
+# canary off; reboot detection costs one `scontrol` and stays on.
+PROBE_DIR            = os.path.join(HIVE_DIR, "health-probes")
+CANARY_NAME          = "hive_canary"   # the pollers filter this name out of the pool
+CANARY_INTERVAL_SECS = 6 * 3600
+CANARY_MAX_WAIT_SECS = 24 * 3600       # still queued after this → cancel, try later
+CANARY_TIME          = "00:10:00"
+CANARY_GAP_SECS      = 60              # between the two probes of one canary
+CANARY_SEP           = "---HIVE-CANARY-PROBE---"
+SLURM_CMD_TIMEOUT    = 15
+NODE_DOWN_STATES     = ("DOWN", "DRAIN", "MAINT", "FAIL", "NOT_RESPONDING", "REBOOT")
+
+
+def canary_enabled():
+    if os.environ.get("HIVE_HEALTH_CANARY", "").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    try:
+        with open(os.path.join(HIVE_DIR, "pool_config.json")) as f:
+            return json.load(f).get("health_canary", True) is not False
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return True
+
+
+def _slurm(argv):
+    """stdout of a bounded SLURM command, or None when it could not be run / failed."""
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=SLURM_CMD_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def node_info(node):
+    """{State, BootTime (epoch | None), Partitions [..]} from `scontrol show node`."""
+    out = _slurm(["scontrol", "show", "node", node])
+    if not out:
+        return None
+    kv = dict(re.findall(r"(\w+)=(\S+)", out))
+    if kv.get("NodeName") != node:
+        return None
+    boot = None
+    try:
+        # scontrol prints local time in this process's zone, and mktime reads it back
+        # in the same one.
+        boot = time.mktime(time.strptime(kv.get("BootTime", ""), "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        pass
+    return {"State": kv.get("State", ""), "BootTime": boot,
+            "Partitions": [p for p in kv.get("Partitions", "").split(",") if p]}
+
+
+def submit_canary(node, partition=None):
+    """sbatch the canary on `node`; returns {"jobid", "out"} or None."""
+    os.makedirs(PROBE_DIR, exist_ok=True)
+    out_pat = os.path.join(PROBE_DIR, f"{node}-%j.out")
+    gap = os.environ.get("HIVE_CANARY_GAP", str(CANARY_GAP_SECS))
+    probe = full_probe_shell()
+    script = ("#!/bin/bash\n"
+              f'echo "HIVE_CANARY start node=$(hostname -s) job=$SLURM_JOB_ID"\n'
+              f"echo {CANARY_SEP}\n{probe}\n"
+              f"sleep {shlex.quote(gap)}\n"
+              f"echo {CANARY_SEP}\n{probe}\n"
+              'echo "HIVE_CANARY done"\n')
+    argv = ["sbatch", "--parsable", f"--job-name={CANARY_NAME}", f"--nodelist={node}",
+            "--nodes=1", "--ntasks=1", "--cpus-per-task=1", "--mem=4G", "--gres=gpu:1",
+            f"--time={CANARY_TIME}", f"--output={out_pat}", f"--error={out_pat}"]
+    if partition:
+        argv.append(f"--partition={partition}")
+    try:
+        res = subprocess.run(argv, input=script, capture_output=True, text=True,
+                             timeout=SLURM_CMD_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    jobid = (res.stdout or "").strip().split(";")[0].strip()
+    if res.returncode != 0 or not jobid.isdigit():
+        return None
+    return {"jobid": jobid, "out": out_pat.replace("%j", jobid)}
+
+
+def read_canary(path):
+    """Verdicts [(verdict, detail), ...] of the probes a canary managed to run."""
+    try:
+        with open(path, errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    return [parse_full_probe(sec) for sec in text.split(CANARY_SEP)[1:]]
+
+
+def check_without_hold_job(data, node, partition=None, now=None):
+    """Periodic check of a quarantined node that has no hold job to probe through.
+    Returns 'released' | 'extended' | None, like record_check."""
+    now = now if now is not None else time.time()
+    rec = _rec(data, node)
+    can = rec.get("canary")
+    if can:
+        state = _slurm(["squeue", "-h", "-j", str(can["jobid"]), "-o", "%T"])
+        if state is None:
+            return record_check(data, node, None, "canary_unknown")   # squeue failed: wait
+        state = state.strip().split("\n")[0].strip()
+        if state:                                   # still queued / running
+            if now - float(can.get("submitted") or now) > CANARY_MAX_WAIT_SECS:
+                _slurm(["scancel", str(can["jobid"])])
+                rec.pop("canary", None)
+                return record_check(data, node, None, "canary_never_started")
+            return record_check(data, node, None, f"canary_{state.lower()}")
+        rec.pop("canary", None)
+        verdicts = read_canary(can.get("out", ""))
+        if not verdicts:
+            return record_check(data, node, "unknown", "canary: no output")
+        outcome = None
+        for verdict, detail in verdicts:
+            outcome = record_check(data, node, verdict, f"canary: {detail}".rstrip(": ")) or outcome
+            if outcome == "released":
+                break
+        return outcome
+
+    info = node_info(node)
+    if info is None:
+        return record_check(data, node, None, "no_hold_job")
+    boot, since = info["BootTime"], float(rec.get("since") or 0)
+    if boot and since and boot > since:
+        release(data, node, "node rebooted after it was quarantined", "auto")
+        rec["last_check"] = now
+        return "released"
+    if any(s in info["State"].upper() for s in NODE_DOWN_STATES) or info["State"].endswith("*"):
+        return record_check(data, node, None, f"node_{info['State'].lower()}")
+    if canary_enabled() and now - float(rec.get("last_canary") or 0) >= CANARY_INTERVAL_SECS:
+        part = partition if partition in info["Partitions"] else \
+            (info["Partitions"][0] if info["Partitions"] else None)
+        job = submit_canary(node, part)
+        rec["last_canary"] = now            # also on failure: don't retry every 10 min
+        if job:
+            rec["canary"] = dict(job, submitted=now)
+            return record_check(data, node, None, f"canary_submitted {job['jobid']}")
+        return record_check(data, node, None, "canary_submit_failed")
+    return record_check(data, node, None, "no_hold_job")
+
+
 # ── Node lists (`hive pool add --exclude`, `hive submit --exclude`) ──────────
 def expand_nodes(spec):
     """Node names from a SLURM-style list: 'evc22,evc[1-3,07],gpu01' →

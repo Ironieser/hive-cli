@@ -499,10 +499,7 @@ def live_probe(slurm_jobid):
     # comes back as a verdict — `fault` — instead of an srun timeout that looks like a
     # transient miss. The CUDA probe is skipped when the query hung: it would block in
     # the same driver call.
-    probe = (hh.gpu_query_shell()
-             + f"echo {hh.CUDA_MARKER}; "
-             + 'if [ -n "$_HIVE_GPU_HUNG" ]; then echo "CUDA_PROBE unknown gpu_hung"; else\n'
-             + hh.cuda_probe_shell() + "\nfi")
+    probe = hh.full_probe_shell()
     rc, raw = _run_probe(
         ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
          "bash", "-c", probe],
@@ -971,9 +968,21 @@ def run_one_cycle():
             jid = next((j for j, i in jobs_db.items()
                         if i.get("node") == node_name and j not in running_jobids), None)
             if jid is None:
-                hh.record_check(health, node_name, None, "no_hold_job")
+                # No hold job to probe through (pool add keeps new ones off this node):
+                # reboot detection + canary job, see hh.check_without_hold_job.
+                outcome = hh.check_without_hold_job(health, node_name, rec.get("partition"), now)
                 health_changed = True
+                last = health["nodes"][node_name].get("last_result")
+                if outcome or (last or "").startswith("canary"):
+                    logging.info("Health check %s (no hold job): %s%s", node_name, last,
+                                 f" → {outcome}" if outcome else "")
+                if outcome == "released":
+                    quarantined.discard(node_name)
+                    ev.record("release", node=node_name, source="auto",
+                              detail=health["nodes"][node_name].get("release_reason"))
                 continue
+            if jobs_db[jid].get("partition"):
+                rec["partition"] = jobs_db[jid]["partition"]   # where a canary would go
             verdict, detail = health_probe(jid)
             outcome = hh.record_check(health, node_name, verdict, detail)
             health_changed = True

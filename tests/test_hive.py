@@ -594,6 +594,100 @@ chk("a dispatch resets the starvation backoff",
 hs.request_repoll = _real_repoll
 reset_health(); reset_sched_state()
 
+print("== health monitor: recovery of a quarantined node that has no hold job ==")
+# `pool add` keeps hold jobs off quarantined nodes, so the through-a-hold-job check
+# never runs there again; without this the node stayed quarantined for good.
+def mock(name, val=None):
+    p = os.path.join(hs.HIVE_DIR, name)
+    if val is None:
+        try: os.remove(p)
+        except FileNotFoundError: pass
+    else:
+        open(p, "w").write(val)
+def quarantine_old(n, age=7200):
+    reset_health(); reset_sched_state()
+    d = hh.load(); hh.quarantine(d, n, "wedged", "verify")
+    d["nodes"][n].update(since=time.time() - age, until=time.time() - age + 3600)
+    hh.save(d)
+def hrec(n):
+    return hh.load()["nodes"][n]
+for m in ("mock_boot", "mock_node_state", "mock_canary_state", "mock_sbatch.log", "mock_scancel.log"):
+    mock(m)
+os.environ["HIVE_CANARY_GAP"] = "0"
+wdb({}); wq({})
+chk("node_info parses scontrol", hh.node_info("evcX")["Partitions"] == ["gpu", "preemptable"]
+    and hh.node_info("evcX")["State"] == "IDLE" and hh.node_info("evcX")["BootTime"] is not None)
+
+# (1) reboot after the quarantine -> released, no job submitted
+quarantine_old("evcR")
+mock("mock_boot", time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 600)))
+hs.run_one_cycle()
+chk("node rebooted after quarantine -> released", hrec("evcR")["state"] == "ok"
+    and "rebooted" in hrec("evcR").get("release_reason", ""))
+chk("...without submitting a canary", not os.path.exists(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")))
+chk("release event recorded", any(e["event"] == "release" and e.get("node") == "evcR" for e in ev.iter_events()))
+mock("mock_boot")
+
+# (2) healthy canary: two good probes in one job -> released
+quarantine_old("evcC")
+mock("mock_canary_state", "RUNNING")
+hs.run_one_cycle()
+r = hrec("evcC")
+_sb = open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read()
+chk("canary submitted, pinned to the node, in its partition",
+    r.get("canary", {}).get("jobid") == "4242" and "--nodelist=evcC" in _sb
+    and "--partition=gpu" in _sb and "--job-name=hive_canary" in _sb)
+d = hh.load(); d["nodes"]["evcC"]["last_check"] = 0; hh.save(d)
+hs.run_one_cycle()
+chk("while the canary runs: still quarantined, no second canary",
+    hrec("evcC")["state"] == "quarantined" and hrec("evcC")["last_result"] == "canary_running"
+    and open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read().count("hive_canary") == 1)
+mock("mock_canary_state")                         # job left the queue
+d = hh.load(); d["nodes"]["evcC"]["last_check"] = 0; hh.save(d)
+hs.run_one_cycle()
+chk("canary came back healthy twice -> released", hrec("evcC")["state"] == "ok")
+
+# (3) canary on a node that is still broken -> quarantine re-armed, next one in 6 h
+quarantine_old("evcB"); mock("mock_sbatch.log")
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE fail cuCtxCreate=999'"
+hs.run_one_cycle()
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE ok'"
+d = hh.load(); d["nodes"]["evcB"]["last_check"] = 0; hh.save(d)
+hs.run_one_cycle()
+r = hrec("evcB")
+chk("failing canary keeps the node quarantined and extends the hold",
+    r["state"] == "quarantined" and "canary" not in r and r["until"] > time.time() + 3000
+    and r["last_result"].startswith("fail: canary"))
+d = hh.load(); d["nodes"]["evcB"]["last_check"] = 0; hh.save(d)
+hs.run_one_cycle()
+chk("no new canary before CANARY_INTERVAL_SECS",
+    open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read().count("hive_canary") == 1)
+d = hh.load(); d["nodes"]["evcB"].update(last_check=0, last_canary=time.time() - hh.CANARY_INTERVAL_SECS - 1); hh.save(d)
+hs.run_one_cycle()
+chk("...and a new one after it", open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read().count("hive_canary") == 2)
+
+# (4) canary stuck in the SLURM queue -> cancelled after CANARY_MAX_WAIT_SECS
+mock("mock_canary_state", "PENDING")
+d = hh.load(); d["nodes"]["evcB"]["last_check"] = 0
+d["nodes"]["evcB"]["canary"]["submitted"] = time.time() - hh.CANARY_MAX_WAIT_SECS - 1; hh.save(d)
+hs.run_one_cycle()
+chk("canary that never started is cancelled", "canary" not in hrec("evcB")
+    and "4242" in open(os.path.join(hs.HIVE_DIR, "mock_scancel.log")).read())
+mock("mock_canary_state")
+
+# (5) no canary onto a node SLURM has drained, or when switched off
+quarantine_old("evcD"); mock("mock_sbatch.log"); mock("mock_node_state", "IDLE+DRAIN")
+hs.run_one_cycle()
+chk("drained node: no canary, state noted", not os.path.exists(os.path.join(hs.HIVE_DIR, "mock_sbatch.log"))
+    and hrec("evcD")["last_result"] == "node_idle+drain")
+mock("mock_node_state")
+os.environ["HIVE_HEALTH_CANARY"] = "0"
+d = hh.load(); d["nodes"]["evcD"]["last_check"] = 0; hh.save(d)
+hs.run_one_cycle()
+chk("HIVE_HEALTH_CANARY=0 -> no canary", not os.path.exists(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")))
+os.environ.pop("HIVE_HEALTH_CANARY"); os.environ.pop("HIVE_CANARY_GAP")
+reset_health(); reset_sched_state()
+
 print("== node exclusion: hive submit --exclude, hive pool add --exclude ==")
 chk("expand_nodes: names, ranges, padding, duplicates",
     hh.expand_nodes("evc22,evc[1-3,07],gpu01,evc22") == ["evc22", "evc1", "evc2", "evc3", "evc07", "gpu01"])
