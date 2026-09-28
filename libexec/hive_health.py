@@ -735,8 +735,12 @@ def slow_probe(data, node, secs, now=None):
     now = now if now is not None else time.time()
     rec = _rec(data, node)
     rec["last_check"] = now
-    if rec.get("state") != "quarantined" or rec.get("source") not in ("verify", "auto"):
-        rec["last_result"] = f"unknown: slow init {int(secs)}s on a node quarantined by hand"
+    # Not for a node an agent or a person put away, and not for one that is out
+    # because TASKS died on it at CUDA init: such a node passes probes while it fails
+    # work, and coming back as `slow` would cost a failed task an hour, for ever.
+    if rec.get("state") != "quarantined" or rec.get("source") not in ("verify", "auto") \
+            or "CUDA-init failures" in str(rec.get("reason") or ""):
+        rec["last_result"] = f"unknown: slow init {int(secs)}s on a node that is out for a fault"
         return False
     rec["slow_streak"] = int(rec.get("slow_streak", 0)) + 1
     rec["ok_streak"] = 0
@@ -875,6 +879,7 @@ def record_check(data, node, verdict, detail=""):
         rec["last_result"] = detail or "not_checked"
         return None
     rec["last_result"] = verdict if verdict == "ok" else f"{verdict}: {detail}"
+    rec["slow_streak"] = 0          # "in a row": any other answer in between starts over
     _hist(rec, "check", result=rec["last_result"])
     if rec.get("state") == "slow":
         # ok here means a context in normal time (the caller sends slow ones to

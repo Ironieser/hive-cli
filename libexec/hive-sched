@@ -511,6 +511,12 @@ def task_gpus(task):
         return DEFAULT_TASK_GPUS
 
 
+WARN_MIN_RUN_SECS = 60      # no --warn-before signal to a command this young: it has
+                            # not installed its handler yet, and would be killed by it
+PREEMPT_RESERVE_SECS = 300  # how long a hold job freed by a preemption is kept for the
+                            # task that asked for it
+PREEMPT_KILL_AFTER   = 45   # a victim's step that ignores SIGTERM gets SIGKILL after this
+_reserved = {}              # jid → (task id it is kept for, epoch until which)
 GANG_FAILED_EXIT = 126
 MAX_PREEMPTIONS  = 5        # times one task may be preempted before it is left alone
 PREEMPT_WAIT_SECS = 120     # a task that preempted waits this long before it does so again
@@ -530,12 +536,18 @@ def abort_broken_gangs(tasks):
         running = [t for t in members if t["state"] == "running"]
         broken = [t for t in members if t["state"] in ("failed", "cancelled")
                   or (t["state"] == "pending" and (t.get("requeue_count") or t.get("attempts")))]
-        lost = len(members) < int(members[0].get("gang_size") or 0)      # a member was removed
-        if not (broken or lost) or all(t["state"] in ("done", "failed", "cancelled") for t in members):
-            if not any(t["state"] == "pending" and (t.get("requeue_count") or t.get("attempts"))
-                       for t in members):
-                continue
-        cause = broken[0]["id"] if broken else None
+        # A member that is missing was removed from the queue (hive rm / prune), which
+        # only happens to tasks that have ended. That breaks a gang which has not
+        # started — it can never be complete again — but says nothing against members
+        # that are running: stopping them because a finished one was tidied away
+        # killed healthy work.
+        lost = len(members) < int(members[0].get("gang_size") or 0) \
+            and all(t["state"] == "pending" for t in members)
+        if not (broken or lost):
+            continue
+        if all(t["state"] in ("done", "failed", "cancelled") for t in members):
+            continue
+        cause = broken[0]["id"] if broken else "(removed from the queue)"
         for t in members:
             if t["state"] == "running" and not t.get("cancel_requested"):
                 t["cancel_requested"] = now_iso()
@@ -549,7 +561,7 @@ def abort_broken_gangs(tasks):
                 t["finished_ts"] = now_ts()
                 t.pop("pending_reason", None)
                 append_log_note(t, [f"=== hive: task #{t['id']} is part of a multi-node task "
-                                    f"whose member #{cause} did not complete; it was not "
+                                    f"whose member {cause} did not complete; it was not "
                                     f"(re)run (exit_code={GANG_FAILED_EXIT}) ==="])
                 ev.record("finish", task=t["id"], name=t.get("name") or None, state="failed",
                           exit_code=GANG_FAILED_EXIT, reason="gang_member_failed")
@@ -558,12 +570,36 @@ def abort_broken_gangs(tasks):
     return touched
 
 
-def pick_victim(task, tasks, quarantined, slow):
+def fits_hold_job(task, info, db_updated):
+    """Could `task` run on hold job `info` if it were free — the gates of find_slot that
+    do not depend on what is running there now: cards, card size, walltime."""
+    if info is None:
+        return False
+    cards = info.get("gpu") or []
+    want = task_gpus(task)
+    if cards and want > len(cards):
+        return False
+    need = int(task.get("need_mb") or 0)
+    if need and cards and max(int(g.get("mem_total") or 0) for g in cards) < need:
+        return False
+    left = db_time_left(info, db_updated)
+    if left is not None and left >= 0:
+        est = task.get("est_runtime_secs")
+        if est and left < int(est) + WALLTIME_MARGIN_SECS:
+            return False
+        if task.get("warn_before_secs") and left <= float(task["warn_before_secs"]) + WARN_MIN_RUN_SECS:
+            return False
+    return True
+
+
+def pick_victim(task, tasks, quarantined, slow, jobs_db=None, db_updated=None):
     """The running task `task` may take the place of (checklist B6), or None. Both
     sides opt in: `task` was submitted --preempt, the victim --preemptible. The victim
     has a strictly lower priority, holds at least as many cards as `task` wants, is not
-    part of a multi-node task, and sits on a node `task` could use. Of those: the
-    lowest priority, then the one that started last (least work lost)."""
+    part of a multi-node task, and sits on a hold job `task` could USE (walltime, card
+    size — a victim must never be stopped for a task that then cannot take its
+    place) whose step this scheduler can actually stop. Of those: the lowest priority,
+    then the one that started last (least work lost)."""
     want = task_gpus(task)
     excluded = set(task.get("exclude_nodes") or ())
     best = None
@@ -572,6 +608,9 @@ def pick_victim(task, tasks, quarantined, slow):
                 or v.get("gang_size") or v.get("priority", 0) >= task.get("priority", 0) \
                 or int(v.get("preempt_count") or 0) >= MAX_PREEMPTIONS \
                 or len(v.get("gpu_slots") or []) < want \
+                or not _pid_alive(v.get("srun_pid")) \
+                or (jobs_db is not None
+                    and not fits_hold_job(task, jobs_db.get(v.get("slurm_jobid")), db_updated)) \
                 or v.get("node") in excluded or v.get("node") in quarantined \
                 or (v.get("node") in slow and not hh.task_accepts_slow(task)):
             continue
@@ -1158,11 +1197,20 @@ def dispatch_task(task, slurm_jobid, node_name):
     # that is in the foreground of a child does not run traps until the child ends,
     # and one without a trap is killed by the signal — either way the wrapper could
     # not pass it on and live to write the exit file.
+    #
+    # The signal goes to the command's whole process GROUP (setsid makes it one), not
+    # just to the shell that runs it: for `python train.py; echo done`, a pipeline or a
+    # multi-line script that shell is a bash in between, and signalling it alone
+    # killed IT (no trap → default action), recorded the task as failed 138 and left
+    # the real process running as an orphan that never heard of the warning. So that
+    # shell starts with a no-op trap, which the command is free to replace; the
+    # processes it starts get the default disposition and can install a handler.
     if task.get("warn_before_secs"):
+        guarded = "trap : USR1\n" + cmd
         run_line = (
-            f"bash -c -- {q(cmd)} >> {lf} 2>&1 &\n"
+            f"setsid bash -c -- {q(guarded)} >> {lf} 2>&1 &\n"
             "_CMD_PID=$!\n"
-            "trap 'kill -USR1 $_CMD_PID 2>/dev/null' USR1\n"
+            "trap 'kill -USR1 -- -$_CMD_PID 2>/dev/null || kill -USR1 $_CMD_PID 2>/dev/null' USR1\n"
             "while :; do wait $_CMD_PID; _EC=$?; kill -0 $_CMD_PID 2>/dev/null || break; done\n"
             "trap - USR1\n"
             "( exit $_EC )\n"
@@ -1325,9 +1373,12 @@ def auto_prune(queue, now=None):
     n = 0
     if days > 0:
         tasks = queue.get("tasks", {})
+        active_gangs = {t.get("array_id") for t in tasks.values()
+                        if t.get("gang_size") and t.get("state") in ("pending", "running")}
         for key in [k for k, t in tasks.items()
                     if t.get("state") in ("done", "failed", "cancelled")
                     and not t.get("notify_pending")
+                    and not (t.get("gang_size") and t.get("array_id") in active_gangs)
                     and (_task_epoch(t, "finished") or now) < now - days * 86400]:
             for path in (os.path.join(HEARTBEAT_DIR, key), os.path.join(HEARTBEAT_DIR, key + ".exit"),
                          usage_file(key)):
@@ -1517,7 +1568,8 @@ def _cycle(probe_cache, final):
             # Node about to expire (`hive submit --warn-before`): one SIGUSR1 to the
             # step, once, so the command can write a checkpoint while it still can.
             warn = task.get("warn_before_secs")
-            if warn and not task.get("warned_ts") and status == "alive" and jid in jobs_db:
+            if warn and not task.get("warned_ts") and status == "alive" and jid in jobs_db \
+                    and (_task_age(task, "started", "dispatched") or 0) >= WARN_MIN_RUN_SECS:
                 left = db_time_left(jobs_db[jid], db_updated)
                 if left is not None and 0 <= left <= float(warn):
                     pid = task.get("srun_pid")
@@ -1545,15 +1597,44 @@ def _cycle(probe_cache, final):
                 # marked cancelled, GPU still busy) or hit an unrelated same-number
                 # PID. The CLI records the request; we act on it here.
                 pid = task.get("srun_pid")
-                if pid and _pid_alive(pid):
+                by = task.get("preempted_by")
+                if by is not None:
+                    other = tasks.get(str(by))
+                    if not task.get("preempt_signalled_ts") and \
+                            (other is None or other["state"] != "pending"):
+                        # The task it was to make room for is gone or has found a node
+                        # by itself, and nothing was signalled yet: leave it running.
+                        task.pop("preempted_by", None)
+                        task.pop("cancel_requested", None)
+                        changed = True
+                        continue
+                    if pid and _pid_alive(pid):
+                        # Two steps: ask, then wait until the step is really gone.
+                        # Requeued in the same pass it could be dispatched again while
+                        # its first copy was still shutting down on the card.
+                        since = task.get("preempt_signalled_ts")
+                        try:
+                            if not since:
+                                os.kill(pid, signal.SIGTERM)
+                                task["preempt_signalled_ts"] = now_ts()
+                                changed = True
+                            elif time.time() - float(since) > PREEMPT_KILL_AFTER:
+                                os.kill(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        continue
+                elif pid and _pid_alive(pid):
                     try:
                         os.kill(pid, signal.SIGTERM)   # srun forwards it to the step
                     except OSError:
                         pass
                 if task.pop("preempted_by", None) is not None:
                     # Preempted, not cancelled: back in the queue, to start afresh.
-                    by = task.pop("preempting", None)
+                    task.pop("preempt_signalled_ts", None)
+                    task.pop("warned_ts", None)
                     task.pop("cancel_requested", None)
+                    if jid:
+                        _reserved[jid] = (by, time.time() + PREEMPT_RESERVE_SECS)
                     collect_usage(task)
                     task["preempt_count"]      = int(task.get("preempt_count") or 0) + 1
                     task["requeue_count"]      = task.get("requeue_count", 0) + 1
@@ -1601,6 +1682,8 @@ def _cycle(probe_cache, final):
                 continue
 
             if status.startswith("done:"):
+                for stale in ("cancel_requested", "preempted_by", "preempt_signalled_ts"):
+                    task.pop(stale, None)          # it ended by itself first
                 ec = int(status.split(":")[1])
                 task["state"]       = "done" if ec == 0 else "failed"
                 task["exit_code"]   = ec
@@ -1657,6 +1740,7 @@ def _cycle(probe_cache, final):
                                 task["state"]          = "pending"
                                 task["pending_reason"] = "node_quarantined_redispatch"
                                 task.pop("gpu_slots", None)
+                                task.pop("warned_ts", None)
                                 task["slurm_jobid"]    = None
                                 task["node"]           = None
                                 task["srun_pid"]       = None
@@ -1686,6 +1770,7 @@ def _cycle(probe_cache, final):
                     task["state"]         = "pending"
                     task["pending_reason"] = "redispatched_after_crash"
                     task.pop("gpu_slots", None)
+                    task.pop("warned_ts", None)
                     task["slurm_jobid"]   = None
                     task["node"]          = None
                     task["srun_pid"]      = None
@@ -1716,6 +1801,7 @@ def _cycle(probe_cache, final):
                     task["state"]              = "pending"
                     task["pending_reason"]     = "infra_failure_redispatch"
                     task.pop("gpu_slots", None)
+                    task.pop("warned_ts", None)
                     task["slurm_jobid"]        = None
                     task["node"]               = None
                     task["srun_pid"]           = None
@@ -2065,6 +2151,24 @@ def _cycle(probe_cache, final):
                                      _fmt_dur(node_left), _fmt_dur(int(est)))
                     i += 1
                     continue
+                # …nor on one that expires before the --warn-before signal could be of
+                # any use: it would be signalled seconds after it started.
+                if task.get("warn_before_secs") and node_left is not None and node_left >= 0 \
+                        and node_left <= float(task["warn_before_secs"]) + WARN_MIN_RUN_SECS:
+                    reason = "insufficient_walltime"
+                    i += 1
+                    continue
+                # A hold job freed by a preemption is kept for the task that asked for
+                # it; otherwise whoever is first in line takes it and the preemptor
+                # preempts again, stopping one victim after the other for nothing.
+                kept = _reserved.get(jid)
+                if kept and kept[0] != task["id"]:
+                    keeper = tasks.get(str(kept[0]))
+                    if kept[1] > time.time() and keeper is not None and keeper["state"] == "pending":
+                        reason = "no_dispatchable_node"
+                        i += 1
+                        continue
+                    _reserved.pop(jid, None)
                 # A card smaller than the task needs will never do (task-level).
                 biggest = max((r[2] for r in readings), default=0)
                 if need_mb and biggest and want_gpus > 0 and biggest < need_mb:
@@ -2246,6 +2350,7 @@ def _cycle(probe_cache, final):
                 save_queue(queue, lfd)
                 return False
             task["srun_pid"] = srun_pid
+            _reserved.pop(jid, None)
             running_jobids.add(jid)
             if task.get("array_id") is not None:
                 run_by_array[task["array_id"]] = run_by_array.get(task["array_id"], 0) + 1
@@ -2275,25 +2380,43 @@ def _cycle(probe_cache, final):
             members = sorted((t for t in tasks.values() if t.get("array_id") == first.get("array_id")
                               and t.get("gang_size") and t["state"] == "pending"),
                              key=lambda t: t.get("array_index") or 0)
+            def wait_all(reason):
+                nonlocal changed, starved
+                starved += 1                  # one gang, one starved "task"
+                for m in members:
+                    if m.get("pending_reason") != reason:
+                        m["pending_reason"] = reason
+                        changed = True
+
             if len(members) < int(first["gang_size"]):
-                for m in members:             # a member is gone: abort_broken_gangs
-                    hold_back(m, "waiting_for_gang")   # ends the rest next pass
+                wait_all("waiting_for_gang")  # a member is gone: abort_broken_gangs
+                return                        # ends the rest next pass
+            # Not even worth a probe if the pool has fewer NODES than members: every
+            # free hold job used to be probed every cycle for as long as the gang waited.
+            if len({c[1].get("node") for c in candidates}) < len(members):
+                wait_all("waiting_for_gang")
                 return
             chosen, nodes, why = [], set(), None
             for m in members:
+                asked = set(wanted)
                 choice, reason = find_slot(m, avoid_nodes=nodes)
                 if choice is None:
                     why = why or reason
                     if final:
                         break
-                    continue                  # pass 1: let every member ask for a probe
+                    # Pass 1: the hold job this member asked to have probed is on a
+                    # node the next members must stay off, exactly like a choice —
+                    # else N members ask for N hold jobs of the same node, pass 2 can
+                    # use one of them, and the gang never starts.
+                    for jid in set(wanted) - asked:
+                        nodes.add(jobs_db.get(jid, {}).get("node"))
+                    continue
                 chosen.append((m, choice))
                 nodes.add(choice["node"])
             if len(chosen) < len(members):
                 for _m, choice in reversed(chosen):
                     release(choice)
-                for m in members:
-                    hold_back(m, why if why == "verifying_node" else "waiting_for_gang")
+                wait_all(why if why == "verifying_node" else "waiting_for_gang")
                 return
             hosts = ",".join(c["node"] for _m, c in chosen)
             started = []
@@ -2307,33 +2430,57 @@ def _cycle(probe_cache, final):
                     changed = True
                     return
 
+        def gate(task, together=1):
+            """Why `task` must not be placed yet although a node may be free — the
+            gates that need no node — or None. `together` = how many tasks of its
+            owner would start at once (the members of a multi-node task)."""
+            dep, _dep_id = dependency_status(task, tasks, pruned)
+            if task.get("held"):
+                return "held"                       # `hive hold`; until `hive unhold`
+            if task.get("begin_ts") and time.time() < float(task["begin_ts"]):
+                return "waiting_for_begin"          # `hive submit --begin`
+            if dep == "wait":
+                return "waiting_for_dependency"
+            if task.get("array_max_running") and task.get("array_id") is not None \
+                    and not task.get("gang_size") \
+                    and run_by_array.get(task["array_id"], 0) >= int(task["array_max_running"]):
+                return "array_limit"
+            if task.get("owner") in owner_cap \
+                    and run_by_owner.get(task["owner"], 0) + together > owner_cap[task["owner"]]:
+                return "owner_limit"
+            return None
+
+        gangs_seen = set()
         for task in pending:
             if task["state"] != "pending":
                 continue                      # started a moment ago, with its gang
+            if task.get("gang_size"):
+                # Once per gang and pass, and only if EVERY member may go: the members
+                # start together, so one that is held, not due yet or over its owner's
+                # cap holds all of them.
+                gid = task.get("array_id")
+                if gid in gangs_seen:
+                    continue
+                gangs_seen.add(gid)
+                members = [t for t in tasks.values() if t.get("array_id") == gid
+                           and t.get("gang_size") and t["state"] == "pending"]
+                held = next((h for h in (gate(m, together=len(members)) for m in members) if h), None)
+                if held:
+                    for m in members:
+                        if m.get("pending_reason") != held:
+                            m["pending_reason"] = held
+                            changed = True
+                    continue
+                place_gang(task)
+                continue
             # ── Gates that need no node (docs/feature_plan.md phase 3) ────────────
-            dep, dep_id = dependency_status(task, tasks, pruned)
-            held = None
-            if task.get("held"):
-                held = "held"                       # `hive hold`; until `hive unhold`
-            elif task.get("begin_ts") and time.time() < float(task["begin_ts"]):
-                held = "waiting_for_begin"          # `hive submit --begin`
-            elif dep == "wait":
-                held = "waiting_for_dependency"
-            elif task.get("array_max_running") and task.get("array_id") is not None \
-                    and run_by_array.get(task["array_id"], 0) >= int(task["array_max_running"]):
-                held = "array_limit"
-            elif task.get("owner") in owner_cap \
-                    and run_by_owner.get(task["owner"], 0) >= owner_cap[task["owner"]]:
-                held = "owner_limit"
+            held = gate(task)
             if held:
                 if task.get("pending_reason") != held:
                     task["pending_reason"] = held
                     changed = True
                 continue
 
-            if task.get("gang_size"):
-                place_gang(task)
-                continue
             choice, reason = find_slot(task)
             if choice is None:
                 hold_back(task, reason)
@@ -2353,7 +2500,10 @@ def _cycle(probe_cache, final):
                                                            "owner_limit", "verifying_node") \
                         or time.time() - float(task.get("preempted_ts") or 0) < PREEMPT_WAIT_SECS:
                     continue
-                victim = pick_victim(task, tasks, quarantined, slow)
+                if any(tid == task["id"] and until > time.time()
+                       for tid, until in _reserved.values()):
+                    continue          # a hold job is already on its way to this task
+                victim = pick_victim(task, tasks, quarantined, slow, jobs_db, db_updated)
                 if victim is None:
                     continue
                 victim["cancel_requested"] = now_iso()

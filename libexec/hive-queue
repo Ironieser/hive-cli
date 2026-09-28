@@ -1365,6 +1365,9 @@ def cmd_cancel(args):
             _, sched_host = read_sched_pid()
             sched_local = (not sched_host) or sched_host == socket.gethostname()
             sched_alive = is_sched_running()
+            # The user's cancel wins over a preemption that is under way: without this
+            # the scheduler requeued the task it had been told to cancel.
+            task.pop("preempted_by", None)
             if getattr(args, "force", False):
                 # The scheduler is alive but not acting (stuck, or not the one that
                 # owns this task). Mark it cancelled here and now; stop the step

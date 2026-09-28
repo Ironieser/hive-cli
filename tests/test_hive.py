@@ -546,6 +546,7 @@ chk("gpu query parser: CPU-only hold job (nothing granted) is never a fault",
 chk("gpu query parser: step never ran -> no verdict", hh.parse_gpu_query([]) == ([], None, None))
 
 def reset_sched_state():
+    getattr(hs, "_reserved", {}).clear()
     hs._probe_backoff.clear(); hs._reject_logged.clear()
     getattr(hs, "_freed_at", {}).clear(); getattr(hs, "_task_skip", {}).clear()
     hs._starve_streak = 0; hs._starve_threshold = hs.STARVATION_CYCLES
@@ -1681,9 +1682,17 @@ _cmdw = f"trap 'echo caught > {_flag}; exit 0' USR1; for i in $(seq 100); do sle
 wdb({"700": node("expiring", 400)})                       # 400 s of walltime left
 clear_notified()
 wq({"840": dict(task(840, name="warned"), cmd=_cmdw, warn_before_secs=600, notify=_hook)})
+hs.run_one_cycle()
+chk("not placed on a node that expires before the warning could help",
+    rq()["840"]["state"] == "pending" and rq()["840"].get("pending_reason") == "insufficient_walltime")
+wdb({"700": node("expiring", 72000)})
 hs.run_one_cycle()                                        # dispatched
 chk("dispatched with the waiting wrapper", rq()["840"]["state"] == "running")
 time.sleep(1.0)
+wdb({"700": node("expiring", 400, st="busy")})            # …time passes: 400 s left
+hs.run_one_cycle()
+chk("a command that has only just started is not signalled yet", not rq()["840"].get("warned_ts"))
+q_ = rq(); q_["840"]["started_ts"] = q_["840"]["dispatched_ts"] = time.time() - 90; wq(q_)
 hs.run_one_cycle()                                        # walltime 400 s <= 600 s -> warn
 t = rq()["840"]
 chk("the task is warned once", t.get("warned_ts") and "will be reclaimed" in open(t["log"]).read())
@@ -1699,6 +1708,35 @@ chk("hook called with event `expiring`", any(l.startswith("840 expiring") for l 
 _w = open(t["log"]).read().count("will be reclaimed")
 chk("...and only once", _w == 1)
 clear_notified()
+# a compound command: the signal must reach the real process, and the shell in between
+# must survive it (it used to be killed: task failed 138, the process left running)
+_flag2 = os.path.join(hs.HIVE_DIR, "got_usr1_py")
+open(os.path.join(hs.HIVE_DIR, "w.py"), "w").write(
+    "import signal, time, sys\n"
+    f"signal.signal(signal.SIGUSR1, lambda *a: (open({_flag2!r}, 'w').write('x'), sys.exit(0)))\n"
+    "time.sleep(20)\n")
+_cmdc = f"{sys.executable} {hs.HIVE_DIR}/w.py; echo after-python"
+wdb({"700": node("n0", 72000)})
+wq({"842": dict(task(842, name="compound"), cmd=_cmdc, warn_before_secs=600)})
+hs.run_one_cycle(); time.sleep(1.5)
+q_ = rq(); q_["842"]["started_ts"] = q_["842"]["dispatched_ts"] = time.time() - 90; wq(q_)
+wdb({"700": node("n0", 400, st="busy")})
+hs.run_one_cycle()
+for _ in range(50):
+    if os.path.exists(_flag2): break
+    time.sleep(0.1)
+chk("compound command: the python process got the signal", os.path.exists(_flag2))
+time.sleep(0.8); hs.run_one_cycle()
+t = rq()["842"]
+chk("...the shell around it lived on and finished the script (exit 0, not 138)",
+    (t["state"], t["exit_code"]) == ("done", 0) and "after-python" in open(t["log"]).read())
+# warned on one node, requeued, warned again on the next
+t = dict(task(843, name="again", state="running", jid="2001", node="gone", st=loc(-450), sub=loc(-500),
+              dispatched=loc(-450)), warn_before_secs=600, warned_ts=time.time() - 300, gpu_slots=[0])
+stale_hb(843); open(os.path.join(hs.LOG_DIR, "task-843.log"), "w").write("x")
+wdb({}); wq({"843": t}); hs.run_one_cycle()
+chk("a requeue forgets the warning of the old node", rq()["843"]["state"] == "pending"
+    and "warned_ts" not in rq()["843"])
 wq({"841": dict(task(841, name="plenty"), cmd="sleep 1", warn_before_secs=600)})
 wdb({"700": node("fresh", 72000)})
 hs.run_one_cycle(); time.sleep(0.4); hs.run_one_cycle()
@@ -1816,16 +1854,66 @@ chk("a member that lost its node is not re-run alone; the gang ends",
     and (q["921"].get("cancel_requested") or q["921"]["state"] == "cancelled"))
 hs.run_one_cycle()
 
+# red team round 3 — gangs
+reset_health(); reset_sched_state()
+_pr3 = []
+hs.live_probe = lambda jid, **kw: (_pr3.append(jid), _ok())[1]
+json.dump({"version": 1, "next_id": 960, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="g2", nodes=2, cmd_or_file="sleep 1"))
+wdb(dict({str(700 + i): node("a", 72000) for i in range(4)}, **{"704": node("b", 72000)}))
+hs.run_one_cycle(); time.sleep(0.3)
+chk("four hold jobs on node a, one on b: the gang of 2 starts (a and b)",
+    sorted(rq()[k].get("node") for k in ("960", "961")) == ["a", "b"])
+chk("...having probed one hold job per node, not every one", len(_pr3) == 2)
+time.sleep(1.0); hs.run_one_cycle()
+_pr3.clear()
+json.dump({"version": 1, "next_id": 962, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="g3", nodes=3, cmd_or_file="sleep 1"))
+wdb({"700": node("a", 72000), "701": node("a", 72000), "702": node("b", 72000)})
+for _ in range(3): hs.run_one_cycle()
+chk("two nodes for a gang of three: it waits WITHOUT probing anything", _pr3 == []
+    and {rq()[k].get("pending_reason") for k in ("962", "963", "964")} == {"waiting_for_gang"})
+q_ = rq(); q_["963"]["held"] = True; wq(q_)
+wdb({"700": node("a", 72000), "701": node("b", 72000), "702": node("c", 72000)})
+hs.run_one_cycle()
+chk("one held member holds the whole gang",
+    [rq()[k]["state"] for k in ("962", "963", "964")] == ["pending"] * 3
+    and {rq()[k].get("pending_reason") for k in ("962", "963", "964")} == {"held"})
+q_ = rq(); q_["963"]["held"] = False
+for k in ("962", "963", "964"): q_[k].update(owner="capped", max_running=2)
+wq(q_); hs.run_one_cycle()
+chk("a gang of 3 does not start under an owner cap of 2",
+    {rq()[k].get("pending_reason") for k in ("962", "963", "964")} == {"owner_limit"})
+# a finished member that was removed does not stop the ones still running
+t0 = dict(task(966, name="g", state="running", jid="700", node="a", st=loc(-60)), array_id=965,
+          array_index=1, gang_size=2, gpu_slots=[0])
+t0["started_ts"] = time.time() - 60
+open(os.path.join(hs.HEARTBEAT_DIR, "966"), "w").write("x")
+wdb({"700": node("a", 72000, st="busy")}); wq({"966": t0}); hs.run_one_cycle()
+chk("rank 0 ended and was removed from the queue: rank 1 keeps running",
+    rq()["966"]["state"] == "running" and not rq()["966"].get("cancel_requested"))
+old_m = dict(task(968, name="g", state="done"), array_id=967, array_index=0, gang_size=2,
+             finished_ts=time.time() - 30 * 86400)
+run_m = dict(t0, id=969, array_id=967)
+qq = {"version": 1, "next_id": 1000, "tasks": {"968": old_m, "969": run_m}}
+hs._last_auto_prune = 0; hs.auto_prune(qq)
+chk("auto-prune leaves the members of a gang that is still running", "968" in qq["tasks"])
+hs._last_auto_prune = time.time()
+hs.live_probe = _lpR
+
 # B6 — preemption
 reset_health(); reset_sched_state()
-def _running(i, prio, **kw):
+_victims = []
+def _running(i, prio, stubborn=False, **kw):
+    _p = _sp.Popen(["bash", "-c", "trap '' TERM; sleep 300 & wait"] if stubborn else ["sleep", "300"],
+                   start_new_session=True); _victims.append(_p)
     t = dict(task(i, name=f"r{i}", state="running", jid=kw.pop("jid", "700"), node=kw.pop("node", "a"),
-                  st=loc(-60), priority=prio), gpu_slots=[0], **kw)
+                  st=loc(-60), priority=prio), gpu_slots=[0], srun_pid=_p.pid, **kw)
     t["started_ts"] = time.time() - kw.get("age", 60)
     open(os.path.join(hs.HEARTBEAT_DIR, str(i)), "w").write("x")
     open(t["log"], "w").write("x\n")
     return t
-T = {"930": _running(930, 0, preemptible=True), "931": _running(931, 0, jid="701", node="b"),
+T = {"930": _running(930, 0, stubborn=True, preemptible=True), "931": _running(931, 0, jid="701", node="b"),
      "932": dict(task(932, name="urgent", priority=9), preempt=True, cmd="sleep 1.5")}
 chk("victim: lower priority AND preemptible", hs.pick_victim(T["932"], T, set(), set())["id"] == 930)
 chk("no victim among tasks that did not agree",
@@ -1846,6 +1934,10 @@ chk("no free node: the preemptible task is asked to stop, the other is left alon
     q["930"].get("cancel_requested") and q["930"].get("preempted_by") == 932
     and not q["931"].get("cancel_requested") and q["932"].get("pending_reason") == "preempting")
 hs.run_one_cycle()
+chk("first the step is asked to stop; the task is requeued only once it is gone",
+    rq()["930"]["state"] == "running" and rq()["930"].get("preempt_signalled_ts"))
+os.killpg(_victims[0].pid, 9); time.sleep(0.3); [_p.poll() for _p in _victims]
+hs.run_one_cycle()
 q = rq()
 chk("the victim is REQUEUED, not cancelled", q["930"]["state"] == "pending"
     and q["930"].get("preempt_count") == 1 and q["930"].get("checkpoint_warning")
@@ -1863,6 +1955,59 @@ chk("a task preempted MAX_PREEMPTIONS times is left alone", not rq()["940"].get(
 wq({"942": _running(942, 0, preemptible=True), "943": dict(task(943, name="plain", priority=9))})
 wdb({"700": busy("a")}); hs.run_one_cycle()
 chk("a task without --preempt never preempts", not rq()["942"].get("cancel_requested"))
+# red team round 3
+# a victim is never stopped for a task that could not use its node
+reset_sched_state(); hs._reserved.clear()
+wdb({"700": dict(busy("a"), time_left_secs=7200)})
+wq({"944": _running(944, 0, preemptible=True),
+    "945": dict(task(945, name="ten_h", priority=9, est=36000), preempt=True)})
+for _ in range(3): hs.run_one_cycle()
+chk("walltime too short for the preemptor -> nobody is preempted",
+    not rq()["944"].get("cancel_requested") and rq()["944"]["state"] == "running")
+small = dict(busy("a"), gpu=[{"index": 0, "util": 50, "mem_used": 30000, "mem_total": 40000}])
+wdb({"700": small})
+wq({"946": _running(946, 0, preemptible=True),
+    "947": dict(task(947, name="big", priority=9, need_mb=60000), preempt=True)})
+for _ in range(3): hs.run_one_cycle()
+chk("card too small for the preemptor -> nobody is preempted", not rq()["946"].get("cancel_requested"))
+# the freed node is kept for the task that asked for it
+reset_sched_state(); hs._reserved.clear()
+wdb({"700": busy("a")})
+wq({"950": _running(950, 0, preemptible=True),
+    "951": dict(task(951, name="ordinary", priority=5, sub=loc(-100)), cmd="sleep 2"),
+    "952": dict(task(952, name="preemptor", priority=5, sub=loc(-10)), preempt=True, cmd="sleep 2")})
+hs.run_one_cycle(); hs.run_one_cycle()
+time.sleep(0.3); [_p.poll() for _p in _victims]
+hs.run_one_cycle(); hs.run_one_cycle(); time.sleep(0.3)
+q = rq()
+chk("the node a preemption freed goes to the preemptor, not to whoever is first in line",
+    q["952"].get("node") == "a" and q["951"]["state"] == "pending" and q["950"]["state"] == "pending")
+# the user's cancel wins over a preemption under way
+reset_sched_state(); hs._reserved.clear()
+wdb({"700": busy("a")})
+wq({"953": _running(953, 0, preemptible=True), "954": dict(task(954, name="p", priority=9), preempt=True)})
+hs.run_one_cycle()
+_rc(hq.cmd_cancel, _apR.Namespace(id=953, array=None, force=False))
+hs.run_one_cycle(); time.sleep(0.3); [_p.poll() for _p in _victims]; hs.run_one_cycle()
+chk("hive cancel of a task that is being preempted cancels it", rq()["953"]["state"] == "cancelled")
+# the preemptor goes away before anything was signalled
+reset_sched_state(); hs._reserved.clear()
+wdb({"700": busy("a")})
+v = _running(955, 0, preemptible=True); v.update(cancel_requested=loc(), preempted_by=956)
+wq({"955": v, "956": dict(task(956, name="gone", priority=9, state="cancelled"), preempt=True)})
+hs.run_one_cycle()
+chk("preemptor cancelled before the victim was signalled: the victim keeps running",
+    rq()["955"]["state"] == "running" and not rq()["955"].get("cancel_requested"))
+# a victim that finishes by itself carries no stale flags
+v = _running(957, 0, preemptible=True); v.update(cancel_requested=loc(), preempted_by=958)
+open(os.path.join(hs.HEARTBEAT_DIR, "957.exit"), "w").write("0")
+wq({"957": v, "958": dict(task(958, name="p", priority=9), preempt=True)})
+hs.run_one_cycle()
+chk("victim ended by itself: done, flags cleared", rq()["957"]["state"] == "done"
+    and not rq()["957"].get("cancel_requested") and not rq()["957"].get("preempted_by"))
+for _p in _victims:
+    _p.poll() is None and _p.kill()
+hs._reserved.clear()
 hs.live_probe = _lpR
 _rc(hq.cmd_submit, _nsR(name="pp", preempt=True, preemptible=True))
 chk("--preempt / --preemptible stored", _new()["preempt"] is True and _new()["preemptible"] is True)
