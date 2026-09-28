@@ -12,6 +12,7 @@ daemon restart. Status is updated here as phases land.
 | 3 | Dependencies | `hive submit --after ID[,ID]` (`afterok`), `--after-any` | done |
 | 3 | Sweeps | `hive submit --array 0-9%4` with `$HIVE_ARRAY_INDEX`; `%N` caps concurrency; `hive wait/cancel --array` | done |
 | 3 | Per-owner concurrency cap | `--max-running N` / `$HIVE_MAX_RUNNING` per owner, so one sweep cannot take the pool | done |
+| — | Slow-node tier, partition preference | `SLOW` node state, `--allow-slow` / `--no-slow`, `"prefer_partitions"` in pool_config.json | done |
 | 4 | GPU-slot scheduling | several tasks on one multi-GPU hold job, one card each | planned |
 | 5 | Queue control | `hive hold` / `release` / `reprioritize` | planned (`hive wait ID ID …` done with phase 3) |
 | 5 | Probes outside `queue.lock` | `hive submit` / `cancel` never wait on a node probe | health checks done (background threads); verify-before-dispatch still inline |

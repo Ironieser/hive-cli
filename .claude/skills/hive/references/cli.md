@@ -50,6 +50,7 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--after-any` | — | run after these tasks ended, whatever the outcome (cleanup, reports) |
 | `--array` | — | one task per index: `0-9`, `1,3,5`, `0-20:5`; append `%N` to run at most N at once (`0-9%4`). Same command for all, index in `$HIVE_ARRAY_INDEX`. See [Arrays](#arrays) |
 | `--max-running` | `$HIVE_MAX_RUNNING` | hold this task while its owner already has N running (`owner_limit`). Needs an owner |
+| `--allow-slow` / `--no-slow` | by estimate | whether the task may run on a **SLOW** node (works, but CUDA needs minutes to initialise — measured 146 s vs 4 s — then runs at its normal rate). Default: allowed when `--est-runtime` ≥ 1 h. Slow nodes are only used after every faster node |
 | `--exclude` / `-x` | — | nodes the task must not run on (`evc22,evc[40-43]`); it waits (`node_excluded`) rather than use them. Broken nodes don't need this — hive quarantines them itself |
 | `--workdir` / `-w` | cwd | working directory on the node |
 | `--priority` / `-p` | 0 | higher dispatches first (`-p=-5` for negatives) |
@@ -76,7 +77,7 @@ python eval.py --model $MODEL --skip-existing
 ```
 
 Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`, `exclude`,
-`timeout`, `notify`, `after`, `after_any`, `array`, `max_running`. Other `#` lines
+`timeout`, `notify`, `after`, `after_any`, `array`, `max_running`, `allow_slow`. Other `#` lines
 are comments; the rest is the command.
 
 ## `hive list`
@@ -148,6 +149,7 @@ hive submit --notify 'curl -s -d "task $HIVE_TASK_NAME: $HIVE_TASK_STATE" https:
 | `waiting_for_mem` | No card has the task's `--need-mb` free |
 | `waiting_for_dependency` | A task it was submitted `--after` has not ended yet |
 | `array_limit` / `owner_limit` | The array's `%N` / the owner's `--max-running` is reached; it starts when one of them ends |
+| `node_slow` | Only SLOW nodes are free and the task does not accept them → `--allow-slow`, or give an `--est-runtime` ≥ 1 h, or wait for a fast node |
 | `node_excluded` | The only free nodes are in the task's `--exclude` list |
 | `insufficient_gpus` | No hold job owns `--gpus N` cards → add a `--gres=gpu:N` hold job or lower N |
 | `insufficient_walltime` | No node has est + 10 min left → `hive pool add --time …` or lower `--est-runtime` |
@@ -185,6 +187,7 @@ the rest describe nodes and apply to everyone.
 | `WARN` | was busy, went quiet < 3 min ago (grace) | after a live probe |
 | `PFAIL` | probe couldn't run | after a live probe |
 | `QUAR` | node quarantined by `hive health` (CUDA init fails there) | no |
+| `SLOW` | works, but CUDA needs minutes to initialise (`hive health`) | long tasks / `--allow-slow` only, after faster nodes |
 | `CPU` | hold job has no GPU | no |
 
 `LEFT` = remaining walltime (red under 1 h). `node!` = that row's poll is > 10 min old.

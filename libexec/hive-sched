@@ -450,7 +450,8 @@ def health_probe(slurm_jobid):
     """(verdict, detail) for the periodic check of a quarantined node — the same
     guarded probe as verify-before-dispatch, so a wedged driver reads `fail` here too
     instead of hanging a bare CUDA probe until the srun timeout."""
-    p = live_probe(slurm_jobid)
+    p = live_probe(slurm_jobid, cuda_deadline=hh.SLOW_CUDA_DEADLINE,
+                   timeout=HEALTH_PROBE_TIMEOUT)
     if p.get("fault"):
         return "fail", p["fault"]
     if not p["ok"]:
@@ -675,7 +676,10 @@ def _run_probe(argv, timeout, stop_on=None):
     return rc, buf.decode("utf-8", errors="replace")
 
 
-def live_probe(slurm_jobid):
+HEALTH_PROBE_TIMEOUT = 420   # periodic check: waits up to hh.SLOW_CUDA_DEADLINE for a context
+
+
+def live_probe(slurm_jobid, cuda_deadline=None, skip_cuda=False, timeout=None):
     """Fast single-job GPU probe, bypassing the (possibly stale) node DB.
 
     Used to verify-before-dispatch so one stale/failed poll can't strand a node
@@ -690,11 +694,11 @@ def live_probe(slurm_jobid):
     # comes back as a verdict — `fault` — instead of an srun timeout that looks like a
     # transient miss. The CUDA probe is skipped when the query hung: it would block in
     # the same driver call.
-    probe = hh.full_probe_shell()
+    probe = hh.full_probe_shell(cuda_deadline, skip_cuda)
     rc, raw = _run_probe(
         ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
          "bash", "-c", probe],
-        LIVE_PROBE_TIMEOUT, stop_on=(f"{hh.GPU_MARKER} hung", hh.CUDA_SLOW_DETAIL))
+        timeout or LIVE_PROBE_TIMEOUT, stop_on=(f"{hh.GPU_MARKER} hung", hh.CUDA_SLOW_DETAIL))
     gpu_part, _, cuda_part = raw.partition(hh.CUDA_MARKER)
     lines, granted, fault = hh.parse_gpu_query(gpu_part.splitlines())
     if fault:
@@ -713,6 +717,20 @@ def live_probe(slurm_jobid):
     cuda, cuda_detail = hh.parse_cuda_probe(cuda_part.splitlines())
     return {"ok": True, "util": util, "mem_used": used, "mem_total": total,
             "cuda": cuda, "cuda_detail": cuda_detail}
+
+
+def preferred_partitions():
+    """Partitions to dispatch to first, from "prefer_partitions" in pool_config.json."""
+    try:
+        with open(os.path.join(HIVE_DIR, "pool_config.json")) as f:
+            pref = json.load(f).get("prefer_partitions") or []
+        return [str(p) for p in pref] if isinstance(pref, list) else [str(pref)]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return []
+
+
+def partition_rank(partition, prefer):
+    return prefer.index(partition) if partition in prefer else len(prefer)
 
 
 def get_candidates(jobs_db, used_jobids, freed, quarantined=frozenset()):
@@ -802,6 +820,12 @@ def dispatch_task(task, slurm_jobid, node_name):
     # Re-dispatch warning: a task put back on a (possibly different) node loses any
     # in-memory/un-checkpointed progress — make that unmissable in the log.
     rq = int(task.get("requeue_count", 0) or 0)
+    slow_secs = task.get("node_slow_init_secs")
+    slow_line = ""
+    if slow_secs:
+        slow_line = ("echo " + q(f"=== NOTE: {node_name} is a SLOW node — CUDA needs about "
+                                 f"{_fmt_dur(int(slow_secs))} to initialise here. A long silence "
+                                 f"at start-up is expected, not a hang. ===") + f" >> {lf}\n")
     rq_line = ""
     if rq > 0:
         rq_line = ("echo " + q(f"=== WARNING: re-dispatch #{rq} (attempt {task.get('attempts', 0)}). "
@@ -885,7 +909,7 @@ def dispatch_task(task, slurm_jobid, node_name):
         # ── Header ──────────────────────────────────────────────────────────
         "echo " + q(f"=== hive task #{task_id} started at {started_at} ===") + f" >> {lf}\n"
         "echo " + q(f"=== node: {node_name}  slurm_jobid: {slurm_jobid} ===") + f" >> {lf}\n"
-        + wt_line + est_line + rq_line +
+        + wt_line + est_line + rq_line + slow_line +
         "echo " + q(f"=== workdir: {workdir} ===") + f" >> {lf}\n"
         "echo " + q(f"=== cmd: {cmd_oneline} ===") + f" >> {lf}\n"
         f"echo '' >> {lf}\n"
@@ -1005,6 +1029,7 @@ def run_one_cycle():
         health = hh.load()
         health_changed = False
         quarantined = hh.quarantined_nodes(health)
+        slow = hh.slow_nodes(health)
 
         # ── (1) Check running tasks ──────────────────────────────────────────
         running_jobids = set()
@@ -1254,8 +1279,27 @@ def run_one_cycle():
 
         def apply_check(node_name, jid, verdict, detail):
             nonlocal health_changed
+            secs = hh.cuda_secs(detail) if verdict == "ok" else None
+            if secs is not None and secs > hh.CUDA_INIT_DEADLINE:
+                # The context was created, but slowly: usable for long tasks only.
+                health_changed = True
+                if hh.mark_slow(health, node_name, secs):
+                    quarantined.discard(node_name)
+                    slow.add(node_name)
+                    logging.warning("Node %s is SLOW, not broken: CUDA init took %ss. It "
+                                    "takes tasks that allow it (--allow-slow, or "
+                                    "--est-runtime >= %s).", node_name, secs,
+                                    _fmt_dur(hh.SLOW_OK_MIN_EST_SECS))
+                    ev.record("slow", node=node_name, source="auto", secs=secs)
+                return
             outcome = hh.record_check(health, node_name, verdict, detail)
             health_changed = True
+            if outcome == "quarantined":
+                slow.discard(node_name)
+                quarantined.add(node_name)
+                ev.record("quarantine", node=node_name, source="auto", reason=detail)
+            elif outcome == "released":
+                slow.discard(node_name)
             logging.info("Health check %s via %s: %s %s%s", node_name, jid, verdict, detail,
                          f" → {outcome}" if outcome else "")
             if outcome == "released":
@@ -1271,6 +1315,8 @@ def run_one_cycle():
                 continue
             jid = next((j for j, i in jobs_db.items()
                         if i.get("node") == node_name and j not in running_jobids), None)
+            if jid is None and rec.get("state") == "slow":
+                continue      # its hold jobs are all running tasks: that is health enough
             if jid is None:
                 # No hold job to probe through (pool add keeps new ones off this node):
                 # reboot detection + canary job, see hh.check_without_hold_job.
@@ -1298,6 +1344,11 @@ def run_one_cycle():
         # or actually-occupied GPU (feedback C1/C2). A reason is recorded on each
         # task that can't be placed this cycle.
         candidates = get_candidates(jobs_db, running_jobids, freed_jobids, quarantined)
+        # Fast nodes first, preferred partitions first ("prefer_partitions" in
+        # pool_config.json); the sort is stable, so trusted-idle-first is kept within.
+        prefer = preferred_partitions()
+        candidates.sort(key=lambda c: (c[1].get("node") in slow,
+                                       partition_rank(c[1].get("partition"), prefer)))
         n_quarantined_jobs = sum(1 for i in jobs_db.values() if i.get("node") in quarantined)
         pending = sorted(
             [t for t in tasks.values() if t["state"] == "pending"],
@@ -1393,6 +1444,14 @@ def run_one_cycle():
                 else:
                     used, total = db_gpu_mem(info)
 
+                # Slow-node gate (task-level): only tasks that can live with a start
+                # delayed by minutes.
+                is_slow = info.get("node") in slow
+                if is_slow and not hh.task_accepts_slow(task):
+                    reason = "node_slow"
+                    i += 1
+                    continue
+
                 # Exclusion gate (task-level): `hive submit --exclude`.
                 if info.get("node") in excluded:
                     reason = "node_excluded"
@@ -1415,7 +1474,9 @@ def run_one_cycle():
                         reason = node_reject = held
                         candidates.pop(i)      # node-level: silent last time, not re-probed yet
                         continue
-                    p = live_probe(jid)
+                    # On a slow node the CUDA probe would take minutes (while holding
+                    # queue.lock) to say what the periodic check already established.
+                    p = live_probe(jid, skip_cuda=is_slow)
                     if p.get("fault"):
                         # srun ran, SLURM granted a GPU, and the GPU did not answer.
                         # No user code involved, but one slow nvidia-smi on a loaded
@@ -1519,6 +1580,8 @@ def run_one_cycle():
                 task["dispatched_at"] = now_iso()
                 task["started_ts"]   = task["dispatched_ts"] = now_ts()
                 task["node_time_left_secs"] = node_left
+                task["node_slow_init_secs"] = (health["nodes"].get(node_name, {})
+                                               .get("slow_init_secs") if is_slow else None)
                 task.pop("pending_reason", None)
                 save_queue(queue, lfd)
                 try:

@@ -411,7 +411,7 @@ def parse_hive_file(path):
         result["est_runtime"] = meta["est_runtime"]   # parsed/resolved in cmd_submit
     if "exclude" in meta:
         result["exclude"] = meta["exclude"]           # expanded in cmd_submit
-    for key in ("after", "after_any", "array", "max_running"):
+    for key in ("after", "after_any", "array", "max_running", "allow_slow"):
         if key in meta:
             result[key] = meta[key]                   # parsed in cmd_submit
     if "timeout" in meta:
@@ -684,6 +684,12 @@ def cmd_submit(args):
               f"set --owner or $HIVE_OWNER", file=sys.stderr)
         sys.exit(2)
 
+    # Slow nodes (usable, but CUDA takes minutes to initialise): --allow-slow /
+    # --no-slow > #HIVE allow_slow= > decided from the runtime estimate (None).
+    allow_slow = getattr(args, "allow_slow", None)
+    if allow_slow is None and spec.get("allow_slow") is not None:
+        allow_slow = str(spec["allow_slow"]).strip().lower() in ("1", "true", "yes", "on")
+
     # Hard run-time limit: --timeout > #HIVE timeout=. Unlike --est-runtime (a placement
     # hint) this one is enforced: the scheduler kills the step when it is exceeded.
     timeout_secs = None
@@ -780,6 +786,7 @@ def cmd_submit(args):
                 "array_index":   a_idx,
                 "array_max_running": array_cap,
                 "max_running":   max_running,
+                "allow_slow":    allow_slow,
                 "est_runtime_secs":    est_secs,
                 "est_source":          est_source,
                 "requeue_count":       0,
@@ -1547,6 +1554,11 @@ def build_parser():
     ps.add_argument("--max-running", type=int, metavar="N", dest="max_running",
                     help="Hold this task while its owner already has N tasks running "
                          "(needs --owner / $HIVE_OWNER). Default: $HIVE_MAX_RUNNING")
+    ps.add_argument("--allow-slow", dest="allow_slow", action="store_true", default=None,
+                    help="May run on a SLOW node (CUDA takes minutes to initialise there, "
+                         "then runs normally). Default: yes when --est-runtime is 1h or more")
+    ps.add_argument("--no-slow", dest="allow_slow", action="store_false",
+                    help="Never run on a slow node, however long the task")
     ps.add_argument("--timeout", metavar="DUR",
                     help="Kill the task after this much RUN time (2h, 90m, 1-12:00:00). "
                          "It ends as failed with exit code 124 and is not retried")

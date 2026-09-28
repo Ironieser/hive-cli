@@ -79,7 +79,8 @@ _CUDA_FAULT_RE = re.compile("|".join(f"(?:{p})" for p in CUDA_FAULT_PATTERNS))
 # `CUDA_PROBE fail <where>=<code>` or `CUDA_PROBE unknown <why>` (can't tell — never
 # treated as a fault). Verified live: healthy node → ok; evc43 → cuCtxCreate=999.
 CUDA_PROBE_PY = r'''
-import ctypes, sys
+import ctypes, sys, time
+_t0 = time.time()
 try:
     lib = ctypes.CDLL("libcuda.so.1")
 except OSError:
@@ -94,7 +95,7 @@ ctx = ctypes.c_void_p(); r = lib.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev)
 if r: print(f"CUDA_PROBE fail cuCtxCreate={r}"); sys.exit(0)
 p = ctypes.c_void_p(); r = lib.cuMemAlloc_v2(ctypes.byref(p), ctypes.c_size_t(1 << 20))
 lib.cuCtxDestroy_v2(ctx)
-print("CUDA_PROBE ok" if r == 0 else f"CUDA_PROBE fail cuMemAlloc={r}")
+print(f"CUDA_PROBE ok secs={time.time() - _t0:.0f}" if r == 0 else f"CUDA_PROBE fail cuMemAlloc={r}")
 '''.strip("\n")
 
 CUDA_MARKER = "---CUDA---"
@@ -174,7 +175,7 @@ def parse_gpu_query(lines):
     return csv, granted, fault
 
 
-def cuda_probe_shell():
+def cuda_probe_shell(deadline=None):
     """Shell snippet that runs CUDA_PROBE_PY on the node. Uses the interpreter this
     process runs (a shared-FS conda env is visible on compute nodes) and falls back to
     the node's python3; a missing interpreter yields `unknown`, never `fail`.
@@ -190,7 +191,9 @@ def cuda_probe_shell():
     # task would pay that, so it is reported as a failure (`cuda_init_slow`), and the
     # 3-minute wait is not spent holding queue.lock.
     py = shlex.quote(sys.executable or "python3")
-    ticks = max(1, int(float(os.environ.get("HIVE_CUDA_PROBE_DEADLINE", CUDA_INIT_DEADLINE)) * 2))
+    if deadline is None:
+        deadline = float(os.environ.get("HIVE_CUDA_PROBE_DEADLINE", CUDA_INIT_DEADLINE))
+    ticks = max(1, int(float(deadline) * 2))
     return (f"PY={py}; [ -x \"$PY\" ] || PY=python3; "
             '_c=$(mktemp 2>/dev/null || echo "/tmp/hive_cudap.$$"); '
             "( \"$PY\" - >\"$_c\" 2>/dev/null <<'HIVE_CUDA_PROBE_EOF'\n"
@@ -234,14 +237,21 @@ def cuda_probe(slurm_jobid, timeout=CUDA_PROBE_TIMEOUT):
     return parse_cuda_probe((out.stdout or "").splitlines())
 
 
-def full_probe_shell():
+def full_probe_shell(cuda_deadline=None, skip_cuda=False):
     """The whole verify probe — guarded GPU query, then the CUDA-context probe (skipped
     when the query hung: it would block in the same driver call). One definition for
     verify-before-dispatch, the periodic check and the canary job."""
     return (gpu_query_shell()
             + f"echo {CUDA_MARKER}; "
             + 'if [ -n "$_HIVE_GPU_HUNG" ]; then echo "CUDA_PROBE unknown gpu_hung"; else\n'
-            + cuda_probe_shell() + "\nfi")
+            + ("echo 'CUDA_PROBE unknown skipped'" if skip_cuda else cuda_probe_shell(cuda_deadline))
+            + "\nfi")
+
+
+def cuda_secs(detail):
+    """Seconds the CUDA context took, from an `ok secs=N` detail; None if not stated."""
+    m = re.search(r"secs=(\d+)", detail or "")
+    return int(m.group(1)) if m else None
 
 
 def parse_full_probe(text):
@@ -552,6 +562,49 @@ def save(data):
     os.replace(tmp, HEALTH_FILE)
 
 
+# ── Slow nodes ───────────────────────────────────────────────────────────────
+# Some nodes are not broken, only slow to start: evc48 (2026-09-28) needed 146 s from
+# `torch.cuda.init()` to the first tensor — evc104 needs 4 — and then ran at a steady
+# rate. Useless for a two-minute debug run, fine for a six-hour training. Such a node
+# is `slow`, not `quarantined`: it takes tasks that said they can live with it
+# (`--allow-slow`, or a runtime estimate of SLOW_OK_MIN_EST_SECS or more) and only
+# after every faster node was considered.
+SLOW_CUDA_DEADLINE   = 300     # the periodic check waits this long for a context
+SLOW_OK_MIN_EST_SECS = 3600    # est. runtime from which a slow start stops mattering
+
+
+def slow_nodes(data=None):
+    data = data if data is not None else load()
+    return {n for n, r in data.get("nodes", {}).items() if r.get("state") == "slow"}
+
+
+def mark_slow(data, node, secs):
+    """`node` works but needs `secs` to create a CUDA context. Returns True if this
+    changed its state."""
+    rec = _rec(data, node)
+    was = rec.get("state")
+    rec.update({"state": "slow", "slow_init_secs": int(secs), "ok_streak": 0, "strikes": 0,
+                "reason": f"slow CUDA init: {int(secs)}s (a healthy node needs <10s)"})
+    rec["last_check"] = time.time()
+    rec["last_result"] = f"slow: init {int(secs)}s"
+    if was != "slow":
+        rec["since"] = time.time()
+        _hist(rec, "slow", secs=int(secs))
+    return was != "slow"
+
+
+def task_accepts_slow(task):
+    """Whether a task may be placed on a slow node: an explicit `allow_slow` wins,
+    otherwise a runtime estimate of at least SLOW_OK_MIN_EST_SECS."""
+    allow = task.get("allow_slow")
+    if allow is not None:
+        return bool(allow)
+    try:
+        return int(task.get("est_runtime_secs") or 0) >= SLOW_OK_MIN_EST_SECS
+    except (TypeError, ValueError):
+        return False
+
+
 def quarantined_nodes(data=None):
     """Set of node names currently quarantined."""
     data = data if data is not None else load()
@@ -626,6 +679,18 @@ def record_check(data, node, verdict, detail=""):
         return None
     rec["last_result"] = verdict if verdict == "ok" else f"{verdict}: {detail}"
     _hist(rec, "check", result=rec["last_result"])
+    if rec.get("state") == "slow":
+        # ok here means a context in normal time (the caller sends slow ones to
+        # mark_slow), so the node got better; a failure means it got worse.
+        if verdict == "ok":
+            rec["ok_streak"] = int(rec.get("ok_streak", 0)) + 1
+            if rec["ok_streak"] >= HEALTH_OK_STREAK:
+                release(data, node, f"{HEALTH_OK_STREAK} consecutive healthy CUDA probes", "auto")
+                return "released"
+        elif verdict == "fail":
+            quarantine(data, node, f"CUDA probe failed: {detail}", "auto")
+            return "quarantined"
+        return None
     if rec.get("state") != "quarantined":
         return None
     if verdict == "ok":
@@ -644,5 +709,5 @@ def record_check(data, node, verdict, detail=""):
 
 def due_for_check(rec, now=None):
     now = now if now is not None else time.time()
-    return rec.get("state") == "quarantined" and \
+    return rec.get("state") in ("quarantined", "slow") and \
         (now - float(rec.get("last_check") or 0)) >= HEALTH_CHECK_SECS

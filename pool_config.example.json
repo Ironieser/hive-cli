@@ -3,6 +3,7 @@
   "default": "normal",
   "exclude": "",
   "health_canary": true,
+  "prefer_partitions": [],
   "presets": {
     "normal": {
       "script": "~/1_normal_gpu.slurm",

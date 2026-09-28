@@ -15,6 +15,7 @@
 | `hive wait` prints ⚠ re-dispatched | — | node reclaimed mid-run; the new run started from scratch — make the command resume from its checkpoint |
 | `hive list` shows RUNNING for hours but the log has a `finished` footer | `hive queue daemon status` | scheduler died before reaping. `hive list` / `hive wait` restart it by themselves when tasks are active; otherwise `hive queue daemon start` |
 | Node shows `PFAIL` | `hive poll` | probe failed; `probe_detail` in `node_monitor.json` says why (`srun_failed` = couldn't run, `gpu_unresponsive` / `no_gpu_devices` = broken node). hive still verifies before dispatch |
+| Node shows `SLOW` | `hive health` | works, but CUDA needs minutes to initialise. Takes long tasks (`--est-runtime` ≥ 1h) or `--allow-slow`, after every faster node. A task there is silent for minutes at start-up — that is not a hang (the log header says so). Becomes normal again after 2 checks at normal speed |
 | Node shows `QUAR` | `hive health` | quarantined; auto-released after 2 healthy probes, or `hive health clear NODE` |
 | Quarantined node with no hold job on it | `hive health` RESULT column | the health monitor takes over: released when SLURM reports the node **rebooted** since the quarantine, or when a `hive_canary` job (10 min, 1 GPU, every 6 h, pinned to the node) probes healthy twice. `canary_pending` = waiting in the SLURM queue. Don't cancel `hive_canary` jobs |
 | Node shows `CLAIM` with 0 % GPU | — | normal: a task is in cold import / model load; the slot is taken |

@@ -52,6 +52,7 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--after ID,ID` | pipeline: run only after those tasks ended done (fails with them, exit 125). `--after-any` = whatever their outcome |
 | `--array 0-9%4` | sweep: one task per index (`$HIVE_ARRAY_INDEX`, single-quote the command), at most 4 at once. `hive wait --array ID`, `hive cancel --array ID` |
 | `--max-running N` | don't take more than N nodes at once for this owner |
+| `--allow-slow` | accept a SLOW node (CUDA init takes minutes there, then normal speed). Automatic for `--est-runtime` ≥ 1h; `--no-slow` to refuse. Give long training / serving jobs an estimate so they use these nodes and leave the fast ones for short runs |
 | `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
 | `--priority N` | higher dispatches first |

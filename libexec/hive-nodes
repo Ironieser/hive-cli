@@ -219,11 +219,13 @@ health_path = sys.argv[3] if len(sys.argv) > 3 else None
 
 # Quarantined physical nodes (hive health / scheduler auto-quarantine)
 quarantined = set()
+slow = set()      # usable, but CUDA takes minutes to initialise: long tasks only
 if health_path:
     try:
         with open(health_path) as _hf:
-            quarantined = {n for n, r in json.load(_hf).get("nodes", {}).items()
-                           if r.get("state") == "quarantined"}
+            _hn = json.load(_hf).get("nodes", {})
+        quarantined = {n for n, r in _hn.items() if r.get("state") == "quarantined"}
+        slow = {n for n, r in _hn.items() if r.get("state") == "slow"}
     except Exception:
         pass
 
@@ -353,6 +355,8 @@ for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
     # keeps BUSY/CLAIM so the operator can see it.
     if node in quarantined and status not in ("busy", "claimed"):
         status = "quarantined"
+    elif node in slow and status not in ("busy", "claimed"):
+        status = "slow"
 
     if len(task_cmd) > 55:
         task_cmd = task_cmd[:54] + "…"
@@ -435,7 +439,7 @@ show_table() {
     printf "${NC}\n"
     printf "  %s\n" "$SEP"
 
-    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0 n_warn=0 n_claim=0 n_quar=0
+    local n_busy=0 n_cpu=0 n_idle=0 n_pfail=0 n_warn=0 n_claim=0 n_quar=0 n_slow=0
 
     for row in "${rows[@]}"; do
         IFS=$'\t' read -r jobid node part elapsed status gpu_util mem_str left job_stale task_cmd <<< "$row"
@@ -453,6 +457,11 @@ show_table() {
             # scheduler's periodic CUDA probe. `hive health` for details.
             status_upper="QUAR ";   status_color="${RED}${BOLD}"
             n_quar=$(( n_quar + 1 ))
+        elif [[ "$status" == "slow" ]]; then
+            # Works, but CUDA needs minutes to initialise: takes --allow-slow / long
+            # tasks only, after every faster node. `hive health` for details.
+            status_upper="SLOW ";   status_color="${YELLOW}"
+            n_slow=$(( n_slow + 1 ))
         elif [[ "$status" == "cpu" ]]; then
             status_upper="CPU  ";   status_color="${CYAN}${BOLD}"
             n_cpu=$(( n_cpu + 1 ))
@@ -525,7 +534,8 @@ show_table() {
     (( n_warn > 0 ))  && summary+="$(printf "${BOLD}   warn: ${YELLOW}%d${NC}" "$n_warn")"
     (( n_pfail > 0 )) && summary+="$(printf "${BOLD}   probe-fail: ${RED}%d${NC}" "$n_pfail")"
     (( n_quar > 0 ))  && summary+="$(printf "${BOLD}   quarantined: ${RED}%d${NC}" "$n_quar")"
-    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_claim + n_cpu + n_idle + n_pfail + n_warn + n_quar ))")"
+    (( n_slow > 0 ))  && summary+="$(printf "${BOLD}   slow: ${YELLOW}%d${NC}" "$n_slow")"
+    summary+="$(printf "${BOLD}   total: %d${NC}" "$(( n_busy + n_claim + n_cpu + n_idle + n_pfail + n_warn + n_quar + n_slow ))")"
     printf "%s\n" "$summary"
 }
 

@@ -579,7 +579,7 @@ sys.executable = _exe; os.environ.pop("HIVE_CUDA_PROBE_DEADLINE"); os.environ["H
 print("== probe backoff / pending reasons / starvation backoff ==")
 reset_health(); reset_sched_state()
 _real_probe, _calls = hs.live_probe, []
-hs.live_probe = lambda jid: (_calls.append(jid), {"ok": False})[1]      # srun can't run
+hs.live_probe = lambda jid, **kw: (_calls.append(jid), {"ok": False})[1]   # srun cannot run
 wdb({"700": node("silent", 72000)})
 wq({"140": task(140, name="b1"), "141": task(141, name="b2", sub=loc(1))})
 hs.run_one_cycle(); hs.run_one_cycle()
@@ -876,6 +876,76 @@ chk("hive stats shows GPU peak (P90) and mean util", "GPU-PEAK" in _buf.getvalue
 open(ev.EVENTS_FILE, "w").close(); wq({})
 reset_health(); reset_sched_state()
 
+print("== slow nodes: usable for long tasks, after every faster node ==")
+reset_health(); reset_sched_state()
+open(ev.EVENTS_FILE, "w").close()
+chk("probe detail carries the init time", hh.cuda_secs("secs=146") == 146 and hh.cuda_secs("") is None)
+chk("task_accepts_slow: explicit flag wins, else est >= 1h",
+    hh.task_accepts_slow({"allow_slow": True}) and not hh.task_accepts_slow({"allow_slow": False, "est_runtime_secs": 99999})
+    and hh.task_accepts_slow({"est_runtime_secs": 3600}) and not hh.task_accepts_slow({"est_runtime_secs": 3599})
+    and not hh.task_accepts_slow({}))
+# quarantined for cuda_init_slow; the periodic check finds the context IS created, slowly
+d = hh.load(); hh.quarantine(d, "slown", "CUDA probe failed: cuda_init_slow", "verify")
+d["nodes"]["slown"].update(since=time.time() - 7200, until=time.time() - 3600, last_check=0); hh.save(d)
+_real_hp = hs.health_probe
+hs.health_probe = lambda jid: ("ok", "secs=146")
+wdb({"700": node("slown", 72000)}); wq({})
+hs.run_one_cycle()
+r = hh.load()["nodes"]["slown"]
+chk("context created in 146s -> state slow, not quarantined",
+    r["state"] == "slow" and r["slow_init_secs"] == 146 and hh.quarantined_nodes() == set())
+chk("slow event recorded", any(e["event"] == "slow" and e.get("node") == "slown" for e in ev.iter_events()))
+# placement
+hs.health_probe = _real_hp
+d = hh.load(); d["nodes"]["slown"]["last_check"] = time.time(); hh.save(d)
+wdb({"700": node("slown", 72000)})
+wq({"260": dict(task(260, name="quick"), cmd="true"),
+    "261": dict(task(261, name="long", est=7200, sub=loc(1)), cmd="true")})
+_probes = []
+_real_lp = hs.live_probe
+def _spy(jid, **kw):
+    _probes.append(kw); return _real_lp(jid, **kw)
+hs.live_probe = _spy
+hs.run_one_cycle(); time.sleep(0.4)
+q = rq()
+chk("short task is held off the slow node (node_slow)",
+    q["260"]["state"] == "pending" and q["260"].get("pending_reason") == "node_slow")
+chk("long task (est 2h) takes it", q["261"].get("node") == "slown")
+chk("verify on a slow node skips the CUDA probe", _probes and _probes[-1].get("skip_cuda") is True)
+chk("its log warns about the slow start", "is a SLOW node" in open(q["261"]["log"]).read())
+hs.live_probe = _real_lp
+# --allow-slow / --no-slow
+wdb({"700": node("slown", 72000)})
+wq({"262": dict(task(262, name="optin"), cmd="true", allow_slow=True),
+    "263": dict(task(263, name="optout", est=99999, sub=loc(1)), cmd="true", allow_slow=False)})
+hs.run_one_cycle(); time.sleep(0.4)
+chk("--allow-slow places a short task; --no-slow holds a long one",
+    rq()["262"].get("node") == "slown" and rq()["263"]["state"] == "pending")
+# fast node preferred even for a task that accepts slow
+wdb({"700": node("slown", 72000), "701": node("fastn", 72000)})
+wq({"264": dict(task(264, name="pick", est=7200), cmd="true")})
+hs.run_one_cycle(); time.sleep(0.4)
+chk("a fast node is used before a slow one", rq()["264"].get("node") == "fastn")
+# partition preference
+json.dump({"prefer_partitions": ["highgpu"]}, open(os.path.join(hs.HIVE_DIR, "pool_config.json"), "w"))
+wdb({"700": dict(node("n_norm", 72000), partition="normal"), "701": dict(node("n_high", 72000), partition="highgpu")})
+wq({"265": dict(task(265, name="pref"), cmd="true")})
+hs.run_one_cycle(); time.sleep(0.4)
+chk("prefer_partitions decides between equally good nodes", rq()["265"].get("node") == "n_high")
+os.remove(os.path.join(hs.HIVE_DIR, "pool_config.json"))
+# a slow node recovers, or gets worse
+hs.health_probe = lambda jid: ("ok", "secs=3")
+for _ in range(2):
+    d = hh.load(); d["nodes"]["slown"]["last_check"] = 0; hh.save(d)
+    wdb({"700": node("slown", 72000)}); wq({}); hs.run_one_cycle()
+chk("two checks at normal speed -> released", hh.load()["nodes"]["slown"]["state"] == "ok")
+d = hh.load(); hh.mark_slow(d, "slown", 150); d["nodes"]["slown"]["last_check"] = 0; hh.save(d)
+hs.health_probe = lambda jid: ("fail", "gpu_unresponsive")
+hs.run_one_cycle()
+chk("a slow node that stops answering is quarantined", hh.load()["nodes"]["slown"]["state"] == "quarantined")
+hs.health_probe = _real_hp
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({})
+
 print("== queued hold jobs learn about nodes quarantined after they were submitted ==")
 reset_health(); reset_sched_state()
 _upd = os.path.join(hs.HIVE_DIR, "mock_scontrol_update.log")
@@ -938,7 +1008,7 @@ chk("parse_id_list", hq.parse_id_list("12, 13 14,12") == [12, 13, 14] and _bad(h
 def _ns(**kw):
     base = dict(cmd_or_file="true", workdir=None, priority=None, name=None, owner=None, need_mb=None,
                 gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
-                after_any=None, array=None, max_running=None)
+                after_any=None, array=None, max_running=None, allow_slow=None)
     base.update(kw); return __import__("argparse").Namespace(**base)
 def _submit3(**kw):
     buf = _io.StringIO()
@@ -1033,6 +1103,11 @@ chk("--max-running 1: one task of that owner runs, the other owner is unaffected
     [q[k]["state"] for k in ("240", "241", "242", "243")] == ["running", "pending", "pending", "running"]
     and q["241"].get("pending_reason") == "owner_limit")
 chk("--max-running without an owner is refused", _exits(hq.cmd_submit, _ns(max_running=2)) == 2)
+_submit3(name="s1", allow_slow=True); _a = max(rq().values(), key=lambda t: t["id"])["allow_slow"]
+_submit3(name="s2"); _b = max(rq().values(), key=lambda t: t["id"])["allow_slow"]
+chk("--allow-slow stored; unset stays None (decided from the estimate)", _a is True and _b is None)
+for t in list(rq().values()):
+    if t["name"] in ("s1", "s2"): _exits(hq.cmd_cancel, _ap.Namespace(id=t["id"], array=None))
 for k in ("240", "243"): _exits(hq.cmd_cancel, _ap.Namespace(id=int(k), array=None))
 hs.run_one_cycle()
 

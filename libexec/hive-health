@@ -82,8 +82,8 @@ def cmd_list(args):
     for node in sorted(nodes):
         r = nodes[node]
         st = r.get("state", "ok")
-        col = C_RED if st == "quarantined" else C_GREEN
-        label = "QUARANTINED" if st == "quarantined" else "ok"
+        col = C_RED if st == "quarantined" else (C_YELLOW if st == "slow" else C_GREEN)
+        label = {"quarantined": "QUARANTINED", "slow": "SLOW"}.get(st, "ok")
         print(f"  {node:<10} {col}{label:<12}{C_RESET} {r.get('strikes', 0):>7}  "
               f"{_ago(r.get('last_check')):<14} {(r.get('last_result') or '—')[:24]:<24} "
               f"{(r.get('reason') or r.get('release_reason') or '')[:60]}")

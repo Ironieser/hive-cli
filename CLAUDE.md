@@ -181,6 +181,15 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   (background thread) adds the new nodes to `ExcNodeList` of the user's PENDING hold
   jobs via `scontrol update`. A hold job is recognised by its stdout being under
   `pool-logs/`; jobs submitted any other way are never modified. Add-only.
+- **`slow` is a third node state, between ok and quarantined.** A node whose CUDA
+  context is created, but in more than `CUDA_INIT_DEADLINE`, is `slow`
+  (`hh.mark_slow`): it takes only tasks for which `hh.task_accepts_slow()` holds
+  (`allow_slow`, else `est_runtime_secs` ≥ 1 h) — a task-level rejection, `node_slow` —
+  and candidates are sorted so slow nodes come last, then by `prefer_partitions`.
+  Verify-before-dispatch has a 60 s CUDA deadline and therefore quarantines such a node
+  first; it is the periodic check, which waits `SLOW_CUDA_DEADLINE`, that finds the
+  context does get created and reclassifies it. Verify on a slow node skips the CUDA
+  probe. `pool add` does not exclude slow nodes.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward
