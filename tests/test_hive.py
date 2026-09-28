@@ -2012,49 +2012,127 @@ hs.live_probe = _lpR
 _rc(hq.cmd_submit, _nsR(name="pp", preempt=True, preemptible=True))
 chk("--preempt / --preemptible stored", _new()["preempt"] is True and _new()["preemptible"] is True)
 
-# B1 — autoscale
+# B1 — autoscale. It counts hold jobs by asking SLURM, and does nothing when unsure.
 C = {"preset": "highgpu", "min_nodes": 4, "max_nodes": 6, "time": "7-00:00:00",
-     "renew_before": 12 * 3600, "until": None}
-def J(n, left=500000, nodes=None, **kw):
-    return {str(700 + i): dict(node((nodes or [f"n{i}"] * n)[i] if nodes else f"n{i}", left), **kw)
-            for i in range(n)}
-chk("enough usable nodes -> nothing", hauto.plan(C, J(4), 0, 0, set(), [])[0] == 0)
-chk("two short -> two submitted", hauto.plan(C, J(2), 0, 0, set(), [])[0] == 2)
-chk("at most MAX_PER_RUN at a time", hauto.plan(C, {}, 0, 0, set(), [])[0] == hauto.MAX_PER_RUN)
-chk("queued hold jobs count as on their way", hauto.plan(C, J(2), 0, 2, set(), [])[0] == 0)
+     "renew_before": 12 * 3600, "until": "2099-01-01"}
+def HJ(n, left=500000, state="RUNNING", nodes=None, first=6000):
+    return [{"jid": str(first + i), "state": state, "node": (nodes[i] if nodes else f"n{i}"),
+             "left": left} for i in range(n)]
+chk("enough usable nodes -> nothing", hauto.plan(C, HJ(4), set(), [])[0] == 0)
+chk("two short -> two submitted", hauto.plan(C, HJ(2), set(), [])[0] == 2)
+chk("at most MAX_PER_RUN at a time", hauto.plan(C, [], set(), [])[0] == hauto.MAX_PER_RUN)
+chk("queued hold jobs count as on their way", hauto.plan(C, HJ(2) + HJ(2, state="PENDING", first=6010), set(), [])[0] == 0)
 chk("hold jobs about to expire are replaced before they do",
-    hauto.plan(C, J(4, left=6 * 3600), 0, 0, set(), [])[0] == 2)
-chk("...judged by the walltime left NOW, not when the DB was written",
-    hauto.plan(C, J(4, left=13 * 3600), 2 * 3600, 0, set(), [])[0] == 2)
+    hauto.plan(C, HJ(4, left=6 * 3600), set(), [])[0] == 2)
 chk("hold jobs on quarantined or slow nodes do not count as usable",
-    hauto.plan(C, J(4, nodes=["bad", "bad", "g1", "g2"]), 0, 0, {"bad"}, [])[0] == 2)
+    hauto.plan(C, HJ(4, nodes=["bad", "bad", "g1", "g2"]), {"bad"}, [])[0] == 2)
 chk("...but they do count towards max_nodes",
-    hauto.plan(C, J(6, nodes=["bad"] * 4 + ["g1", "g2"]), 0, 0, {"bad"}, [])[0] == 0)
-chk("daily limit", hauto.plan(C, {}, 0, 0, set(), [time.time() - 60] * hauto.MAX_PER_DAY)[0] == 0)
-chk("SLURM could not be asked -> nothing (never guess)", hauto.plan(C, {}, 0, None, set(), [])[0] == 0)
-json.dump({"autoscale": {"enabled": False, "min_nodes": 4, "preset": "highgpu"}}, open(_cfg, "w"))
-chk("off unless enabled", hauto.settings() is None)
-json.dump({"autoscale": {"enabled": True, "min_nodes": 4, "preset": "highgpu", "until": "2020-01-01"}}, open(_cfg, "w"))
-chk("off after `until`", hauto.settings() is None)
-json.dump({"autoscale": {"enabled": True, "min_nodes": 4, "max_nodes": 2, "preset": "highgpu"}}, open(_cfg, "w"))
-chk("off when max_nodes < min_nodes", hauto.settings() is None)
-json.dump({"default": "normal", "presets": {"highgpu": {"script": os.path.join(hs.HIVE_DIR, "hold.slurm")}},
-           "autoscale": {"enabled": True, "min_nodes": 3, "max_nodes": 5, "preset": "highgpu",
-                         "time": "7-00:00:00", "renew_before": "12h", "until": "2099-01-01"}}, open(_cfg, "w"))
+    hauto.plan(C, HJ(6, nodes=["bad"] * 4 + ["g1", "g2"]), {"bad"}, [])[0] == 0)
+chk("daily limit", hauto.plan(C, [], set(), [time.time() - 60] * hauto.MAX_PER_DAY)[0] == 0)
+chk("SLURM could not be asked -> nothing (never guess)", hauto.plan(C, None, set(), [])[0] == 0)
+
+def acfg(**kw):
+    a = {"enabled": True, "min_nodes": 3, "max_nodes": 5, "preset": "highgpu", "time": "7-00:00:00",
+         "renew_before": "12h", "until": "2099-01-01"}
+    a.update(kw); a = {k: v for k, v in a.items() if v is not None}
+    json.dump({"default": "normal", "presets": {"highgpu": {"script": os.path.join(hs.HIVE_DIR, "hold.slurm")}},
+               "autoscale": a}, open(_cfg, "w"))
 open(os.path.join(hs.HIVE_DIR, "hold.slurm"), "w").write("#!/bin/bash\n#SBATCH -p highgpu\nsleep 1\n")
-for f in ("mock_sbatch.log", "autoscale_state.json"):
-    try: os.remove(os.path.join(hs.HIVE_DIR, f))
-    except OSError: pass
-_n, _why = hauto.run(J(1), 0, set())
-_sb = open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read().splitlines()
+chk("a valid block is on", (acfg(), hauto.settings())[1] is not None)
+for bad, what in (({"enabled": "false"}, 'enabled "false" (a string)'), ({"enabled": "true"}, 'enabled "true" (a string)'),
+                  ({"enabled": 1}, "enabled 1"), ({"enabled": False}, "enabled false"),
+                  ({"until": "2020-01-01"}, "until in the past"), ({"until": None}, "no until"),
+                  ({"until": "next year"}, "unreadable until"), ({"max_nodes": 2}, "max_nodes < min_nodes"),
+                  ({"max_nodes": 100000}, "max_nodes 100000"), ({"min_nodes": 0}, "min_nodes 0"),
+                  ({"min_nodes": "4"}, 'min_nodes "4"'), ({"renew_before": "-5h"}, "negative renew_before"),
+                  ({"renew_before": "30d"}, "renew_before longer than the walltime"),
+                  ({"preset": "nosuch"}, "unknown preset"), ({"time": "a week"}, "unreadable time")):
+    acfg(**bad)
+    chk(f"off: {what}", hauto.settings() is None and hauto.check_settings()[1])
+acfg(max_nodes=None)
+chk("max_nodes defaults to min_nodes + 2, so that expiring hold jobs can be replaced",
+    hauto.settings()["max_nodes"] == 5)
+
+_hold = os.path.join(hs.HIVE_DIR, "mock_hold_jobs")
+def fresh(jobs=""):
+    for f in ("mock_sbatch.log", "autoscale_state.json", "mock_sbatch_n", "mock_squeue_fail",
+              "mock_sbatch_fail", "mock_sbatch_slow"):
+        path = os.path.join(hs.HIVE_DIR, f)
+        if os.path.isdir(path): os.rmdir(path)
+        elif os.path.exists(path): os.remove(path)
+    open(_hold, "w").write(jobs)
+    hauto._mem.update(last_run=0.0, submitted=[])
+def real_submits():
+    try:
+        return [l for l in open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read().splitlines()
+                if "--test-only" not in l and "hive_canary" not in l]
+    except OSError:
+        return []
+acfg(); fresh("6000|RUNNING|6-00:00:00|n0\n")
+_n, _why = hauto.run(set())
 chk("run(): submits through hive pool add, with the configured time",
-    _n == 2 and sum(1 for l in _sb if "--test-only" not in l) == 2 and all("--time 7-00:00:00" in l for l in _sb))
-chk("...and not again before EVERY_SECS", hauto.run(J(1), 0, set()) == (0, "not due"))
-chk("what it did is kept", len(hauto.load_state().get("submitted", [])) == 2)
-os.remove(_cfg)
-for f in ("mock_sbatch.log", "autoscale_state.json", "hold.slurm"):
-    try: os.remove(os.path.join(hs.HIVE_DIR, f))
-    except OSError: pass
+    _n == 2 and len(real_submits()) == 2 and all("--time 7-00:00:00" in l for l in real_submits()))
+chk("...and not again before EVERY_SECS", hauto.run(set())[0] == 0 and len(real_submits()) == 2)
+chk("what it did is kept", len(hauto.load_state()["submitted"]) == 2)
+# the poller is irrelevant: hold jobs are counted from SLURM, the user's other jobs are not
+fresh("6000|RUNNING|6-00:00:00|n0\n6001|RUNNING|6-00:00:00|n1\n6002|RUNNING|6-00:00:00|n2\n"
+      "777|RUNNING|1-00:00:00|n9\n778|RUNNING|1-00:00:00|n9\n")
+wdb({})                                                          # node DB empty (poller down)
+chk("three hold jobs running, node DB empty: nothing is submitted", hauto.run(set())[0] == 0 and real_submits() == [])
+chk("jobs that are not hold jobs are not counted",
+    [j["jid"] for j in hauto.observe()] == ["6000", "6001", "6002"])
+# max_nodes holds over days, with a dead poller
+fresh("")
+_t = time.time(); _tot = 0
+for k in range(3 * 144):                                         # 3 days, a decision every 10 min
+    _tot += hauto.run(set(), now=_t + k * 600)[0]
+chk("three days of decisions: min_nodes are submitted and then no more",
+    _tot == 3 and len(real_submits()) == 3)
+# the hold jobs started, the poller never noticed, and they are about to expire
+open(_hold, "w").write("".join(f"{6100 + i}|RUNNING|1:00:00|n{i}\n" for i in range(1, 4)))
+hauto._mem.update(last_run=0.0); _tot = 0
+for k in range(3 * 144):
+    _tot += hauto.run(set(), now=_t + 86400 * 4 + k * 600)[0]
+chk("replacements stop at max_nodes (5 in total), however long it runs",
+    _tot == 2 and len(open(_hold).read().splitlines()) == 5)
+# SLURM down
+fresh(""); open(os.path.join(hs.HIVE_DIR, "mock_squeue_fail"), "w").write("1")
+chk("SLURM cannot be asked -> nothing submitted", hauto.run(set())[0] == 0 and real_submits() == [])
+# the state file
+fresh(""); os.mkdir(os.path.join(hs.HIVE_DIR, "autoscale_state.json"))        # cannot be written
+_tot = sum(hauto.run(set(), now=time.time() + k * 600)[0] for k in range(20))
+chk("state file cannot be written -> nothing is submitted, ever", _tot == 0 and real_submits() == [])
+fresh(""); open(os.path.join(hs.HIVE_DIR, "autoscale_state.json"), "w").write("{trunc")
+chk("state file corrupt -> nothing is submitted", hauto.run(set())[0] == 0 and real_submits() == [])
+fresh(""); json.dump({"last_run": "yesterday", "submitted": []}, open(os.path.join(hs.HIVE_DIR, "autoscale_state.json"), "w"))
+chk("state file with nonsense in it -> nothing is submitted", hauto.run(set())[0] == 0 and real_submits() == [])
+# the limits are also kept in memory
+fresh(""); hauto.run(set())
+os.remove(os.path.join(hs.HIVE_DIR, "autoscale_state.json"))
+chk("state file deleted between two decisions: the 10 minutes still hold",
+    hauto.run(set())[0] == 0 and len(real_submits()) == 2)
+# hive pool add fails, or is killed after it submitted
+fresh(""); open(os.path.join(hs.HIVE_DIR, "mock_sbatch_fail"), "w").write("1")
+_n, _why = hauto.run(set())
+chk("sbatch refuses: nothing submitted, said so", _n == 0 and "hive pool add" in _why)
+chk("...and the next try is a decision later, not a cycle later", hauto.run(set(), now=time.time() + 30)[0] == 0)
+fresh(""); open(os.path.join(hs.HIVE_DIR, "mock_sbatch_slow"), "w").write("1.5")
+_st, hauto.SUBMIT_TIMEOUT = hauto.SUBMIT_TIMEOUT, 2.2
+_n, _why = hauto.run(set()); time.sleep(2.0)
+hauto.SUBMIT_TIMEOUT = _st
+chk("hive pool add killed by the timeout after it had submitted: the job is counted",
+    len(hauto.load_state()["submitted"]) >= 1 and len(hauto.load_state()["submitted"]) >= len(real_submits()) - 1)
+# the status command says what the scheduler would do
+acfg(); fresh("6000|RUNNING|6-00:00:00|n0\n")
+_c, _o = _rc(hp2.cmd_autoscale, None)
+chk("hive pool autoscale: same figures as the scheduler's decision",
+    "would submit 2" in _o and "1 usable of 3 wanted" in _o and "1 running" in _o)
+acfg(enabled="false")
+_c, _o = _rc(hp2.cmd_autoscale, None)
+chk("...and why it is off", "off" in _o and "enabled" in _o)
+os.remove(_cfg); fresh(""); os.remove(_hold)
+try: os.remove(os.path.join(hs.HIVE_DIR, "hold.slurm"))
+except OSError: pass
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
 
 print("== a dead scheduler is restarted by list / wait (feedback #18/#19) ==")

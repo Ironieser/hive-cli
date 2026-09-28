@@ -32,6 +32,11 @@ cat > "$TMP/bin/squeue" <<'EOF'
 # a 20h TimeLeft, in either the poll (%i|...|%L) or daemon (%i|...|%L|%j) format.
 jid=""; prev=""
 for a in "$@"; do [[ "$prev" == "-j" ]] && jid="$a"; prev="$a"; done
+# every hold job of the user, running or queued (`-t R,PD`, autoscale): the lines of
+# $HIVE_DIR/mock_hold_jobs, "jid|STATE|LEFT|NODE"; $HIVE_DIR/mock_squeue_fail = SLURM down
+if [[ "$*" == *"-t R,PD"* ]]; then
+  [[ -e "$HIVE_DIR/mock_squeue_fail" ]] && exit 1
+  cat "$HIVE_DIR/mock_hold_jobs" 2>/dev/null; exit 0; fi
 # pending jobs of the user (`-t PD`): two queued hold jobs and one foreign job
 if [[ "$*" == *"-t PD"* ]]; then
   [[ -e "$HIVE_DIR/mock_pending" ]] && printf '5001\n5002\n5003\n'; exit 0; fi
@@ -59,6 +64,7 @@ if [[ "$1 $2" == "show job" ]]; then
   case "$3" in
     5001) exc="evc[1-3]"; out="$HIVE_DIR/pool-logs/slurm-5001.out";;
     5002) exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-5002.out";;
+    6*)   exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-$3.out";;        # hold jobs of the autoscale tests
     *)    exc="(null)";   out="/somewhere/else/slurm-$3.out";;        # not a hold job
   esac
   printf 'JobId=%s JobName=hold\n   ExcNodeList=%s\n   StdOut=%s\n' "$3" "$exc" "$out"; exit 0
@@ -76,11 +82,16 @@ cat > "$TMP/bin/sbatch" <<'EOF'
 echo "$*" >> "$HIVE_DIR/mock_sbatch.log"
 out=""; for a in "$@"; do [[ "$a" == --output=* ]] && out="${a#--output=}"; done
 [[ "$*" == *"--test-only"* ]] && exit 0
+[[ -e "$HIVE_DIR/mock_sbatch_slow" ]] && sleep "$(cat "$HIVE_DIR/mock_sbatch_slow")"
+[[ -e "$HIVE_DIR/mock_sbatch_fail" ]] && { echo "sbatch: error: Batch job submission failed" >&2; exit 1; }
 if [[ "$*" == *"hive_canary"* ]]; then
   SLURM_JOB_ID=4242 bash -s > "${out//%j/4242}" 2>&1 </dev/stdin
   echo 4242; exit 0
 fi
-echo "Submitted batch job 4300"
+# a submitted hold job shows up in squeue as queued, like the real thing
+n=$(( $(cat "$HIVE_DIR/mock_sbatch_n" 2>/dev/null || echo 6100) + 1 )); echo "$n" > "$HIVE_DIR/mock_sbatch_n"
+echo "$n|PENDING|7-00:00:00|" >> "$HIVE_DIR/mock_hold_jobs"
+echo "Submitted batch job $n"
 EOF
 cat > "$TMP/bin/scancel" <<'EOF'
 #!/usr/bin/env bash

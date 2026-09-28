@@ -326,41 +326,43 @@ def cmd_init(args):
 
 
 def cmd_autoscale(args):
-    """Show what pool autoscale is set to and what it would do now. It is switched on
-    and off in pool_config.json ("autoscale": {"enabled": …}); the scheduler acts on it."""
+    """Show what pool autoscale is set to and what the scheduler would do with it now —
+    through the same code the scheduler runs. It is switched on and off in
+    pool_config.json ("autoscale": {"enabled": …})."""
     import hive_autoscale as hauto
-    cfg = hauto.settings()
-    state = hauto.load_state()
+    cfg, off = hauto.check_settings()
     if cfg is None:
-        print(f"autoscale: {C_DIM}off{C_RESET}  (not enabled in {CONFIG_FILE}, incomplete, "
-              f"or past its `until`)")
-        print('  to switch it on, add e.g.  "autoscale": {"enabled": true, "preset": "highgpu",')
-        print('      "min_nodes": 6, "max_nodes": 8, "time": "7-00:00:00", "renew_before": "12h",')
-        print('      "until": "2026-12-31"}')
+        print(f"autoscale: {C_DIM}off{C_RESET} — {off}")
+        print('  to switch it on, add to ' + CONFIG_FILE + ':')
+        print('    "autoscale": {"enabled": true, "preset": "highgpu", "min_nodes": 6, "max_nodes": 8,')
+        print('                  "time": "7-00:00:00", "renew_before": "12h", "until": "2026-12-31"}')
         return
     print(f"autoscale: {C_GREEN}on{C_RESET}  preset {cfg['preset']}, keep {cfg['min_nodes']} usable, "
-          f"at most {cfg['max_nodes']} hold jobs, each {cfg['time'] or 'as in the script'}, "
-          f"replaced {int(cfg['renew_before'] // 3600)}h before it expires"
-          + (f", until {cfg['until']}" if cfg["until"] else ", with no end date"))
-    try:
-        with open(NODE_DB) as f:
-            db = json.load(f)
-        jobs = db.get("jobs", {})
-        from datetime import datetime, timezone
-        upd = datetime.fromisoformat(db.get("updated")).replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - upd).total_seconds()
-    except Exception:
-        jobs, age = {}, 0
+          f"at most {cfg['max_nodes']} hold jobs, each {cfg['time'] or 'as long as the script says'}, "
+          f"replaced {cfg['renew_before'] / 3600:g}h before it expires, until {cfg['until']}")
     health = hh.load()
-    pending = hh.pending_hold_jobs()
-    n, why = hauto.plan(cfg, jobs, age, None if pending is None else len(pending),
-                        hh.quarantined_nodes(health) | hh.slow_nodes(health),
-                        state.get("submitted") or [])
-    print(f"  now: would submit {n} — {why}")
-    day = [t for t in (state.get("submitted") or []) if __import__("time").time() - t < 86400]
+    unusable = hh.quarantined_nodes(health) | hh.slow_nodes(health)
+    state = hauto.load_state()
+    if state is None:
+        print(f"  {C_RED}{hauto.STATE_FILE} cannot be read — the scheduler submits nothing until "
+              f"it is repaired or removed{C_RESET}")
+        return
+    jobs = hauto.observe()
+    n, why = hauto.plan(cfg, jobs, unusable, state.get("submitted") or [])
+    if jobs is not None:
+        run_ = [j for j in jobs if j["state"] == "RUNNING"]
+        print(f"  hold jobs now: {len(run_)} running "
+              f"({sum(1 for j in run_ if j['node'] in unusable)} on a quarantined or slow node), "
+              f"{sum(1 for j in jobs if j['state'] == 'PENDING')} queued")
+    print(f"  at its next decision the scheduler would submit {n} — {why}")
+    import time as _t
+    due = hauto.EVERY_SECS - (_t.time() - float(state.get("last_run") or 0))
+    print(f"  next decision: {'now' if due <= 0 else f'in about {int(due)}s'} "
+          f"(one every {hauto.EVERY_SECS // 60} min, while the scheduler runs)")
+    day = [t for t in (state.get("submitted") or []) if _t.time() - t < 86400]
     print(f"  submitted by autoscale in the last 24 h: {len(day)} (limit {hauto.MAX_PER_DAY})")
     if state.get("last_decision"):
-        print(f"  last decision of the scheduler: {state['last_decision']}")
+        print(f"  last decision: {state['last_decision']}")
 
 
 def cmd_config(args):

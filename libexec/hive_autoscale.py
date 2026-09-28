@@ -9,16 +9,27 @@ empty again, tasks sat at `pool_empty`, and the agents went back to sbatch. With
 in pool_config.json the scheduler submits hold jobs (through `hive pool add`, so with
 its exclusions and log paths) whenever fewer than `min_nodes` are usable.
 
-  usable = running hold jobs that are not on a quarantined or slow node and have more
-           than `renew_before` of walltime left, plus the ones waiting in the SLURM queue
+  usable = hold jobs that run on a node that is neither quarantined nor slow and have
+           more than `renew_before` of walltime left, plus the ones still queued
 
-It spends allocation on its own, so it is bounded four ways: `max_nodes` hold jobs in
-total (running + queued, usable or not), MAX_PER_RUN per decision, MAX_PER_DAY per 24 h,
-and `until`, after which it stops by itself. `plan()` is pure; `run()` acts on it.
+It spends allocation with nobody watching, so it is built to do NOTHING whenever it is
+not sure:
+
+  * It counts hold jobs by asking SLURM (`observe`), never from the node DB — the DB
+    is empty when the poller is down and minutes behind when it is not, and both made
+    it submit past `max_nodes`. A hold job is a job of the user whose stdout is under
+    pool-logs/; the user's other jobs are not counted and not touched.
+  * If SLURM cannot be asked, if its own state file cannot be read or WRITTEN, or if
+    the configuration is not exactly valid, it submits nothing.
+  * What it is about to submit is written to the state file BEFORE it submits, and
+    also kept in memory, so no failure afterwards can make it forget.
+  * Bounds: `max_nodes` hold jobs in total (usable or not), MAX_PER_RUN per decision,
+    MAX_PER_DAY per 24 h, one decision per EVERY_SECS, and `until`, which is required.
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -31,64 +42,95 @@ HIVE_DIR   = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
 STATE_FILE = os.path.join(HIVE_DIR, "autoscale_state.json")
 POOL_BIN   = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hive-pool")
 
-EVERY_SECS   = 600
-MAX_PER_RUN  = 2
-MAX_PER_DAY  = 12
+EVERY_SECS     = 600
+MAX_PER_RUN    = 2
+MAX_PER_DAY    = 12
+MAX_NODES_CAP  = 64          # no configuration may ask for more hold jobs than this
 SUBMIT_TIMEOUT = 120
 
-
-def _secs(text, default):
-    """'12h' / '90m' / '2d' / '3600' → seconds."""
-    try:
-        text = str(text).strip().lower()
-        if text[-1:] in "smhd":
-            return float(text[:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[text[-1]]
-        return float(text)
-    except (ValueError, IndexError, TypeError):
-        return default
+# What this process did, whatever happens to the state file.
+_mem = {"last_run": 0.0, "submitted": []}
 
 
-def settings():
-    """The "autoscale" block of pool_config.json with defaults, or None if it is off,
-    incomplete, or past its `until`."""
+def _secs(text):
+    """'12h' / '90m' / '2d' / '3600' / '7-00:00:00' → seconds, or None."""
+    text = str(text).strip().lower()
+    m = re.fullmatch(r"(?:(\d+)-)?(\d+):(\d{2}):(\d{2})", text)
+    if m:
+        d, h, mi, s = (int(x or 0) for x in m.groups())
+        return d * 86400 + h * 3600 + mi * 60 + s
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text)
+    if not m:
+        return None
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def check_settings():
+    """(settings or None, why it is off). Anything that is not exactly valid is off:
+    `"enabled": "false"` used to switch it ON."""
     try:
         with open(os.path.join(HIVE_DIR, "pool_config.json")) as f:
             cfg = json.load(f)
-        a = cfg.get("autoscale") or {}
-    except (OSError, json.JSONDecodeError, AttributeError):
-        return None
-    if not a.get("enabled"):
-        return None
+    except (OSError, json.JSONDecodeError):
+        return None, "pool_config.json cannot be read"
+    a = cfg.get("autoscale") if isinstance(cfg, dict) else None
+    if not isinstance(a, dict):
+        return None, 'no "autoscale" block in pool_config.json'
+    if a.get("enabled") is not True:
+        return None, '"enabled" is not true (it must be the JSON value true)'
+    preset = a.get("preset") or cfg.get("default")
+    if not isinstance(preset, str) or preset not in (cfg.get("presets") or {}):
+        return None, f'preset "{preset}" is not defined under "presets"'
+    lo, hi = a.get("min_nodes"), a.get("max_nodes")
+    if isinstance(lo, bool) or not isinstance(lo, int) or lo < 1:
+        return None, '"min_nodes" must be a whole number >= 1'
+    if hi is None:
+        hi = lo + 2          # room to replace the ones that are about to expire
+    if isinstance(hi, bool) or not isinstance(hi, int) or hi < lo or hi > MAX_NODES_CAP:
+        return None, f'"max_nodes" must be a whole number from min_nodes to {MAX_NODES_CAP}'
+    wall = _secs(a.get("time")) if a.get("time") else None
+    if a.get("time") and not wall:
+        return None, f'"time" "{a.get("time")}" cannot be read'
+    renew = _secs(a.get("renew_before", "12h"))
+    if renew is None or renew < 0:
+        return None, '"renew_before" cannot be read'
+    if wall and renew >= wall:
+        return None, ('"renew_before" is not shorter than "time": every new hold job would '
+                      'count as about to expire')
+    until = a.get("until")
+    if not until or not isinstance(until, str):
+        return None, '"until" (a date) is required: autoscale never runs without an end'
     try:
-        out = {"preset": str(a.get("preset") or cfg.get("default") or ""),
-               "min_nodes": int(a["min_nodes"]),
-               "max_nodes": int(a.get("max_nodes", a["min_nodes"])),
-               "time": str(a.get("time") or ""),
-               "renew_before": _secs(a.get("renew_before", "12h"), 12 * 3600),
-               "until": a.get("until")}
-    except (KeyError, TypeError, ValueError):
-        return None
-    if not out["preset"] or out["min_nodes"] < 1 or out["max_nodes"] < out["min_nodes"]:
-        return None
-    if out["until"]:
-        try:
-            end = datetime.fromisoformat(str(out["until"]))
-            if len(str(out["until"])) <= 10:
-                end = end.replace(hour=23, minute=59, second=59)
-            if time.time() > end.timestamp():
-                return None
-        except ValueError:
-            return None                      # unreadable limit: do nothing rather than for ever
-    return out
+        end = datetime.fromisoformat(until)
+        if len(until) <= 10:
+            end = end.replace(hour=23, minute=59, second=59)
+    except ValueError:
+        return None, f'"until" "{until}" is not a date'
+    if time.time() > end.timestamp():
+        return None, f'"until" {until} has passed'
+    return {"preset": preset, "min_nodes": lo, "max_nodes": hi, "time": str(a.get("time") or ""),
+            "renew_before": renew, "until": until}, None
+
+
+def settings():
+    return check_settings()[0]
 
 
 def load_state():
+    """The state, {} if there is none yet, None if the file exists and cannot be
+    trusted — then nothing is submitted, for a lost state is a lost daily limit."""
+    if not os.path.exists(STATE_FILE):
+        return {"last_run": 0.0, "submitted": []}
     try:
         with open(STATE_FILE) as f:
             s = json.load(f)
-        return s if isinstance(s, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+        if not isinstance(s, dict):
+            return None
+        s["last_run"] = float(s.get("last_run") or 0)
+        s["submitted"] = [float(t) for t in (s.get("submitted") or [])]
+        return s
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def save_state(state):
@@ -98,27 +140,56 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-def plan(cfg, jobs_db, db_age, pending_jobs, unusable_nodes, submitted, now=None):
-    """How many hold jobs to submit now, and why: (n, text).
+def _left_secs(text):
+    """squeue %L → seconds; -1 unlimited; None unknown."""
+    text = (text or "").strip()
+    if text.upper() in ("UNLIMITED", "INFINITE"):
+        return -1
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d{2})", text)
+    if not m:
+        return None
+    d, h, mi, s = (int(x or 0) for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + s
 
-    jobs_db        the node DB's jobs (every running hold job)
-    db_age         seconds since the DB was written (walltime left is as of then)
-    pending_jobs   number of hold jobs waiting in the SLURM queue, or None if unknown
-    unusable_nodes nodes that are quarantined or slow
-    submitted      epochs of autoscale's own earlier submissions
-    """
-    now = now if now is not None else time.time()
-    if pending_jobs is None:
-        return 0, "SLURM could not be asked for queued hold jobs"
-    usable = 0
-    for info in jobs_db.values():
-        if info.get("node") in unusable_nodes or info.get("status") == "cpu":
+
+def observe():
+    """The hold jobs as SLURM sees them now: [{jid, state, node, left}], or None if
+    SLURM could not be asked. Only jobs whose stdout is under pool-logs/."""
+    out = hh._slurm(["squeue", "-h", "-u", os.environ.get("USER", ""), "-t", "R,PD",
+                     "-o", "%i|%T|%L|%N"])
+    if out is None:
+        return None
+    jobs = []
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 4 or not parts[0].isdigit():
             continue
-        left = info.get("time_left_secs")
-        if left is None or int(left) < 0 or int(left) - db_age > cfg["renew_before"]:
+        info = hh._slurm(["scontrol", "show", "job", parts[0]])
+        if info is None:
+            return None                          # cannot tell what it is: do not guess
+        m = re.search(r"^\s*StdOut=(\S+)", info, flags=re.M)
+        if not m or not m.group(1).startswith(hh.POOL_LOG_DIR + os.sep):
+            continue
+        jobs.append({"jid": parts[0], "state": parts[1].upper(), "node": parts[3],
+                     "left": _left_secs(parts[2])})
+    return jobs
+
+
+def plan(cfg, jobs, unusable_nodes, submitted, now=None):
+    """How many hold jobs to submit now, and why: (n, text). `jobs` is observe()'s
+    answer (None = SLURM could not be asked); `submitted` the epochs of autoscale's own
+    earlier submissions."""
+    now = now if now is not None else time.time()
+    if jobs is None:
+        return 0, "SLURM could not be asked for the hold jobs"
+    usable = 0
+    for j in jobs:
+        if j["state"] == "PENDING":
             usable += 1
-    usable += pending_jobs
-    total = len(jobs_db) + pending_jobs
+        elif j["state"] == "RUNNING" and j["node"] not in unusable_nodes \
+                and (j["left"] is None or j["left"] < 0 or j["left"] > cfg["renew_before"]):
+            usable += 1
+    total = len(jobs)
     lately = [t for t in submitted if now - t < 86400]
     want = cfg["min_nodes"] - usable
     if want <= 0:
@@ -126,46 +197,73 @@ def plan(cfg, jobs_db, db_age, pending_jobs, unusable_nodes, submitted, now=None
     room = cfg["max_nodes"] - total
     if room <= 0:
         return 0, (f"{usable} usable of {cfg['min_nodes']} wanted, but {total} hold jobs exist "
-                   f"(max_nodes {cfg['max_nodes']}): release the unusable ones")
+                   f"(max_nodes {cfg['max_nodes']}): the unusable ones take the room — "
+                   f"`hive nodes` shows them, `hive pool release` frees them")
     if len(lately) >= MAX_PER_DAY:
         return 0, f"{len(lately)} hold jobs submitted in the last 24 h (limit {MAX_PER_DAY})"
     n = min(want, room, MAX_PER_RUN, MAX_PER_DAY - len(lately))
     return n, f"{usable} usable of {cfg['min_nodes']} wanted, {total} in total"
 
 
-def run(jobs_db, db_age, unusable_nodes, log=None, now=None):
-    """Decide and act. Returns (submitted, text). Does its own SLURM calls: run it in
-    a thread, not under queue.lock."""
+def decide(unusable_nodes, now=None):
+    """What a run would do, without doing it: (n, text, cfg, state, jobs)."""
     now = now if now is not None else time.time()
-    cfg = settings()
+    cfg, off = check_settings()
     if cfg is None:
-        return 0, "off"
+        return 0, f"off: {off}", None, None, None
     state = load_state()
-    if now - float(state.get("last_run") or 0) < EVERY_SECS:
-        return 0, "not due"
-    state["last_run"] = now
-    pending = hh.pending_hold_jobs()
-    n, why = plan(cfg, jobs_db, db_age, None if pending is None else len(pending),
-                  unusable_nodes, state.get("submitted") or [], now)
-    state["last_decision"] = f"{n}: {why}"
-    done = 0
-    if n > 0:
-        argv = [sys.executable or "python3", POOL_BIN, "add", cfg["preset"], "--count", str(n)]
-        if cfg["time"]:
-            argv += ["--time", cfg["time"]]
-        try:
-            res = subprocess.run(argv, capture_output=True, text=True, timeout=SUBMIT_TIMEOUT)
-            done = (res.stdout or "").count("Submitted batch job")
-            if res.returncode != 0 or done == 0:
-                why += " — hive pool add failed: " + ((res.stderr or res.stdout or "").strip()[-200:])
-        except (subprocess.TimeoutExpired, OSError) as e:
-            why += f" — hive pool add failed: {e}"
-        state["submitted"] = [t for t in (state.get("submitted") or []) if now - t < 86400] \
-            + [now] * done
+    if state is None:
+        return 0, f"{STATE_FILE} cannot be read — not submitting until it is repaired or removed", \
+            cfg, None, None
+    last = max(state["last_run"], _mem["last_run"])
+    if now - last < EVERY_SECS:
+        return 0, f"not due (next decision in {int(EVERY_SECS - (now - last))}s)", cfg, state, None
+    jobs = observe()
+    submitted = sorted(set(state["submitted"]) | set(_mem["submitted"]))
+    n, why = plan(cfg, jobs, unusable_nodes, submitted, now)
+    return n, why, cfg, state, jobs
+
+
+def run(unusable_nodes, log=None, now=None):
+    """Decide and act. Returns (submitted, text). Asks SLURM and may run
+    `hive pool add`: call it from a thread, not under queue.lock."""
+    now = now if now is not None else time.time()
+    n, why, cfg, state, jobs = decide(unusable_nodes, now)
+    if cfg is None or state is None or why.startswith("not due"):
+        return 0, why
+    submitted = sorted(t for t in set(state["submitted"]) | set(_mem["submitted"]) if now - t < 86400)
+    _mem["last_run"] = now
+    state.update(last_run=now, last_decision=f"{n}: {why}", submitted=submitted + [now] * n)
+    _mem["submitted"] = list(state["submitted"])
+    try:
+        save_state(state)              # BEFORE submitting: what cannot be recorded is not done
+    except OSError as e:
+        return 0, f"state cannot be written ({e}) — not submitting"
+    if n <= 0:
+        return 0, why
+    before = len(jobs or [])
+    argv = [sys.executable or "python3", POOL_BIN, "add", cfg["preset"], "--count", str(n)]
+    if cfg["time"]:
+        argv += ["--time", cfg["time"]]
+    said, trouble = 0, ""
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=SUBMIT_TIMEOUT)
+        said = (res.stdout or "").count("Submitted batch job")
+        if res.returncode != 0 or said == 0:
+            trouble = " — hive pool add: " + ((res.stderr or res.stdout or "").strip()[-200:] or "failed")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        trouble = f" — hive pool add: {e}"
+    # How many there really are now, whatever `hive pool add` said or did not get to say.
+    after = observe()
+    seen = max(0, len(after) - before) if after is not None else n
+    done = max(said, seen) if (said or after is not None) else n
+    # The n recorded above stay recorded if we cannot tell; otherwise exactly `done`.
+    state["submitted"] = submitted + [now] * (done if after is not None else max(done, n))
+    _mem["submitted"] = list(state["submitted"])
     try:
         save_state(state)
     except OSError:
-        pass
-    if log and (done or n):
-        log("Autoscale: submitted %d hold job(s) [%s] — %s", done, cfg["preset"], why)
-    return done, why
+        pass                           # the larger figure written before stands
+    if log:
+        log("Autoscale: submitted %d hold job(s) [%s] — %s%s", done, cfg["preset"], why, trouble)
+    return done, why + trouble

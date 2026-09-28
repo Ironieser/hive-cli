@@ -444,12 +444,10 @@ def autoscale_async(jobs_db, db_updated, unusable):
     global _auto_thread
     if (_auto_thread and _auto_thread.is_alive()) or hauto.settings() is None:
         return
-    jobs = {j: dict(i) for j, i in jobs_db.items()}
-    age = _age_seconds(db_updated) or 0
 
     def run():
         try:
-            hauto.run(jobs, age, set(unusable), log=logging.info)
+            hauto.run(set(unusable), log=logging.info)
         except Exception as e:
             logging.warning("Autoscale failed: %s", e)
 
