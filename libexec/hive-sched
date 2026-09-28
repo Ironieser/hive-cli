@@ -1514,10 +1514,20 @@ def _cycle(probe_cache, final):
             secs = hh.cuda_secs(detail) if verdict == "ok" else None
             slow_ok = hh.may_become_slow(health["nodes"].get(node_name, {}))
             if secs is not None and secs > hh.CUDA_INIT_DEADLINE and not slow_ok:
-                # Created a context, slowly, on a node that is out for another reason:
-                # that is one healthy-ish probe at most, never a shortcut to `slow`.
-                verdict, detail = "unknown", f"slow init {secs}s on a node quarantined for a fault"
-                secs = None
+                # Created a context, slowly, on a node that is out for a fault: never
+                # a shortcut to `slow`, but it counts towards it (hh.slow_probe).
+                health_changed = True
+                became = hh.slow_probe(health, node_name, secs)
+                logging.info("Health check %s via %s: %s", node_name, jid,
+                             health["nodes"][node_name].get("last_result"))
+                if not became:
+                    return
+                quarantined.discard(node_name)
+                slow.add(node_name)
+                logging.warning("Node %s is SLOW again: CUDA init %ss on %d checks in a row",
+                                node_name, secs, hh.HEALTH_OK_STREAK)
+                ev.record("slow", node=node_name, source="auto", secs=secs)
+                return
             if secs is not None and secs > hh.CUDA_INIT_DEADLINE:
                 # The context was created, but slowly: usable for long tasks only.
                 health_changed = True

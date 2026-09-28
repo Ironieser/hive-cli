@@ -423,10 +423,9 @@ def check_without_hold_job(data, node, partition=None, now=None):
         if slowest > CUDA_INIT_DEADLINE and all(v == "ok" for v, _ in verdicts):
             if may_become_slow(rec):
                 return "slow" if mark_slow(data, node, slowest) else None
-            # Out for a real fault and now merely slow: not a healthy probe (the
-            # check through a hold job judges it the same way).
-            return record_check(data, node, "unknown",
-                                f"canary: slow init {slowest}s on a node quarantined for a fault")
+            # Out for a fault and now merely slow: counted towards `slow`, like the
+            # check through a hold job does (one canary = one probe of the streak).
+            return "slow" if slow_probe(data, node, slowest, now) else None
         for verdict, detail in verdicts:
             outcome = record_check(data, node, verdict, f"canary: {detail}".rstrip(": ")) or outcome
             if outcome == "released":
@@ -726,6 +725,30 @@ def may_become_slow(rec):
         and CUDA_SLOW_DETAIL in str(rec.get("reason") or "")
 
 
+def slow_probe(data, node, secs, now=None):
+    """A node that is out for a FAULT created a CUDA context, slowly. Counted towards
+    `slow` the way healthy probes are counted towards a release: HEALTH_OK_STREAK of
+    them in a row, and not before the minimum hold is over. Without this a slow node
+    that failed one probe (evc48: slow → one unanswered probe → quarantined) could
+    never be slow again, only fast or out. A node an agent or a person put away is
+    theirs to release. Returns True when the node just became `slow`."""
+    now = now if now is not None else time.time()
+    rec = _rec(data, node)
+    rec["last_check"] = now
+    if rec.get("state") != "quarantined" or rec.get("source") not in ("verify", "auto"):
+        rec["last_result"] = f"unknown: slow init {int(secs)}s on a node quarantined by hand"
+        return False
+    rec["slow_streak"] = int(rec.get("slow_streak", 0)) + 1
+    rec["ok_streak"] = 0
+    if rec["slow_streak"] >= HEALTH_OK_STREAK and now >= float(rec.get("until") or 0):
+        rec["slow_streak"] = 0
+        return mark_slow(data, node, secs)
+    rec["last_result"] = (f"slow init {int(secs)}s ({rec['slow_streak']}/{HEALTH_OK_STREAK} "
+                          f"towards SLOW)")
+    _hist(rec, "check", result=rec["last_result"])
+    return False
+
+
 def mark_slow(data, node, secs):
     """`node` works but needs `secs` to create a CUDA context. Returns True if this
     changed its state."""
@@ -775,7 +798,7 @@ def quarantine(data, node, reason, source, reporter=None):
     now = time.time()
     fresh = rec.get("state") != "quarantined"
     rec.update({"state": "quarantined", "reason": reason, "source": source,
-                "until": now + QUARANTINE_MIN_SECS, "ok_streak": 0})
+                "until": now + QUARANTINE_MIN_SECS, "ok_streak": 0, "slow_streak": 0})
     if reporter:
         rec["reporter"] = reporter
     if fresh:
@@ -874,6 +897,7 @@ def record_check(data, node, verdict, detail=""):
             return "released"
     elif verdict == "fail":
         rec["ok_streak"] = 0
+        rec["slow_streak"] = 0
         rec["strikes"] = int(rec.get("strikes", 0)) + 1
         rec["until"] = now + QUARANTINE_MIN_SECS
         rec["reason"] = f"CUDA probe failed: {detail}"

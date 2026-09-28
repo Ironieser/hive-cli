@@ -1318,6 +1318,26 @@ _hp = hs.health_probe; hs.health_probe = lambda jid: ("ok", "secs=146")
 wdb({"700": node("realbad", 72000)}); wq({}); hs.run_one_cycle()
 chk("an agent-reported node stays quarantined after a slow-ok probe",
     hh.load()["nodes"]["realbad"]["state"] == "quarantined")
+for _ in range(3):
+    d = hh.load(); d["nodes"]["realbad"].update(last_check=0, until=0); hh.save(d); hs.run_one_cycle()
+chk("...however many of them: it is the reporter's to release",
+    hh.load()["nodes"]["realbad"]["state"] == "quarantined")
+# a node hive quarantined for a fault, that then keeps answering slowly (evc48)
+reset_health(); reset_sched_state()
+d = hh.load(); hh.quarantine(d, "wasslow", "CUDA probe failed: gpu_unresponsive", "auto")
+d["nodes"]["wasslow"]["last_check"] = 0; hh.save(d)
+wdb({"700": node("wasslow", 72000)}); wq({}); hs.run_one_cycle()
+r = hh.load()["nodes"]["wasslow"]
+chk("one slow-ok probe: still quarantined, counted 1/2", r["state"] == "quarantined" and r.get("slow_streak") == 1)
+d = hh.load(); d["nodes"]["wasslow"]["last_check"] = 0; hh.save(d); hs.run_one_cycle()
+chk("two in a row but inside the minimum hold: still quarantined",
+    hh.load()["nodes"]["wasslow"]["state"] == "quarantined")
+d = hh.load(); d["nodes"]["wasslow"].update(last_check=0, until=time.time() - 1); hh.save(d); hs.run_one_cycle()
+chk("two in a row after the hold: SLOW", hh.load()["nodes"]["wasslow"]["state"] == "slow")
+d = hh.load(); hh.quarantine(d, "wasslow", "CUDA probe failed: gpu_unresponsive", "auto")
+d["nodes"]["wasslow"].update(last_check=0, until=0, slow_streak=1); hh.save(d)
+hs.health_probe = lambda jid: ("fail", "gpu_unresponsive"); hs.run_one_cycle()
+chk("a failed probe in between resets the count", hh.load()["nodes"]["wasslow"].get("slow_streak") == 0)
 hs.health_probe = _hp
 
 # index bug: quarantining a node must not make the loop skip the next one

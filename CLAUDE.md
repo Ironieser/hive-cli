@@ -220,7 +220,9 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   Verify-before-dispatch has a 60 s CUDA deadline and therefore quarantines such a node
   first; it is the periodic check, which waits `SLOW_CUDA_DEADLINE`, that finds the
   context does get created and reclassifies it. Verify on a slow node skips the CUDA
-  probe. `pool add` does not exclude slow nodes.
+  probe. `pool add` does not exclude slow nodes. A node hive quarantined for a FAULT
+  becomes slow only after `HEALTH_OK_STREAK` slow-but-ok probes in a row and its
+  minimum hold (`hh.slow_probe`); one put away by an agent or by hand never does.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward
