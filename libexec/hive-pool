@@ -339,7 +339,9 @@ def cmd_autoscale(args):
         return
     print(f"autoscale: {C_GREEN}on{C_RESET}  preset {cfg['preset']}, keep {cfg['min_nodes']} usable, "
           f"at most {cfg['max_nodes']} hold jobs, each {cfg['time'] or 'as long as the script says'}, "
-          f"replaced {cfg['renew_before'] / 3600:g}h before it expires, until {cfg['until']}")
+          f"replaced {cfg['renew_before'] / 3600:g}h before it expires, until {cfg['until']}"
+          + (f", only while a task was submitted in the last {cfg['active_within'] / 3600:g}h"
+             if cfg.get("active_within") else ""))
     health = hh.load()
     unusable = hh.quarantined_nodes(health) | hh.slow_nodes(health)
     state = hauto.load_state()
@@ -349,6 +351,15 @@ def cmd_autoscale(args):
         return
     jobs = hauto.observe()
     n, why = hauto.plan(cfg, jobs, unusable, state.get("submitted") or [])
+    if cfg.get("active_within"):
+        import time as _t2
+        seen = hauto.last_submit()
+        idle = seen is None or _t2.time() - seen > cfg["active_within"]
+        print("  last task submitted: "
+              + ("never" if seen is None else f"{(_t2.time() - seen) / 3600:.1f}h ago")
+              + (f"  → {C_YELLOW}idle, nothing is submitted{C_RESET}" if idle else ""))
+        if idle:
+            n, why = 0, "hive has not been used lately"
     if jobs is not None:
         run_ = [j for j in jobs if j["state"] == "RUNNING"]
         print(f"  hold jobs now: {len(run_)} running "

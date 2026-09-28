@@ -14,7 +14,8 @@
     "max_nodes": 6,
     "time": "7-00:00:00",
     "renew_before": "12h",
-    "until": "2026-12-31"
+    "until": "2026-12-31",
+    "active_within": "48h"
   },
   "presets": {
     "normal": {

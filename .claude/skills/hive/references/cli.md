@@ -324,6 +324,10 @@ is bounded by `max_nodes` (default `min_nodes` + 2; every hold job counts, usabl
 not), 2 submissions per decision, one decision per 10 min, 12 submissions per day and
 `until`, which is required. It counts hold jobs by asking SLURM and submits nothing when
 it cannot, or when its state file cannot be read or written. `"enabled"` must be `true`.
+With `"active_within": "48h"` it only acts while a task was submitted in that time (or is
+still pending or running): an unused pool runs out by itself, and the first `hive submit`
+afterwards brings it back — the hold jobs are submitted at the next decision, within
+10 minutes, and then wait in the SLURM queue like any job.
 
 Other keys of `pool_config.json`: `"prefer_partitions": ["highgpu"]` (tried first),
 `"fair_share": true` (equal priority: the owner who used fewer GPU-hours in the last 24 h

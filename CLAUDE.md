@@ -239,6 +239,8 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   valid (`"enabled"` must be JSON `true`, `until` is required) → submit nothing. The
   state is written before submitting and kept in memory too. `max_nodes` counts every
   hold job, usable or not. `hive pool autoscale` must go through the same functions.
+  `"active_within"` ties it to use (`last_submit()`; owner `hive-selftest` does not
+  count): an unreadable record means "no use", never "use".
 - **`--warn-before` signals the command's process group.** The command runs under
   `setsid` with a no-op USR1 trap in its shell; signalling that shell alone killed it
   and orphaned the program behind it. The heartbeat and sampler loops ignore USR1.

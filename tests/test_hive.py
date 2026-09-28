@@ -2186,6 +2186,31 @@ _n, _why = hauto.run(set()); time.sleep(2.0)
 hauto.SUBMIT_TIMEOUT = _st
 chk("hive pool add killed by the timeout after it had submitted: the job is counted",
     len(hauto.load_state()["submitted"]) >= 1 and len(hauto.load_state()["submitted"]) >= len(real_submits()) - 1)
+# tied to use: "active_within"
+acfg(active_within="48h"); fresh("")
+open(ev.EVENTS_FILE, "w").close(); wq({})
+_n, _why = hauto.run(set())
+chk("active_within, and nobody ever submitted: nothing", _n == 0 and "idle" in _why and real_submits() == [])
+ev.record("submit", task=1, name="x", owner="agentA"); hauto._mem.update(last_run=0.0)
+L_ = open(ev.EVENTS_FILE).read().replace('"t": ', '"t": -1e9 + ', 1)
+open(ev.EVENTS_FILE, "w").write(json.dumps({"ts": "old", "t": time.time() - 50 * 3600, "event": "submit",
+                                            "task": 1, "owner": "agentA"}) + "\n")
+os.remove(os.path.join(hs.HIVE_DIR, "autoscale_state.json")) if os.path.exists(os.path.join(hs.HIVE_DIR, "autoscale_state.json")) else None
+chk("the last submit was 50 h ago: nothing", hauto.run(set())[0] == 0 and real_submits() == [])
+ev.record("submit", task=2, name="y", owner="hive-selftest"); hauto._mem.update(last_run=0.0)
+fresh("")
+chk("hive's own self-tests do not count as use", hauto.run(set())[0] == 0 and real_submits() == [])
+ev.record("submit", task=3, name="z", owner="agentA"); fresh("")
+chk("a task submitted now: the pool is brought back (2 at a time)", hauto.run(set())[0] == 2)
+open(ev.EVENTS_FILE, "w").close(); fresh("")
+wq({"1": dict(task(1, name="waiting"), owner="agentA", submitted_ts=time.time() - 90 * 3600)})
+chk("a task still pending counts as use, however old", hauto.run(set())[0] == 2)
+wq({}); acfg(active_within="soon")
+chk("off: unreadable active_within", hauto.settings() is None)
+acfg(active_within="48h"); fresh("6000|RUNNING|6-00:00:00|n0\n"); open(ev.EVENTS_FILE, "w").close()
+_c, _o = _rc(hp2.cmd_autoscale, None)
+chk("hive pool autoscale says that it is idle", "idle" in _o and "would submit 0" in _o)
+ev.record("submit", task=9, name="q", owner="agentA")
 # the status command says what the scheduler would do
 acfg(); fresh("6000|RUNNING|6-00:00:00|n0\n")
 _c, _o = _rc(hp2.cmd_autoscale, None)

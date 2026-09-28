@@ -219,7 +219,8 @@ CUDA context，两步各有时限：
 写入 `~/.hive/pool_config.json` 后，调度器会自动维持 `min_nodes` 个可用的 hold job，并在
 它们到期前提交替换的。它会自行提交作业，因此有多重上限：总数不超过 `max_nodes`，每次
 最多 2 个，每 10 分钟决策一次，每天最多 12 个，`until`（必填）之后停止。它通过查询
-SLURM 来统计 hold job，查询不到时什么都不做。`hive pool autoscale` 显示它当前会做什么。
+SLURM 来统计 hold job，查询不到时什么都不做。加上 `"active_within": "48h"` 后，只有在这段时间内
+有任务提交（或仍有任务在排队、运行）时才会补充。`hive pool autoscale` 显示它当前会做什么。
 其他配置项：`"prefer_partitions"`、`"fair_share"`、`"exclude"`、`"auto_prune_days"`
 （默认 14）、`"log_keep_days"`。
 

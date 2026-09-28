@@ -25,6 +25,9 @@ not sure:
     also kept in memory, so no failure afterwards can make it forget.
   * Bounds: `max_nodes` hold jobs in total (usable or not), MAX_PER_RUN per decision,
     MAX_PER_DAY per 24 h, one decision per EVERY_SECS, and `until`, which is required.
+  * `"active_within": "48h"` ties it to use: hold jobs are only submitted while somebody
+    has submitted a task in that time. A pool nobody uses runs out by itself, and the
+    first task submitted afterwards brings it back at the next decision.
 """
 
 import json
@@ -108,8 +111,13 @@ def check_settings():
         return None, f'"until" "{until}" is not a date'
     if time.time() > end.timestamp():
         return None, f'"until" {until} has passed'
+    active = None
+    if a.get("active_within") not in (None, "", 0):
+        active = _secs(a.get("active_within"))
+        if not active or active <= 0:
+            return None, f'"active_within" "{a.get("active_within")}" cannot be read'
     return {"preset": preset, "min_nodes": lo, "max_nodes": hi, "time": str(a.get("time") or ""),
-            "renew_before": renew, "until": until}, None
+            "renew_before": renew, "until": until, "active_within": active}, None
 
 
 def settings():
@@ -175,6 +183,50 @@ def observe():
     return jobs
 
 
+EVENTS_FILE   = os.path.join(HIVE_DIR, "events.jsonl")
+QUEUE_FILE    = os.path.join(HIVE_DIR, "queue.json")
+IGNORE_OWNERS = ("hive-selftest",)     # hive's own checks are not somebody using it
+TAIL_BYTES    = 512 * 1024
+
+
+def last_submit():
+    """Epoch of the latest task submission, or None if there is none on record (or the
+    record cannot be read: then nothing is assumed to have happened). Pending and
+    running tasks count as of now — they are use, however long ago they were queued."""
+    latest = None
+    try:
+        with open(QUEUE_FILE) as f:
+            tasks = json.load(f).get("tasks", {})
+        for t in tasks.values():
+            if t.get("owner") in IGNORE_OWNERS:
+                continue
+            if t.get("state") in ("pending", "running"):
+                return time.time()
+            ts = t.get("submitted_ts")
+            if isinstance(ts, (int, float)) and (latest is None or ts > latest):
+                latest = float(ts)
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        with open(EVENTS_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - TAIL_BYTES))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()[1:]
+        for line in reversed(lines):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("event") == "submit" and e.get("owner") not in IGNORE_OWNERS \
+                    and isinstance(e.get("t"), (int, float)):
+                if latest is None or e["t"] > latest:
+                    latest = float(e["t"])
+                break
+    except OSError:
+        pass
+    return latest
+
+
 def plan(cfg, jobs, unusable_nodes, submitted, now=None):
     """How many hold jobs to submit now, and why: (n, text). `jobs` is observe()'s
     answer (None = SLURM could not be asked); `submitted` the epochs of autoscale's own
@@ -218,6 +270,13 @@ def decide(unusable_nodes, now=None):
     last = max(state["last_run"], _mem["last_run"])
     if now - last < EVERY_SECS:
         return 0, f"not due (next decision in {int(EVERY_SECS - (now - last))}s)", cfg, state, None
+    if cfg.get("active_within"):
+        seen = last_submit()
+        if seen is None or now - seen > cfg["active_within"]:
+            ago = "never" if seen is None else f"{(now - seen) / 3600:.0f}h ago"
+            return 0, (f"idle: the last task was submitted {ago}, and the pool is only kept "
+                       f"while hive was used in the last {cfg['active_within'] / 3600:g}h"), \
+                cfg, state, []
     jobs = observe()
     submitted = sorted(set(state["submitted"]) | set(_mem["submitted"]))
     n, why = plan(cfg, jobs, unusable_nodes, submitted, now)

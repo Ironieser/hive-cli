@@ -237,7 +237,8 @@ in `~/.hive/pool_config.json` makes the scheduler keep `min_nodes` usable hold j
 replace the ones about to expire. It submits jobs on its own, so it is bounded:
 `max_nodes` in total, 2 per decision, one decision per 10 minutes, 12 per day, nothing
 after `until` (required). It counts hold jobs by asking SLURM and does nothing when it
-cannot. `hive pool autoscale` shows what it would do. Other keys: `"prefer_partitions"`,
+cannot. With `"active_within": "48h"` it only acts while hive is in use (a task submitted
+in that time, or still pending or running). `hive pool autoscale` shows what it would do. Other keys: `"prefer_partitions"`,
 `"fair_share"`, `"exclude"`, `"auto_prune_days"` (default 14), `"log_keep_days"`.
 
 ### Keeping the queue tidy

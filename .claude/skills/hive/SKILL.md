@@ -78,6 +78,7 @@ These commands are sized for agents; prefer them over `cat ~/.hive/…` or `sque
 | several tasks / a sweep | `hive wait ID ID …` / `hive wait --array ID` | one line per task, no logs; exit 1 if any did not end done |
 | is the pool healthy | `hive nodes` | one line per hold job + summary |
 | why is it pending | `hive list` → NODE column shows the `pending_reason` | — |
+| will the pool be refilled | `hive pool autoscale` | what autoscale keeps, and what it would submit now |
 | bad nodes | `hive health` | one line per node |
 | how long do runs take | `hive stats NAME` | one line per name |
 
@@ -90,7 +91,8 @@ The NODE column of `hive list` says why. The common ones:
 
 | reason | meaning → what to do |
 |---|---|
-| `pool_empty` | the pool has no hold job → `hive pool add` (waiting will not help) |
+| `pool_empty` | the pool has no hold job. If `hive pool autoscale` says it is on, it submits hold jobs within 10 min of your submit (they then wait in the SLURM queue); need more, or sooner → `hive pool add highgpu` |
+| `held` | somebody ran `hive hold` on it → `hive unhold ID` |
 | `no_dispatchable_node` | every hold job is busy → `hive nodes`; wait or `hive pool add` |
 | `waiting_for_mem` / `insufficient_gpus` / `insufficient_walltime` | your task's requirement isn't met by any node → lower it or `hive pool add …` |
 | `gpu_dirty` / `node_busy_on_verify` | a card looked free but isn't (co-tenant / zombie) → wait |
