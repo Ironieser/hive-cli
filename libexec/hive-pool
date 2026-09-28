@@ -2,7 +2,9 @@
 """hive-pool — manage the pre-allocated SLURM node pool
 
 Commands:
-  hive pool add [PRESET] [--count N]   Submit new hold job(s)
+  hive pool add [PRESET] [--count N] [--exclude NODES]
+                                       Submit new hold job(s); quarantined nodes
+                                       (hive health) are excluded automatically
   hive pool release JOBID              Cancel a hold job (scancel)
   hive pool release --idle             Cancel all currently IDLE hold jobs
   hive pool init                       Create ~/.hive/pool_config.json from example
@@ -12,8 +14,12 @@ Commands:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import hive_health as hh   # quarantined nodes are kept out of new hold jobs
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HIVE_DIR     = os.environ.get("HIVE_DIR", os.path.expanduser("~/.hive"))
@@ -76,6 +82,39 @@ def load_idle_jobids():
         return []
 
 
+# ── Node exclusion ────────────────────────────────────────────────────────────
+
+def script_excludes(script):
+    """Node lists from the script's own `#SBATCH --exclude=` / `-x` lines. An
+    `--exclude` on the sbatch command line REPLACES those rather than adding to them,
+    so they have to be carried over by hand."""
+    found = []
+    try:
+        with open(script) as f:
+            for line in f:
+                m = re.match(r"^\s*#SBATCH\s+(?:--exclude(?:=|\s+)|-x\s*)(\S+)", line)
+                if m:
+                    found.append(m.group(1))
+    except OSError:
+        pass
+    return found
+
+
+def build_exclude(script, cli, config_lists, auto):
+    """(merged --exclude value or None, quarantined nodes that were added)."""
+    parts = script_excludes(script) + [x for x in config_lists if x] + ([cli] if cli else [])
+    known = set()
+    for p in parts:
+        try:
+            known.update(hh.expand_nodes(p))
+        except ValueError as e:
+            print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
+            sys.exit(2)
+    added = sorted(hh.quarantined_nodes() - known) if auto else []
+    parts += added
+    return (",".join(parts) or None), added
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_add(args):
@@ -88,11 +127,14 @@ def cmd_add(args):
         script = os.path.expanduser(target)
         preset_name = os.path.basename(script)
         desc = ""
+        config_excl = []
     else:
         config = load_config()
         preset_name, preset = get_preset(config, target)
         script = os.path.expanduser(preset.get("script", ""))
         desc = preset.get("description", "")
+        # Standing exclusions: "exclude" at the top of pool_config.json and/or in a preset.
+        config_excl = [config.get("exclude"), preset.get("exclude")]
         if not script:
             print(f"Preset '{preset_name}' has no 'script' field.", file=sys.stderr)
             sys.exit(1)
@@ -111,12 +153,20 @@ def cmd_add(args):
     out_pat = os.path.join(POOL_LOG_DIR, "slurm-%j.out")
     err_pat = os.path.join(POOL_LOG_DIR, "slurm-%j.err")
 
+    # A hold job that lands on a broken node is worse than none: it uses allocation and
+    # never runs a task. SLURM favours exactly those nodes — their GPUs are always free —
+    # so every node hive has quarantined is excluded unless --no-auto-exclude is given.
+    exclude, auto_added = build_exclude(script, args.exclude, config_excl,
+                                        not args.no_auto_exclude)
+
     def build_cmd(extra=None):
         cmd = ["sbatch"]
         if extra:
             cmd += extra
         if time_arg:
             cmd += ["--time", time_arg]
+        if exclude and (args.exclude or auto_added or any(config_excl)):
+            cmd += [f"--exclude={exclude}"]
         cmd += ["--output", out_pat, "--error", err_pat, script]
         return cmd
 
@@ -135,6 +185,12 @@ def cmd_add(args):
     time_str = f"  time={time_arg}" if time_arg else ""
     print(f"Submitting {count}× hold job  [{preset_name}]  {desc}{time_str}")
     print(f"  {C_DIM}logs → {POOL_LOG_DIR}/slurm-<jobid>.out{C_RESET}")
+    if auto_added:
+        print(f"  {C_DIM}excluding quarantined node(s): {', '.join(auto_added)}  "
+              f"(hive health; --no-auto-exclude to skip){C_RESET}")
+    requested = [x for x in config_excl + [args.exclude] if x]
+    if requested:
+        print(f"  {C_DIM}excluding: {', '.join(requested)}{C_RESET}")
 
     for _ in range(count):
         result = subprocess.run(build_cmd(), capture_output=True, text=True)
@@ -291,6 +347,12 @@ def build_parser():
                     help="Number of hold jobs to submit (default: 1)")
     pa.add_argument("--time", "-t", default=None, metavar="TIME",
                     help="Override --time in the sbatch script, e.g. 1-00:00:00, 12:00:00, 3d")
+    pa.add_argument("--exclude", "-x", default=None, metavar="NODES",
+                    help="Nodes the hold job must not land on (SLURM list: evc22,evc[40-43]). "
+                         "Added to the script's own #SBATCH --exclude and to the 'exclude' "
+                         "key of pool_config.json")
+    pa.add_argument("--no-auto-exclude", action="store_true",
+                    help="Do not exclude the nodes hive has quarantined (see `hive health`)")
     pa.add_argument("--no-validate", action="store_true",
                     help="Skip the 'sbatch --test-only' pre-flight check")
 

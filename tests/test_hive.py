@@ -508,6 +508,119 @@ wq({"123": t}); hs.run_one_cycle()
 chk("a successful task on the node clears its strikes", hh.load()["nodes"]["evc50"]["strikes"] == 0)
 reset_health()
 
+print("== unresponsive GPU: a wedged driver is a node fault, not a transient probe miss ==")
+# 2026-09-26: three hold jobs sat 24 h with pending tasks because nvidia-smi never
+# answered on their nodes and every probe read as "couldn't run" -> retried forever.
+chk("gpu query parser: healthy",
+    hh.parse_gpu_query(["GPU_PROBE granted=0", "0, 10, 81920", "GPU_PROBE rc=0"])
+    == (["0, 10, 81920"], "0", None))
+chk("gpu query parser: hung with a GPU granted -> gpu_unresponsive",
+    hh.parse_gpu_query(["GPU_PROBE granted=0", "GPU_PROBE hung"])[2] == "gpu_unresponsive")
+chk("gpu query parser: answered with no device -> no_gpu_devices",
+    hh.parse_gpu_query(["GPU_PROBE granted=0", "No devices were found", "GPU_PROBE rc=6"])[2]
+    == "no_gpu_devices")
+chk("gpu query parser: CPU-only hold job (nothing granted) is never a fault",
+    hh.parse_gpu_query(["GPU_PROBE granted=", "No devices were found", "GPU_PROBE rc=6"])[2] is None
+    and hh.parse_gpu_query(["GPU_PROBE granted=", "GPU_PROBE hung"])[2] is None)
+chk("gpu query parser: step never ran -> no verdict", hh.parse_gpu_query([]) == ([], None, None))
+
+def reset_sched_state():
+    hs._probe_backoff.clear(); hs._reject_logged.clear()
+    hs._starve_streak = 0; hs._starve_threshold = hs.STARVATION_CYCLES
+reset_health(); reset_sched_state()
+os.environ.update({"MOCK_GPU_HANG": "4", "HIVE_GPU_QUERY_DEADLINE": "1", "CUDA_VISIBLE_DEVICES": "0"})
+_t0 = time.time(); _p = hs.live_probe("700"); _dt = time.time() - _t0
+chk("live_probe reports the fault", _p == {"ok": False, "fault": "gpu_unresponsive"})
+chk("...at the deadline, without waiting for the stuck step", _dt < 3.5)
+wdb({"700": node("wedged", 72000), "701": node("wedged", 72000)})
+wq({"130": task(130, name="w1"), "131": task(131, name="w2", sub=loc(1))})
+hs.run_one_cycle()
+chk("both hold jobs of the node struck -> node quarantined",
+    hh.load()["nodes"]["wedged"]["state"] == "quarantined")
+chk("every pending task carries the real reason, not no_dispatchable_node",
+    [rq()[k].get("pending_reason") for k in ("130", "131")] == ["gpu_unresponsive"] * 2)
+chk("quarantine event recorded",
+    any(e["event"] == "quarantine" and e.get("reason") == "gpu_unresponsive" for e in ev.iter_events()))
+os.environ.pop("MOCK_GPU_HANG")
+reset_health(); reset_sched_state()
+os.environ["MOCK_GPU_NONE"] = "1"
+chk("GPU granted but none listed -> no_gpu_devices", hs.live_probe("700").get("fault") == "no_gpu_devices")
+os.environ.pop("MOCK_GPU_NONE"); os.environ.pop("CUDA_VISIBLE_DEVICES"); os.environ.pop("HIVE_GPU_QUERY_DEADLINE")
+chk("healthy node still verifies clean", hs.live_probe("700").get("ok") is True)
+
+_db = os.path.join(hs.HIVE_DIR, "cf_new.json"); _old = os.path.join(hs.HIVE_DIR, "cf_old.json")
+def _carry(detail):
+    json.dump({"jobs": {"700": node("n", 100)}}, open(_old, "w"))
+    json.dump({"jobs": {"700": dict(node("n", 100, st="probe_failed"), gpu=[], probe_detail=detail)}},
+              open(_db, "w"))
+    sys.argv = ["hive-dbpost", _db, _old]; dbp.main()
+    return json.load(open(_db))["jobs"]["700"]["status"]
+_argv = sys.argv
+chk("dbpost still carries a transient probe miss forward", _carry("srun_failed") == "idle")
+chk("dbpost does NOT carry an unresponsive-GPU verdict forward", _carry("gpu_unresponsive") == "probe_failed")
+sys.argv = _argv
+
+print("== probe backoff / pending reasons / starvation backoff ==")
+reset_health(); reset_sched_state()
+_real_probe, _calls = hs.live_probe, []
+hs.live_probe = lambda jid: (_calls.append(jid), {"ok": False})[1]      # srun can't run
+wdb({"700": node("silent", 72000)})
+wq({"140": task(140, name="b1"), "141": task(141, name="b2", sub=loc(1))})
+hs.run_one_cycle(); hs.run_one_cycle()
+chk("a silent hold job is probed once, then backed off", _calls == ["700"])
+chk("unanswered probes never strike the node", not hh.load()["nodes"].get("silent", {}).get("strikes"))
+chk("tasks behind the first keep the node-level reason",
+    [rq()[k].get("pending_reason") for k in ("140", "141")] == ["probe_unverifiable"] * 2)
+hs._probe_backoff["700"] = (1, time.time() - 1, "probe_unverifiable")   # backoff elapsed
+hs.run_one_cycle()
+chk("...and probed again once the backoff elapsed", _calls == ["700", "700"])
+chk("backoff grows with consecutive failures", hs._probe_backoff["700"][0] == 2
+    and hs._probe_backoff["700"][1] - time.time() > hs.PROBE_BACKOFF_BASE)
+hs.live_probe = _real_probe
+reset_sched_state()
+wdb({})
+wq({"150": task(150, name="e")})
+_polls = []
+_real_repoll = hs.request_repoll
+hs.request_repoll = lambda reason: _polls.append(hs._starve_streak)
+for _ in range(3 + 6 + 10 + 10):
+    hs.run_one_cycle()
+chk("no hold job at all -> pending_reason pool_empty", rq()["150"].get("pending_reason") == "pool_empty")
+chk("starvation re-poll backs off 3 -> 6 -> 10 -> 10 cycles", _polls == [3, 6, 10, 10])
+wdb({"700": node("nodeX", 72000)})
+hs.run_one_cycle(); time.sleep(0.4)
+chk("a dispatch resets the starvation backoff",
+    rq()["150"]["state"] in ("running", "done") and hs._starve_threshold == hs.STARVATION_CYCLES)
+hs.request_repoll = _real_repoll
+reset_health(); reset_sched_state()
+
+print("== node exclusion: hive submit --exclude, hive pool add --exclude ==")
+chk("expand_nodes: names, ranges, padding, duplicates",
+    hh.expand_nodes("evc22,evc[1-3,07],gpu01,evc22") == ["evc22", "evc1", "evc2", "evc3", "evc07", "gpu01"])
+try:
+    hh.expand_nodes("evc[1-3"); _bad = False
+except ValueError:
+    _bad = True
+chk("expand_nodes: unbalanced bracket is an error", _bad)
+reset_health(); reset_sched_state()
+wdb({"700": node("nodeA", 72000)})
+wq({"160": dict(task(160, name="x1"), exclude_nodes=["nodeA"]), "161": task(161, name="x2", sub=loc(1))})
+hs.run_one_cycle(); time.sleep(0.4)
+_q = rq()
+chk("excluded node is never used by that task", _q["160"]["state"] == "pending"
+    and _q["160"].get("pending_reason") == "node_excluded")
+chk("...and stays available to the task behind it", _q["161"].get("node") == "nodeA")
+hp = SourceFileLoader("hp", os.path.join(LIB, "hive-pool")).load_module()
+_scr = os.path.join(hs.HIVE_DIR, "hold.slurm")
+open(_scr, "w").write("#!/bin/bash\n#SBATCH -p normal\n#SBATCH --exclude=evc[1-3],evc9\nsleep 1\n")
+chk("script's own #SBATCH --exclude is read", hp.script_excludes(_scr) == ["evc[1-3],evc9"])
+data = hh.load(); hh.quarantine(data, "evc43", "t", "agent"); hh.quarantine(data, "evc2", "t", "agent"); hh.save(data)
+chk("merged = script + config + CLI + quarantined (no duplicate of evc2)",
+    hp.build_exclude(_scr, "evc22", ["evc50", None], True) == ("evc[1-3],evc9,evc50,evc22,evc43", ["evc43"]))
+chk("--no-auto-exclude leaves quarantined nodes out",
+    hp.build_exclude(_scr, None, [], False) == ("evc[1-3],evc9", []))
+reset_health(); reset_sched_state()
+
 print("== context frugality: hive list cap, log tailing ==")
 import io, contextlib, argparse as _ap
 def _capture(fn, *a):
@@ -543,10 +656,13 @@ os.environ.pop("HIVE_OWNER", None)
 wq({})
 def _submit(**kw):
     ns = _ap.Namespace(cmd_or_file="true", workdir=None, priority=None, name=kw.get("name"),
-                       owner=kw.get("owner"), need_mb=None, gpus=None, est_runtime=None)
+                       owner=kw.get("owner"), need_mb=None, gpus=None, est_runtime=None,
+                       exclude=kw.get("exclude"))
     _capture(hq.cmd_submit, ns)
     return max(rq().values(), key=lambda t: t["id"])
 chk("--owner stored on the task", _submit(owner="agentA", name="a1")["owner"] == "agentA")
+chk("--exclude stored expanded on the task",
+    _submit(owner="agentA", name="a0", exclude="evc[42-43]")["exclude_nodes"] == ["evc42", "evc43"])
 os.environ["HIVE_OWNER"] = "projB"
 chk("$HIVE_OWNER used when --owner absent", _submit(name="b1")["owner"] == "projB")
 chk("--owner beats $HIVE_OWNER", _submit(owner="agentA", name="a2")["owner"] == "agentA")
@@ -555,11 +671,11 @@ chk("#HIVE owner= parsed", hq.parse_hive_file(os.path.join(hs.HIVE_DIR, "o.hive"
 def _rows(ns):
     return [l for l in _capture(hq.cmd_list, ns).splitlines() if l.strip().startswith(tuple("0123456789"))]
 chk("hive list defaults to $HIVE_OWNER's tasks", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner=None))) == 1)
-chk("--owner NAME filters explicitly", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner="agentA"))) == 2)
+chk("--owner NAME filters explicitly", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner="agentA"))) == 3)
 out_all = _capture(hq.cmd_list, _ap.Namespace(state=None, all=False, days=None, limit=None, owner="all"))
 chk("--owner all shows everyone, with an OWNER column", "OWNER" in out_all and "agentA" in out_all and "projB" in out_all)
 os.environ.pop("HIVE_OWNER", None)
-chk("without $HIVE_OWNER the list is unfiltered", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner=None))) == 3)
+chk("without $HIVE_OWNER the list is unfiltered", len(_rows(_ap.Namespace(state=None, all=False, days=None, limit=None, owner=None))) == 4)
 chk("submit event carries owner", any(e["event"] == "submit" and e.get("owner") == "agentA" for e in ev.iter_events()))
 
 print("== integration: history_estimate from event log (P90) ==")

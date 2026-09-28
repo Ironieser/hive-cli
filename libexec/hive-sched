@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import select
 import shlex
 import signal
 import socket
@@ -39,7 +40,7 @@ LOG_DIR       = os.path.join(HIVE_DIR, "logs")
 
 POLL_INTERVAL     = 30    # seconds between scheduler loops
 HEARTBEAT_TIMEOUT = 300   # 5 min → task considered dead
-LOG_ROLL_LINES    = 500
+LOG_ROLL_LINES    = 5000
 
 # ── Dispatch gating (feedback C1/C2: stop dispatching into dirty/stale/unverified nodes) ──
 GPU_CLEAN_MB       = 5000   # a hold-job GPU with >5GB used is dirty (zombie / co-tenant) → skip
@@ -51,7 +52,8 @@ NODE_DB_STALE_SECS = 1800   # node DB older than this → force a re-poll instea
 ORPHAN_GRACE_SECS  = 90     # running task w/ no srun+heartbeat+exit older than this → crash orphan
 MAX_ATTEMPTS       = 3      # requeue cap for crash orphans (prevents infinite redispatch)
 STARVATION_CYCLES  = 3      # consecutive starved cycles before forcing a poller re-poll
-LIVE_PROBE_TIMEOUT = 45     # verify-before-dispatch probe: srun + python startup (CUDA probe)
+LIVE_PROBE_TIMEOUT = 75     # verify-before-dispatch probe: srun + GPU query deadline (20 s) +
+                            # CUDA probe + step teardown, which a wedged driver stretches to 15 s
 VERIFY_EVERY_DISPATCH = True  # live-probe (memory + CUDA context) before EVERY dispatch, not
                               # only for uncertain nodes: the DB can be a poll cycle stale
                               # (feedback #14) and nvidia-smi can't see a CUDA-init fault
@@ -66,8 +68,27 @@ VERIFY_EVERY_DISPATCH = True  # live-probe (memory + CUDA context) before EVERY 
 WALLTIME_MARGIN_SECS = 600  # safety head-room above the estimate
 SQUEUE_CONFIRM_TIMEOUT = 10 # bounded squeue used to confirm a hold-job actually died
 
-# Mutable run-state for the starvation watchdog (consecutive cycles with pending but no dispatch)
+# Starvation watchdog: consecutive cycles with pending tasks but no dispatch. The
+# re-poll it forces costs one srun probe per hold job, so the threshold backs off
+# (3 → 6 → 10 cycles) while nothing changes — a pool that stayed empty for two days
+# was being re-polled every 90 s, and the warning it logged each time rolled every
+# other line out of sched.log.
+STARVATION_CYCLES_MAX = 10
 _starve_streak = 0
+_starve_threshold = STARVATION_CYCLES
+
+# Per-hold-job probe backoff: jid → (consecutive failures, epoch before which the job
+# is not probed again, the reason it was rejected for). An unanswered probe holds queue.lock for LIVE_PROBE_TIMEOUT,
+# so re-probing a silent node every cycle both stalls `hive submit`/`cancel` and
+# stacks probe steps on the node.
+PROBE_BACKOFF_BASE = 60
+PROBE_BACKOFF_MAX  = 600
+_probe_backoff = {}
+
+# Node rejections are logged when the reason changes, else at most this often — the
+# log must explain a stuck queue without drowning in one line per node per cycle.
+REJECT_LOG_EVERY = 600
+_reject_logged = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -331,6 +352,47 @@ def append_log_note(task, lines):
         pass
 
 
+def log_reject(jid, node, reason, detail=""):
+    """Record why a hold job was passed over (rate-limited per job + reason)."""
+    now = time.time()
+    last = _reject_logged.get(jid)
+    if last and last[0] == reason and now - last[1] < REJECT_LOG_EVERY:
+        return
+    _reject_logged[jid] = (reason, now)
+    logging.info("Node %s (hold job %s) not dispatchable: %s%s", node, jid, reason,
+                 f" ({detail})" if detail else "")
+
+
+def probe_backoff_reason(jid):
+    """The reason `jid` was last rejected for while its backoff is running, else None."""
+    rec = _probe_backoff.get(jid)
+    if rec and time.time() < rec[1]:
+        return rec[2] if len(rec) > 2 else "probe_unverifiable"
+    return None
+
+
+def note_probe_result(jid, answered, reason="probe_unverifiable"):
+    """Arm / clear the per-job probe backoff."""
+    if answered:
+        _probe_backoff.pop(jid, None)
+        return
+    fails = _probe_backoff.get(jid, (0, 0))[0] + 1
+    wait = min(PROBE_BACKOFF_BASE * (2 ** (fails - 1)), PROBE_BACKOFF_MAX)
+    _probe_backoff[jid] = (fails, time.time() + wait, reason)
+
+
+def health_probe(slurm_jobid):
+    """(verdict, detail) for the periodic check of a quarantined node — the same
+    guarded probe as verify-before-dispatch, so a wedged driver reads `fail` here too
+    instead of hanging a bare CUDA probe until the srun timeout."""
+    p = live_probe(slurm_jobid)
+    if p.get("fault"):
+        return "fail", p["fault"]
+    if not p["ok"]:
+        return "unknown", "probe_unverifiable"
+    return p.get("cuda") or "unknown", p.get("cuda_detail") or ""
+
+
 def request_repoll(reason):
     """Ask the poller to refresh now instead of waiting for its 900s cycle.
 
@@ -380,6 +442,48 @@ def _max_gpu(lines):
     return (util, used, total) if parsed else None
 
 
+def _run_probe(argv, timeout, stop_on=None):
+    """Run a probe step; returns (returncode | None, stdout). Stops waiting as soon as
+    `stop_on` appears on stdout: once a wedged node has said so there is nothing left
+    to wait for except the step's teardown, which was measured at 15–60 s there — all
+    of it spent holding queue.lock. returncode is None when we stopped early or timed
+    out; whatever was printed by then is still returned."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+    except OSError:
+        return None, ""
+    fd = proc.stdout.fileno()
+    buf = b""
+    deadline = time.time() + timeout
+    rc = None
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        ready, _, _ = select.select([fd], [], [], min(left, 1.0))
+        if not ready:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:                       # EOF: the step is over
+            try:
+                rc = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            break
+        buf += chunk
+        if stop_on and stop_on.encode() in buf:
+            break
+    if rc is None:
+        proc.terminate()                    # srun cancels the step
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass                            # reaped later by _reap_children()
+    proc.stdout.close()
+    return rc, buf.decode("utf-8", errors="replace")
+
+
 def live_probe(slurm_jobid):
     """Fast single-job GPU probe, bypassing the (possibly stale) node DB.
 
@@ -388,22 +492,26 @@ def live_probe(slurm_jobid):
     (feedback OPT-B / OBSERVED#2). Enumerates ALL the hold-job's GPUs (no --id=0;
     cgroup isolation scopes nvidia-smi to the job's own cards) and aggregates with
     max, so a node with any busy/dirty GPU is rejected. Returns {ok, util, mem_used,
-    mem_total}.
+    mem_total, cuda, cuda_detail}; on failure {ok: False} plus `fault` when the node
+    itself is at fault (see hh.parse_gpu_query) rather than the probe being unrunnable.
     """
-    probe = ("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
-             "--format=csv,noheader,nounits 2>/dev/null; "
-             f"echo {hh.CUDA_MARKER}; " + hh.cuda_probe_shell())
-    try:
-        out = subprocess.run(
-            ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
-             "bash", "-c", probe],
-            capture_output=True, text=True, timeout=LIVE_PROBE_TIMEOUT)
-    except (subprocess.TimeoutExpired, OSError):
-        return {"ok": False}
-    raw = (out.stdout or "")
+    # The GPU query runs under its own deadline (hh.gpu_query_shell) so a wedged driver
+    # comes back as a verdict — `fault` — instead of an srun timeout that looks like a
+    # transient miss. The CUDA probe is skipped when the query hung: it would block in
+    # the same driver call.
+    probe = (hh.gpu_query_shell()
+             + f"echo {hh.CUDA_MARKER}; "
+             + 'if [ -n "$_HIVE_GPU_HUNG" ]; then echo "CUDA_PROBE unknown gpu_hung"; else\n'
+             + hh.cuda_probe_shell() + "\nfi")
+    rc, raw = _run_probe(
+        ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
+         "bash", "-c", probe],
+        LIVE_PROBE_TIMEOUT, stop_on=f"{hh.GPU_MARKER} hung")
     gpu_part, _, cuda_part = raw.partition(hh.CUDA_MARKER)
-    lines = [l for l in gpu_part.strip().splitlines() if l.strip()]
-    if out.returncode != 0 or not lines:
+    lines, granted, fault = hh.parse_gpu_query(gpu_part.splitlines())
+    if fault:
+        return {"ok": False, "fault": fault}
+    if rc != 0 or not lines:
         return {"ok": False}
     agg = _max_gpu(lines)
     if agg is None:
@@ -649,7 +757,7 @@ def _is_crash_orphan(task):
 
 
 def run_one_cycle():
-    global _starve_streak
+    global _starve_streak, _starve_threshold
     _reap_children()   # clear exited srun zombies so liveness checks stay truthful
     jobs_db, db_updated = load_node_db()
     changed = False
@@ -866,7 +974,7 @@ def run_one_cycle():
                 hh.record_check(health, node_name, None, "no_hold_job")
                 health_changed = True
                 continue
-            verdict, detail = hh.cuda_probe(jid)
+            verdict, detail = health_probe(jid)
             outcome = hh.record_check(health, node_name, verdict, detail)
             health_changed = True
             logging.info("Health check %s via %s: %s %s%s", node_name, jid, verdict, detail,
@@ -888,13 +996,23 @@ def run_one_cycle():
         )
 
         dispatched = 0
+        node_reject = None   # last NODE-level rejection this cycle
         for task in pending:
             need_mb = int(task.get("need_mb") or NEED_MB_DEFAULT)
             want_gpus = int(task.get("gpus") or DEFAULT_TASK_GPUS)
-            # If the only reason nothing is dispatchable is that the pool's nodes are
-            # quarantined, say so instead of the generic reason.
-            reason = "node_quarantined" if (not candidates and n_quarantined_jobs) \
-                else "no_dispatchable_node"
+            excluded = set(task.get("exclude_nodes") or ())
+            # Say what is actually wrong instead of the generic reason: the pool has no
+            # hold job at all, its nodes are quarantined, or every candidate was
+            # rejected earlier this cycle (the first task used to get the real reason
+            # and every task behind it `no_dispatchable_node`).
+            if not jobs_db:
+                reason = "pool_empty"
+            elif not candidates and node_reject:
+                reason = node_reject
+            elif not candidates and n_quarantined_jobs:
+                reason = "node_quarantined"
+            else:
+                reason = "no_dispatchable_node"
             placed = False
 
             # `candidates` is shared by every pending task this cycle. A NODE-level
@@ -913,6 +1031,12 @@ def run_one_cycle():
                 else:
                     used, total = db_gpu_mem(info)
 
+                # Exclusion gate (task-level): `hive submit --exclude`.
+                if info.get("node") in excluded:
+                    reason = "node_excluded"
+                    i += 1
+                    continue
+
                 # GPU-count gate (task-level): a task asking for N GPUs must land on a
                 # hold job that actually owns N. Older DB records (no per-GPU array)
                 # report 0 and stay unrestricted, so legacy behaviour is kept.
@@ -923,24 +1047,59 @@ def run_one_cycle():
                     continue
 
                 if needs_verify or VERIFY_EVERY_DISPATCH:
+                    node_name = info.get("node", "?")
+                    held = probe_backoff_reason(jid)
+                    if held:
+                        reason = node_reject = held
+                        candidates.pop(i)      # node-level: silent last time, not re-probed yet
+                        continue
                     p = live_probe(jid)
+                    if p.get("fault"):
+                        # srun ran, SLURM granted a GPU, and the GPU did not answer.
+                        # No user code involved, but one slow nvidia-smi on a loaded
+                        # node is possible, so it takes STRIKES_TO_QUARANTINE of these.
+                        note_probe_result(jid, False, p["fault"])
+                        reason = node_reject = p["fault"]
+                        candidates.pop(i)      # node-level
+                        health_changed = True
+                        tripped = hh.strike(health, node_name, f"verify: {p['fault']}",
+                                            "verify")
+                        log_reject(jid, node_name, p["fault"],
+                                   f"strike {health['nodes'][node_name]['strikes']}")
+                        if tripped:
+                            quarantined.add(node_name)
+                            # this probe WAS the first health check
+                            health["nodes"][node_name]["last_check"] = time.time()
+                            candidates[:] = [c for c in candidates
+                                             if c[1].get("node") != node_name]
+                            logging.warning("Node %s QUARANTINED: GPU did not answer on "
+                                            "verify (%s). Its hold jobs keep using "
+                                            "allocation — `hive pool release <jobid>` "
+                                            "frees them.", node_name, p["fault"])
+                            ev.record("quarantine", node=node_name, source="verify",
+                                      reason=p["fault"])
+                        continue
+                    note_probe_result(jid, p["ok"])
                     if not p["ok"]:
-                        reason = "probe_unverifiable"
+                        reason = node_reject = "probe_unverifiable"
                         candidates.pop(i)      # node-level: can't confirm free this cycle
+                        log_reject(jid, node_name, reason,
+                                   f"no answer within {LIVE_PROBE_TIMEOUT}s or srun failed")
                         continue
                     used, total = p["mem_used"], p["mem_total"]
                     # A node the DB called idle but that is actually occupied:
                     if p["util"] >= 5 and used >= 500:
-                        reason = "node_busy_on_verify"
+                        reason = node_reject = "node_busy_on_verify"
                         candidates.pop(i)      # node-level
+                        log_reject(jid, node_name, reason, f"util={p['util']}% used={used}MiB")
                         continue
                     if p.get("cuda") == "fail":
                         # nvidia-smi says free, but a CUDA context can't be created:
                         # co-tenant outside our cgroup or a broken node. No user code
                         # involved, so this alone quarantines the node (hive health).
-                        node_name = info.get("node", "?")
-                        reason = "cuda_unavailable_on_verify"
+                        reason = node_reject = "cuda_unavailable_on_verify"
                         candidates.pop(i)      # node-level
+                        log_reject(jid, node_name, reason, p.get("cuda_detail") or "")
                         if node_name not in quarantined:
                             hh.quarantine(health, node_name,
                                           f"CUDA probe failed on verify: {p.get('cuda_detail')}",
@@ -958,8 +1117,9 @@ def run_one_cycle():
                     candidates[i] = (jid, info, False)
 
                 if used > GPU_CLEAN_MB:
-                    reason = "gpu_dirty"          # zombie / co-tenant memory resident
+                    reason = node_reject = "gpu_dirty"   # zombie / co-tenant memory resident
                     candidates.pop(i)          # node-level
+                    log_reject(jid, info.get("node", "?"), reason, f"used={used}MiB")
                     continue
                 if total and need_mb and (total - used) < need_mb:
                     reason = "waiting_for_mem"    # task-level
@@ -1033,12 +1193,14 @@ def run_one_cycle():
         # ── (3) Starvation watchdog ──────────────────────────────────────────
         if pending and dispatched == 0:
             _starve_streak += 1
-            if _starve_streak >= STARVATION_CYCLES:
+            if _starve_streak >= _starve_threshold:
                 request_repoll(f"starvation: {len(pending)} pending, 0 dispatched "
                                f"for {_starve_streak} cycles")
                 _starve_streak = 0
+                _starve_threshold = min(_starve_threshold * 2, STARVATION_CYCLES_MAX)
         else:
             _starve_streak = 0
+            _starve_threshold = STARVATION_CYCLES
 
         if changed:
             save_queue(queue, lfd)

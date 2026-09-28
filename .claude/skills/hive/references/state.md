@@ -48,6 +48,8 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `time_left_secs`: remaining walltime measured at the DB's `updated` (`-1` unlimited,
   `null` unknown); subtract the DB age for a live value.
 - `carried_forward: true`: last-good reading reused after a transient probe miss.
+- `probe_detail`: why a `probe_failed` probe failed — `srun_failed`, `gpu_unresponsive`,
+  `no_gpu_devices`; empty otherwise. The last two are never carried forward.
 - `polled_at`: when this record was last probed successfully (UTC).
 
 ## Health record fields

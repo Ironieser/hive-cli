@@ -42,6 +42,7 @@ hive pool add                           # sbatch 一个新占卡作业（默认 
 hive pool add highgpu                   # 使用指定 preset
 hive pool add ~/my.slurm                # 直接传 slurm 脚本路径
 hive pool add --count 3 --time 12:00:00 # 同时提交 3 个，覆盖时长
+hive pool add --exclude evc22,evc[40-43] # 不落在这些节点上（已隔离的节点会自动排除）
 hive pool release 584954                # scancel 指定占卡作业
 hive pool release --idle                # 自动 scancel 所有空闲节点
 hive pool config                        # 查看 preset 配置，验证脚本路径

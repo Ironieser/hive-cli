@@ -99,6 +99,76 @@ print("CUDA_PROBE ok" if r == 0 else f"CUDA_PROBE fail cuMemAlloc={r}")
 
 CUDA_MARKER = "---CUDA---"
 
+# ── The GPU query: nvidia-smi under a deadline that survives a hung driver ───
+# A node whose NVIDIA driver is wedged (observed on evc22, 2026-09-28: kernel thread
+# `nv_open_q` in D state, `nvidia-smi` answering "No devices were found" after 154 s,
+# root's own exporter stuck the same way) still runs `srun ... true` in 0.5 s. SLURM
+# keeps handing such a GPU out — nobody holds on to it — so hold jobs gravitate to it.
+# The old probe was a bare `nvidia-smi` under the caller's srun timeout, so this read
+# as "couldn't run the probe" (transient, retry forever): three hold jobs sat 24 h with
+# pending tasks while every one of ~870 probe steps per job timed out.
+#
+# `timeout nvidia-smi` is not enough: a process blocked in the driver is in
+# uninterruptible sleep and ignores SIGKILL until the call returns, and `timeout`
+# waits for it. So the query runs in the background with its output in a file (it must
+# not hold the step's stdout open) and the step stops waiting at the deadline.
+GPU_QUERY_DEADLINE = 20     # seconds; a healthy node answers in well under 10. Measured on
+                            # the wedged node: +4 s step start, +15 s step teardown after
+                            # the verdict, so callers need ~deadline + 30 s of srun timeout
+GPU_MARKER = "GPU_PROBE"
+GPU_QUERY_FIELDS = "utilization.gpu,memory.used,memory.total"
+
+
+def gpu_query_shell(fields=GPU_QUERY_FIELDS, deadline=None):
+    """Shell snippet printing, in order: `GPU_PROBE granted=<CUDA_VISIBLE_DEVICES>`
+    (empty = SLURM gave this job no GPU), nvidia-smi's csv lines, then
+    `GPU_PROBE rc=<n>` or `GPU_PROBE hung`. Sets $_HIVE_GPU_HUNG when it gave up."""
+    if deadline is None:
+        deadline = float(os.environ.get("HIVE_GPU_QUERY_DEADLINE", GPU_QUERY_DEADLINE))
+    ticks = max(1, int(deadline * 2))
+    return (
+        f'echo "{GPU_MARKER} granted=${{CUDA_VISIBLE_DEVICES:-}}"; '
+        '_o=$(mktemp 2>/dev/null || echo "/tmp/hive_gpuq.$$"); '
+        f'( nvidia-smi --query-gpu={fields} --format=csv,noheader,nounits >"$_o" 2>&1; '
+        'echo $? >"$_o.rc" ) </dev/null >/dev/null 2>&1 & '
+        f'_i=0; while [ ! -s "$_o.rc" ] && [ "$_i" -lt {ticks} ]; do sleep 0.5; _i=$((_i+1)); done; '
+        '_HIVE_GPU_HUNG=; '
+        f'if [ -s "$_o.rc" ]; then cat "$_o"; echo "{GPU_MARKER} rc=$(cat "$_o.rc")"; '
+        f'else _HIVE_GPU_HUNG=1; echo "{GPU_MARKER} hung"; fi; '
+        'rm -f "$_o" "$_o.rc"; '
+    )
+
+
+def parse_gpu_query(lines):
+    """(csv_lines, granted, fault) from gpu_query_shell output.
+
+    `fault` names a NODE fault and is only ever set when SLURM granted the job a GPU
+    (a CPU-only hold job legitimately sees no device): `gpu_unresponsive` — nvidia-smi
+    gave no answer by the deadline; `no_gpu_devices` — it answered but listed none.
+    `granted` is None when the probe printed no GPU_PROBE line at all (step never ran)."""
+    csv, granted, hung, answered = [], None, False, False
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        if ln.startswith(GPU_MARKER + " "):
+            rest = ln[len(GPU_MARKER) + 1:]
+            if rest.startswith("granted="):
+                granted = rest[len("granted="):].strip()
+            elif rest == "hung":
+                hung = True
+            elif rest.startswith("rc="):
+                answered = True
+            continue
+        csv.append(ln)
+    fault = None
+    if granted:
+        if hung:
+            fault = "gpu_unresponsive"
+        elif answered and not any(len(l.split(",")) >= 3 for l in csv):
+            fault = "no_gpu_devices"
+    return csv, granted, fault
+
 
 def cuda_probe_shell():
     """Shell snippet that runs CUDA_PROBE_PY on the node. Uses the interpreter this
@@ -145,6 +215,55 @@ def cuda_probe(slurm_jobid, timeout=CUDA_PROBE_TIMEOUT):
     if out.returncode != 0 and "CUDA_PROBE" not in (out.stdout or ""):
         return "unknown", f"srun_rc={out.returncode}"
     return parse_cuda_probe((out.stdout or "").splitlines())
+
+
+# ── Node lists (`hive pool add --exclude`, `hive submit --exclude`) ──────────
+def expand_nodes(spec):
+    """Node names from a SLURM-style list: 'evc22,evc[1-3,07],gpu01' →
+    ['evc22', 'evc1', 'evc2', 'evc3', 'evc07', 'gpu01']. Order kept, duplicates
+    dropped, zero padding preserved. Raises ValueError on unbalanced brackets."""
+    out, seen = [], set()
+    parts, depth, cur = [], 0, ""
+    for ch in (spec or ""):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth < 0:
+                raise ValueError(f"unbalanced ']' in node list: {spec}")
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if depth:
+        raise ValueError(f"unbalanced '[' in node list: {spec}")
+    parts.append(cur)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"([^\[\]]*)\[([^\[\]]+)\]([^\[\]]*)", part)
+        names = []
+        if not m:
+            if "[" in part or "]" in part:
+                raise ValueError(f"cannot parse node list entry: {part}")
+            names = [part]
+        else:
+            pre, body, post = m.groups()
+            for rng in body.split(","):
+                rng = rng.strip()
+                lo, _, hi = rng.partition("-")
+                if not lo.isdigit() or (hi and not hi.isdigit()):
+                    raise ValueError(f"cannot parse node range: {part}")
+                hi = hi or lo
+                for n in range(int(lo), int(hi) + 1):
+                    names.append(f"{pre}{str(n).zfill(len(lo))}{post}")
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+    return out
 
 
 # ── Log classification ───────────────────────────────────────────────────────

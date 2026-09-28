@@ -87,6 +87,14 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   probing filters PIDs by `/proc/<pid>/cgroup` containing `/job_<jobid>/`. The probe
   body is duplicated in `hive-daemon` and `hive-poll` — keep them in sync; the
   *post-processing* (warning timer + carry-forward) is shared via `hive-dbpost`.
+- **A probe that ran and got no answer from the GPU is a verdict, not a miss.** `nvidia-smi`
+  runs in the background under its own deadline (`gpu_query_shell` in `hive_health.py`,
+  duplicated in the two bash pollers) because a wedged driver blocks it in uninterruptible
+  sleep where `timeout` can't end it. `gpu_unresponsive` / `no_gpu_devices` — only when
+  SLURM granted a GPU (`CUDA_VISIBLE_DEVICES` set), so a CPU-only hold job is never at
+  fault — strike the node and are never carried forward; an srun that couldn't run stays
+  `probe_unverifiable`, never strikes, and backs off per hold job. Without this, three
+  hold jobs sat 24 h with pending tasks (2026-09-26) while every probe timed out.
 - `hive-dbpost` carries a `probe_failed` job forward to its last-good state (flagged
   `carried_forward`) for up to 30 min, so one transient probe miss doesn't drop a node.
 - A `busy→idle` transition first becomes `warning` (held in `gpu_idle_since`) before
@@ -125,6 +133,12 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   node. The scheduler re-probes quarantined nodes and releases them itself; don't add a
   static blacklist. Offline tests stub the probe via `HIVE_CUDA_PROBE_CMD` (the mock
   cluster has no GPU) and the live reading via `MOCK_LIVE_GPU`.
+- **New hold jobs stay off quarantined nodes.** `hive pool add` passes `--exclude` with
+  every node on the health list (SLURM favours broken nodes — their GPUs are always
+  free). A command-line `--exclude` *replaces* the script's `#SBATCH --exclude`, so
+  `build_exclude()` re-reads the script's list and merges it; never pass a bare one.
+  Task-level `exclude_nodes` (`hive submit --exclude`) is a task-level rejection
+  (`node_excluded`, `i += 1`).
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

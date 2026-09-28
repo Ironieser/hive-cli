@@ -116,6 +116,7 @@ case "$subcommand" in
     daemon   start|stop|restart|status|logs
     poll                      Trigger immediate node poll
     submit   "cmd"|job.hive   Submit to task queue (shortcut for queue submit)
+                              (--exclude NODES → never run on those nodes)
                               (--est-runtime 2h|auto → walltime-aware scheduling)
     wait     ID               Block until task done, print log, exit $?
     list                      Show task queue (shortcut for queue list)

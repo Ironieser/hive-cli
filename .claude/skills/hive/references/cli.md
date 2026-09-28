@@ -31,7 +31,7 @@ Exit codes of `hive wait`: `0` done · `1` failed · `75` never dispatched (`--p
 ## `hive submit`
 
 ```bash
-hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] \
+hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [--exclude NODES] \
             [--workdir DIR] [--priority N] "command string" | job.hive
 ```
 
@@ -42,6 +42,7 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] \
 | `--est-runtime` | — | `2h`, `90m`, `1-12:00:00`, seconds, or `auto` (P90 of NAME's history). With an estimate the scheduler never places the task on a node whose remaining walltime < estimate + 10 min (`insufficient_walltime`). Without one the task is walltime-blind. |
 | `--need-mb` | 0 | minimum **free** GPU memory; task waits (`waiting_for_mem`) until a card has it |
 | `--gpus` | 1 | GPUs the task may see. A hold job may own more; hive narrows `CUDA_VISIBLE_DEVICES` to the first N so frameworks don't auto-`DataParallel` over cards you didn't ask for. `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`). |
+| `--exclude` / `-x` | — | nodes the task must not run on (`evc22,evc[40-43]`); it waits (`node_excluded`) rather than use them. Broken nodes don't need this — hive quarantines them itself |
 | `--workdir` / `-w` | cwd | working directory on the node |
 | `--priority` / `-p` | 0 | higher dispatches first (`-p=-5` for negatives) |
 
@@ -66,7 +67,7 @@ MODEL=/tmp/Qwen3-VL-4B-Instruct
 python eval.py --model $MODEL --skip-existing
 ```
 
-Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`. Other `#` lines
+Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`, `exclude`. Other `#` lines
 are comments; the rest is the command.
 
 ## `hive list`
@@ -97,13 +98,17 @@ queue · 1 running · 2 pending · 10 of 243 finished in last 7d shown · +233 m
 
 | Reason | Meaning |
 |---|---|
-| `no_dispatchable_node` | No idle pool node → wait or `hive pool add` |
+| `pool_empty` | The pool has no hold job at all (expired / never added) → `hive pool add`; waiting will not help |
+| `no_dispatchable_node` | Hold jobs exist but all are busy → wait or `hive pool add` |
 | `waiting_for_mem` | No card has the task's `--need-mb` free |
+| `node_excluded` | The only free nodes are in the task's `--exclude` list |
 | `insufficient_gpus` | No hold job owns `--gpus N` cards → add a `--gres=gpu:N` hold job or lower N |
 | `insufficient_walltime` | No node has est + 10 min left → `hive pool add --time …` or lower `--est-runtime` |
 | `gpu_dirty` | Idle-looking card has > 5 GB resident (zombie / co-tenant) |
 | `node_busy_on_verify` | Pre-dispatch probe found the card in use |
-| `probe_unverifiable` | Couldn't run the probe (transient srun failure) |
+| `probe_unverifiable` | Couldn't run the probe (srun failed / no answer); that hold job is retried with backoff (1 → 10 min) |
+| `gpu_unresponsive` | The probe ran but `nvidia-smi` never answered — the node's GPU driver is wedged. Two in a row quarantine the node |
+| `no_gpu_devices` | SLURM granted a GPU but `nvidia-smi` lists none — broken node; same strikes as above |
 | `cuda_unavailable_on_verify` | Pre-dispatch CUDA context creation failed → node quarantined |
 | `node_quarantined` | Every remaining node is quarantined → `hive health` |
 | `node_quarantined_redispatch` | Died at CUDA init on a node that just got quarantined; re-running elsewhere |
@@ -185,12 +190,16 @@ hive pool add                    # sbatch a new hold job (default preset)
 hive pool add highgpu            # named preset from ~/.hive/pool_config.json
 hive pool add ~/hold.slurm       # explicit script
 hive pool add --count 2 --time 12:00:00
+hive pool add --exclude evc22,evc[40-43]   # keep the hold job off these nodes
 hive pool config                 # presets + sbatch --test-only validation (✓/✗)
 hive pool release --idle | JOBID # ⚠ HUMAN-ONLY: refuses without a TTY; no --yes/--force
 ```
 
 `pool add` validates with `sbatch --test-only` first and redirects hold-job stdout to
-`~/.hive/pool-logs/`. Never `scancel` hold jobs directly: running tasks on them would
+`~/.hive/pool-logs/`. It excludes every quarantined node (`hive health`) by itself —
+SLURM favours broken nodes because their GPUs are always free — plus `--exclude`, the
+script's own `#SBATCH --exclude`, and an `"exclude"` key in `pool_config.json` (top
+level or per preset). `--no-auto-exclude` turns the first off. Never `scancel` hold jobs directly: running tasks on them would
 be orphaned and requeued.
 
 ## Daemons & multi-node

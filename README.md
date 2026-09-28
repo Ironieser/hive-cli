@@ -42,6 +42,7 @@ hive pool add               # sbatch a new hold job (default preset)
 hive pool add highgpu       # use a named preset
 hive pool add ~/my.slurm    # pass a script path directly
 hive pool add --count 3 --time 12:00:00   # 3 nodes, override wall time
+hive pool add --exclude evc22,evc[40-43]  # keep off these nodes (quarantined nodes are excluded automatically)
 hive health                 # bad-node quarantine list (self-maintained; see docs/status_model.md)
 hive health report evc43    # quarantine a node now; hive re-probes it and releases it when healthy
 hive pool release 584954    # scancel a specific hold job

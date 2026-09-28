@@ -47,6 +47,7 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--est-runtime 2h\|90m\|auto` | walltime-aware placement (`auto` = P90 of NAME's history) |
 | `--need-mb 60000` | hold until a GPU has that much free memory (big models) |
 | `--gpus N` | GPUs the task may see (default **1**; extras are hidden so frameworks don't auto-DataParallel) |
+| `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
 | `--priority N` | higher dispatches first |
 
@@ -76,10 +77,11 @@ The NODE column of `hive list` says why. The common ones:
 
 | reason | meaning → what to do |
 |---|---|
-| `no_dispatchable_node` | no free hold job → `hive nodes`; wait or `hive pool add` |
+| `pool_empty` | the pool has no hold job → `hive pool add` (waiting will not help) |
+| `no_dispatchable_node` | every hold job is busy → `hive nodes`; wait or `hive pool add` |
 | `waiting_for_mem` / `insufficient_gpus` / `insufficient_walltime` | your task's requirement isn't met by any node → lower it or `hive pool add …` |
 | `gpu_dirty` / `node_busy_on_verify` | a card looked free but isn't (co-tenant / zombie) → wait |
-| `cuda_unavailable_on_verify` / `node_quarantined` | node can't create a CUDA context; hive quarantined it → `hive health` |
+| `gpu_unresponsive` / `cuda_unavailable_on_verify` / `node_quarantined` | the node's GPU is broken; hive quarantines it → `hive health`, then `hive pool add` for a replacement |
 | `infra_failure_redispatch` | node reclaimed mid-run; re-running elsewhere (progress lost unless checkpointed) |
 
 Full table and node STATUS legend (`BUSY/CLAIM/IDLE/WARN/PFAIL/QUAR/CPU`):

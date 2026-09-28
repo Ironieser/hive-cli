@@ -45,6 +45,7 @@ PYTHON      = sys.executable  # same interpreter (vlm conda env)
 # Shared append-only event log (durable timing/runtime history).
 sys.path.insert(0, LIBEXEC_DIR)
 import hive_events as ev
+import hive_health as hh   # expand_nodes for --exclude
 
 HEARTBEAT_DAEMON_TIMEOUT = 90   # 3× poll interval → daemon considered dead
 
@@ -313,6 +314,8 @@ def parse_hive_file(path):
             pass
     if "est_runtime" in meta:
         result["est_runtime"] = meta["est_runtime"]   # parsed/resolved in cmd_submit
+    if "exclude" in meta:
+        result["exclude"] = meta["exclude"]           # expanded in cmd_submit
 
     return result
 
@@ -496,6 +499,17 @@ def cmd_submit(args):
         print(f"{C_RED}error: --gpus must be >= 0{C_RESET}", file=sys.stderr)
         sys.exit(2)
 
+    # Nodes this task must not run on: --exclude > #HIVE exclude=. Stored expanded, so
+    # the scheduler compares plain names.
+    excl_raw = getattr(args, "exclude", None) or spec.get("exclude")
+    exclude_nodes = []
+    if excl_raw:
+        try:
+            exclude_nodes = hh.expand_nodes(excl_raw)
+        except ValueError as e:
+            print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
+            sys.exit(2)
+
     # Runtime estimate (drives walltime-aware scheduling). Source priority:
     # CLI --est-runtime > #HIVE est_runtime=. Value 'auto' resolves from history.
     est_raw = None
@@ -549,6 +563,7 @@ def cmd_submit(args):
             "exit_code":    None,
             "need_mb":      spec.get("need_mb", 0),
             "gpus":         spec.get("gpus", DEFAULT_TASK_GPUS),
+            "exclude_nodes": exclude_nodes,
             "est_runtime_secs":    est_secs,
             "est_source":          est_source,
             "requeue_count":       0,
@@ -566,6 +581,8 @@ def cmd_submit(args):
                   priority=spec.get("priority") or None)
 
     print(f"Submitted task #{task_id}" + (f"  (owner: {spec['owner']})" if spec.get("owner") else ""))
+    if exclude_nodes:
+        print(f"  excluded nodes: {', '.join(exclude_nodes)}")
     if est_secs:
         print(f"  runtime estimate: {fmt_elapsed(est_secs)} (source: {est_source}) — "
               f"scheduler will avoid nodes with < estimate + 10m walltime left")
@@ -1194,6 +1211,9 @@ def build_parser():
                          f"may own several; extra ones are hidden via CUDA_VISIBLE_DEVICES so "
                          f"frameworks don't auto-DataParallel. Use --gpus 2 for real multi-GPU; "
                          f"the task then only places on a hold job with >= 2 GPUs")
+    ps.add_argument("--exclude", "-x", metavar="NODES",
+                    help="Nodes this task must not run on (evc22,evc[40-43]). The task "
+                         "waits (node_excluded) rather than use them")
     ps.add_argument("--est-runtime", metavar="DUR", dest="est_runtime",
                     help="Estimated runtime (e.g. 2h, 90m, 1-12:00:00, or 'auto' to use "
                          "P90 of this name's history). The scheduler then won't place the "

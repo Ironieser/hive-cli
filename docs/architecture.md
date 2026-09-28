@@ -110,6 +110,7 @@ node_monitor.json    # DB written by daemon/poll (+ hive-dbpost), read by nodes/
       "gpu": [{"index":0, "util":87, "mem_used":42301, "mem_total":81920}],
       "processes": [{"pid":1234, "cpu":242, "mem":5.4, "elapsed":"1d2h", "cmd":"python ..."}],
       "status": "idle|busy|warning|cpu|probe_failed",   # see docs/status_model.md
+      "probe_detail": "",               # srun_failed | gpu_unresponsive | no_gpu_devices
       "gpu_idle_since": null,                            # busy→idle grace timer
       "carried_forward": true,                           # (optional) last-good reused after a probe miss
       "time_left_secs": 79200,                           # remaining hold-job walltime (squeue %L); -1=unlimited, null=unknown

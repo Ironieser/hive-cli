@@ -1,6 +1,7 @@
 {
   "_comment": "Copy this file to ~/.hive/pool_config.json and edit for your cluster. Never commit pool_config.json to git.",
   "default": "normal",
+  "exclude": "",
   "presets": {
     "normal": {
       "script": "~/1_normal_gpu.slurm",

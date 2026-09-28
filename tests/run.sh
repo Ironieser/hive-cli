@@ -41,6 +41,10 @@ cat > "$TMP/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
 # compute-apps: no GPU processes in the mock cluster
 [[ "$*" == *"--query-compute-apps"* ]] && exit 0
+# A wedged driver: nvidia-smi never answers within the probe's deadline.
+[[ -n "${MOCK_GPU_HANG:-}" ]] && { sleep "${MOCK_GPU_HANG}"; echo "No devices were found"; exit 6; }
+# A broken node that does answer, with nothing.
+[[ -n "${MOCK_GPU_NONE:-}" ]] && { echo "No devices were found"; exit 6; }
 # query-gpu: the daemon/poll probe asks for 'index,...' (4 fields, ALL the job's GPUs) —
 # emit a 2-GPU node (GPU0 idle, GPU1 busy) so the poller proves it now sees BOTH cards
 # (the old --id=0 probe would have missed GPU1). The sched live_probe asks without
@@ -88,6 +92,21 @@ print("  [OK] poller sees BOTH GPUs (idx 0,1); node busy because GPU1 is busy")
 assert '801' not in d['jobs'], sorted(d['jobs'])
 print("  [OK] hive-poll filters cursor_ssh_proxy like the daemon (was: no %j column, grep never matched)")
 PY
+echo "[poll] wedged GPU driver is a probe failure with a reason, never cpu/idle"
+# (the previous poll left this job `busy`: a node fault must not be carried forward)
+# HANG goes last: under the mock srun the stuck query is a local child that inherits the
+# poller's node-DB flock for as long as it sleeps, so a poll right after it would skip.
+for mode in "MOCK_GPU_NONE=1:no_gpu_devices" "MOCK_GPU_HANG=4:gpu_unresponsive"; do
+  env "${mode%%:*}" HIVE_GPU_QUERY_TICKS=2 CUDA_VISIBLE_DEVICES=0 "$REPO/libexec/hive-poll" >/dev/null 2>&1 || true
+  WANT="${mode##*:}" "$PY" - <<'PY' || fail=1
+import json, os
+j = json.load(open(os.environ['HIVE_DIR'] + '/node_monitor.json'))['jobs']['700']
+want = os.environ['WANT']
+assert j['status'] == 'probe_failed' and j.get('probe_detail') == want, (j['status'], j.get('probe_detail'))
+print(f"  [OK] {want}: status=probe_failed, probe_detail={want}")
+PY
+done
+rm -f "$HIVE_DIR/node_monitor.json"
 smoke() { if "$@" >/dev/null 2>&1; then echo "  [OK] $label"; else echo "  [FAIL] $label"; fail=1; fi; }
 label="submit --est-runtime"; smoke "$PY" "$REPO/libexec/hive-queue" submit "true" --name reg --est-runtime 30m
 label="list";                 smoke "$PY" "$REPO/libexec/hive-queue" list
