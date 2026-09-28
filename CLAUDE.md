@@ -232,9 +232,22 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   gets `cancel_requested` + `preempted_by`; the cancel branch of step (1) turns that
   into `pending`. Never pick a victim of equal priority, a gang member, or one that
   did not say `preemptible`.
-- **Autoscale spends allocation by itself**, so every path in `hive_autoscale.plan()`
-  must be bounded: `max_nodes` counts unusable hold jobs too, and "SLURM could not be
-  asked" means submit nothing. It runs in a thread and goes through `hive pool add`.
+- **Autoscale spends allocation by itself, so it fails closed.** It counts hold jobs
+  by asking SLURM (`observe()`: the user's jobs whose stdout is under `pool-logs/`),
+  never from the node DB, which is empty with the poller down and behind otherwise.
+  SLURM unreachable, state file unreadable or UNWRITABLE, any setting not exactly
+  valid (`"enabled"` must be JSON `true`, `until` is required) → submit nothing. The
+  state is written before submitting and kept in memory too. `max_nodes` counts every
+  hold job, usable or not. `hive pool autoscale` must go through the same functions.
+- **`--warn-before` signals the command's process group.** The command runs under
+  `setsid` with a no-op USR1 trap in its shell; signalling that shell alone killed it
+  and orphaned the program behind it. The heartbeat and sampler loops ignore USR1.
+- **A preemption must be worth it and must be finished.** `pick_victim` only names a
+  task on a hold job the preemptor can use and whose step this scheduler can stop; the
+  victim is requeued when its step is gone, and the freed hold job is kept for the
+  preemptor (`_reserved`). A user's `hive cancel` beats a preemption under way.
+- **`hive nodes` rows are tab-separated and read by bash**: every cell goes through
+  `cell()` (never empty, no tab or newline) and every row through `emit()` in a `try`.
 - **The scheduler wakes on `sched.wake` and on exit files** (`idle_wait`), at least
   `MIN_CYCLE_GAP` after the last cycle. CLI commands that change what may run call
   `wake_scheduler()`.

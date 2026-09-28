@@ -1159,7 +1159,7 @@ def _nsR(**kw):
                 gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
                 after_any=None, array=None, max_running=None, allow_slow=None, quiet=False,
                 begin=None, cpus=None, mem=None, warn_before=None, nodes=None,
-                preempt=None, preemptible=None)
+                preempt=None, preemptible=None, same_node=None)
     base.update(kw); return _apR.Namespace(**base)
 def _new():
     return max(rq().values(), key=lambda t: t["id"])
@@ -2009,8 +2009,72 @@ for _p in _victims:
     _p.poll() is None and _p.kill()
 hs._reserved.clear()
 hs.live_probe = _lpR
-_rc(hq.cmd_submit, _nsR(name="pp", preempt=True, preemptible=True))
-chk("--preempt / --preemptible stored", _new()["preempt"] is True and _new()["preemptible"] is True)
+_rc(hq.cmd_submit, _nsR(name="pp", preempt=True, priority=3)); _a = _new()
+_rc(hq.cmd_submit, _nsR(name="pv", preemptible=True)); _b = _new()
+chk("--preempt / --preemptible stored", _a["preempt"] is True and _b["preemptible"] is True
+    and _a["preemptible"] is False and _b["preempt"] is False)
+
+# red team round 3 — CLI
+json.dump({"version": 1, "next_id": 1000, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+for kw, what in ((dict(preempt=True, preemptible=True), "--preempt with --preemptible"),
+                 (dict(nodes=2, preempt=True), "--nodes with --preempt"),
+                 (dict(nodes=2, preemptible=True), "--nodes with --preemptible"),
+                 (dict(nodes=2, gpus=0), "--nodes with --gpus 0"),
+                 (dict(nodes=3, max_running=2, owner="o"), "--nodes 3 with --max-running 2"),
+                 (dict(same_node=True), "--same-node without --nodes"),
+                 (dict(begin="2020-01-01"), "--begin in the past"),
+                 (dict(begin="8"), "--begin 8 (eight what?)")):
+    chk(f"refused: {what}", _rc(hq.cmd_submit, _nsR(**kw))[0] == 2)
+chk("nothing was queued by the refused submits", rq() == {})
+_c, _o = _rc(hq.cmd_submit, _nsR(name="weak", preempt=True))
+chk("--preempt at priority 0 says it will not preempt anything", "strictly LOWER" in _o)
+def hive_file(text):
+    path = os.path.join(hs.HIVE_DIR, "x.hive"); open(path, "w").write(text); return path
+_pf = hq.parse_hive_file(hive_file("#HIVE warn-before=10m\n#HIVE need-mb=30000\n#HIVE est-runtime=2h\n"
+                                   "#HIVE preemptible\n#HIVE nodes=2\n#HIVE same-node=yes\necho x\n"))
+chk("directives spelled like the flags, and bare boolean ones, are read",
+    (_pf.get("warn_before"), _pf.get("need_mb"), _pf.get("est_runtime"), _pf.get("preemptible"),
+     _pf.get("nodes"), _pf.get("same_node")) == ("10m", "30000", "2h", "yes", "2", "yes"))
+chk("an unknown directive is an error, not silence",
+    _rc(hq.cmd_submit, _nsR(cmd_or_file=hive_file("#HIVE warn_befor=5m\necho x\n")))[0] == 2)
+chk("a directive without the value it needs is an error",
+    _rc(hq.cmd_submit, _nsR(cmd_or_file=hive_file("#HIVE timeout\necho x\n")))[0] == 2)
+chk("#HIVE preempt=enabled is an error, not a silent no",
+    _rc(hq.cmd_submit, _nsR(cmd_or_file=hive_file("#HIVE preempt=enabled\necho x\n")))[0] == 2)
+_rc(hq.cmd_submit, _nsR(cmd_or_file=hive_file("#HIVE preempt=yes\n#HIVE priority=4\necho x\n"), preempt=False))
+chk("--no-preempt overrides the file", _new()["preempt"] is False and _new()["priority"] == 4)
+chk("--nodes as a directive with --array is refused",
+    _rc(hq.cmd_submit, _nsR(cmd_or_file=hive_file("#HIVE nodes=2\necho x\n"), array="0-3"))[0] == 2)
+# hold / priority / wait on a member of a multi-node task mean the task
+json.dump({"version": 1, "next_id": 1010, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="gg", nodes=2, cmd_or_file="sleep 1"))
+_c, _o = _rc(hq.cmd_hold, _apR.Namespace(id=[1011], array=None), True)
+chk("hive hold on one member holds them all", all(rq()[k].get("held") for k in ("1010", "1011")) and "all 2 members" in _o)
+wdb({"700": node("a", 72000), "701": node("b", 72000)})
+hs.run_one_cycle()
+chk("...and none of them starts", [rq()[k]["state"] for k in ("1010", "1011")] == ["pending"] * 2)
+_rc(hq.cmd_priority, _apR.Namespace(priority=7, id=[1010], array=None))
+chk("hive priority on one member moves them all", {rq()[k]["priority"] for k in ("1010", "1011")} == {7})
+_rc(hq.cmd_hold, _apR.Namespace(id=[1010], array=None), False)
+# --same-node: two 1-GPU hold jobs on ONE node, used together by two processes
+hs.run_one_cycle(); time.sleep(0.3); time.sleep(1.2); hs.run_one_cycle()
+json.dump({"version": 1, "next_id": 1020, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="pair", nodes=2, same_node=True,
+    cmd_or_file='echo "rank=$HIVE_GANG_RANK hosts=$HIVE_GANG_HOSTS"; sleep 1'))
+wdb({"700": node("one", 72000), "701": node("one", 72000)})
+hs.run_one_cycle(); time.sleep(0.4)
+q = rq()
+chk("--same-node: both members start, on the two hold jobs of the one node",
+    sorted(q[k].get("slurm_jobid") for k in ("1020", "1021")) == ["700", "701"]
+    and q["1020"].get("gang_hosts") == "one,one")
+json.dump({"version": 1, "next_id": 1030, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="apart", nodes=2, cmd_or_file="sleep 1"))
+time.sleep(1.2); hs.run_one_cycle()
+wdb({"700": node("one", 72000), "701": node("one", 72000)})
+hs.run_one_cycle()
+chk("without --same-node the same pool is not enough",
+    {rq()[k].get("pending_reason") for k in ("1030", "1031")} == {"waiting_for_gang"})
+for k in (1030, 1031): _rc(hq.cmd_cancel, _apR.Namespace(id=k, array=None, force=True))
 
 # B1 — autoscale. It counts hold jobs by asking SLURM, and does nothing when unsure.
 C = {"preset": "highgpu", "min_nodes": 4, "max_nodes": 6, "time": "7-00:00:00",

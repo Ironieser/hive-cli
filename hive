@@ -119,6 +119,9 @@ case "$subcommand" in
                               (--exclude NODES → never run on those nodes)
                               (--timeout 2h → killed after that run time; --notify CMD)
                               (--after ID → pipeline; --array 0-9%4 → sweep)
+                              (--nodes N → multi-node; --preempt / --preemptible)
+                              (--begin WHEN; --cpus N --mem MiB; --warn-before 10m)
+                              all flags: hive submit --help
                               (--est-runtime 2h|auto → walltime-aware scheduling)
     wait     ID [ID…]|--array A  Block until done. One ID: log tail + its exit code.
                               Several / an array: one line each, exit 1 if any failed

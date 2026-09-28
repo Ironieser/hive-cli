@@ -315,86 +315,110 @@ def fmt_left(secs):
     return f"{m}m"
 
 jobs = data.get("jobs", {})
-for jobid in sorted(jobs.keys(), key=lambda x: int(x) if x.isdigit() else 0):
-    j = jobs[jobid]
-    node     = j.get("node", "")
-    part     = j.get("partition", "")
-    elapsed  = j.get("job_elapsed", "")
-    status   = j.get("status", "idle")
-    polled_at= j.get("polled_at", "")
+def num(x, default=0):
+    """A number out of whatever the DB holds ("N/A", null, "12.0")."""
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return default
 
-    # Over ALL of the hold job's cards: the busiest card's utilisation and the memory
-    # of all of them together. Card 0 alone said "0%  0G/80G" for a hold job whose
-    # second card was at 90%.
-    gpus = j.get("gpu", [])
-    if gpus:
-        gpu_util  = max(int(g.get("util", 0) or 0) for g in gpus)
-        mem_used  = sum(int(g.get("mem_used", 0) or 0) for g in gpus)
-        mem_total = sum(int(g.get("mem_total", 0) or 0) for g in gpus)
-    else:
-        gpu_util = mem_used = mem_total = 0
+def cell(x, empty="?"):
+    """One table cell: never empty and never with a tab or newline in it — the rows
+    are tab-separated and read by bash, where either shifts every column after it."""
+    text = " ".join(str(x if x is not None else "").split())
+    return text or empty
 
-    mem_str = f"{mem_gb(mem_used)}/{mem_gb(mem_total)}"
-    if len(gpus) > 1:
-        mem_str += f" x{len(gpus)}"
+def emit(jobid, j):
+        node     = cell(j.get("node"))
+        part     = cell(j.get("partition"))
+        elapsed  = cell(j.get("job_elapsed"))
+        status   = cell(j.get("status"), "idle")
+        polled_at= j.get("polled_at") or ""
 
-    procs = j.get("processes", [])
-    task_cmd = ""
-    if procs:
-        best = max(procs, key=lambda p: float(p.get("cpu", 0)))
-        raw_cmd = best.get("cmd", "")
-        m = re.search(r"(python\S*\s.+|bash\s.+)", raw_cmd)
-        task_cmd = m.group(1).strip() if m else raw_cmd.strip()
+        # Over ALL of the hold job's cards: the busiest card's utilisation and the memory
+        # of all of them together. Card 0 alone said "0%  0G/80G" for a hold job whose
+        # second card was at 90%.
+        gpus = [g for g in (j.get("gpu") or []) if isinstance(g, dict)]
+        if gpus:
+            gpu_util  = max(num(g.get("util")) for g in gpus)
+            mem_used  = sum(num(g.get("mem_used")) for g in gpus)
+            mem_total = sum(num(g.get("mem_total")) for g in gpus)
+        else:
+            gpu_util = mem_used = mem_total = 0
 
-    # Override with authoritative queue data if a hive task owns this job
-    qt = jobid_to_task.get(jobid)
-    if qt:
-        tid    = qt["id"]
-        name   = qt.get("name") or ""
-        if name and qt.get("array_index") is not None:
-            name = f"{name}[{qt['array_index']}]"
-        owner  = qt.get("owner") or ""
-        qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
-        more   = len(jobid_tasks.get(jobid, [])) - 1
-        n_gpu  = len(gpus)
-        held   = sum(len(t.get("gpu_slots") or []) for t in jobid_tasks.get(jobid, []))
-        share  = f"(+{more} more, {held}/{n_gpu} GPUs) " if more > 0 else ""
-        prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
-        task_cmd = prefix + qcmd
-        # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
-        # busy: cold import / model load, or a poll older than the dispatch. The
-        # slot is taken regardless of GPU state — show it as CLAIMED instead of
-        # IDLE, which read as "scheduler ignores idle nodes" and cost several
-        # false-alarm debug sessions (feedback #4/#7/#17/#32).
-        if status in ("idle", "warning", "probe_failed", "unknown"):
-            status = "claimed"
-    # Quarantined node (CUDA init fails there): no dispatches until the scheduler's
-    # periodic CUDA probe passes. Shown over idle-ish states; a still-running task
-    # keeps BUSY/CLAIM so the operator can see it.
-    if node in quarantined and status not in ("busy", "claimed"):
-        status = "quarantined"
-    elif node in slow and status not in ("busy", "claimed"):
-        status = "slow"
+        mem_str = f"{mem_gb(mem_used)}/{mem_gb(mem_total)}"
+        if len(gpus) > 1:
+            mem_str += f" x{len(gpus)}"
 
-    if len(task_cmd) > 55:
-        task_cmd = task_cmd[:54] + "…"
+        procs = [p for p in (j.get("processes") or []) if isinstance(p, dict)]
+        task_cmd = ""
+        if procs:
+            best = max(procs, key=lambda p: num(p.get("cpu")))
+            raw_cmd = best.get("cmd") or ""
+            m = re.search(r"(python\S*\s.+|bash\s.+)", raw_cmd)
+            task_cmd = m.group(1).strip() if m else raw_cmd.strip()
 
-    stale_flag = "1" if is_job_stale(polled_at) else "0"
-    # A stale row says HOW stale (feedback #27): a WARN or IDLE row read 20 minutes
-    # ago was taken for the node's state now, and a busy node for an idle one.
-    if stale_flag == "1":
-        age = int(job_age(polled_at) or 0)
-        old = f"{age // 3600}h{age % 3600 // 60:02d}m" if age >= 3600 else f"{age // 60}m"
-        task_cmd = f"[read {old} ago] " + (task_cmd if task_cmd != "—" else "")
-        task_cmd = task_cmd.strip()
-    left = fmt_left(j.get("time_left_secs"))
+        # Override with authoritative queue data if a hive task owns this job
+        qt = jobid_to_task.get(jobid)
+        if qt:
+            tid    = qt["id"]
+            name   = qt.get("name") or ""
+            if name and qt.get("array_index") is not None:
+                name = f"{name}[{qt['array_index']}]"
+            owner  = qt.get("owner") or ""
+            qcmd   = " ".join(str(qt.get("cmd") or "").split())
+            more   = len(jobid_tasks.get(jobid, [])) - 1
+            n_gpu  = len(gpus)
+            # a task without gpu_slots (dispatched by an older scheduler) holds them all
+            held   = min(n_gpu, sum(len(t["gpu_slots"]) if t.get("gpu_slots") is not None else n_gpu
+                                    for t in jobid_tasks.get(jobid, [])))
+            share  = f"(+{more} more, {held}/{n_gpu} GPUs) " if more > 0 else ""
+            prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
+            task_cmd = prefix + qcmd
+            # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
+            # busy: cold import / model load, or a poll older than the dispatch. The
+            # slot is taken regardless of GPU state — show it as CLAIMED instead of
+            # IDLE, which read as "scheduler ignores idle nodes" and cost several
+            # false-alarm debug sessions (feedback #4/#7/#17/#32).
+            if status in ("idle", "warning", "probe_failed", "unknown"):
+                status = "claimed"
+        # Quarantined node (CUDA init fails there): no dispatches until the scheduler's
+        # periodic CUDA probe passes. Shown over idle-ish states; a still-running task
+        # keeps BUSY/CLAIM so the operator can see it.
+        if node in quarantined and status not in ("busy", "claimed"):
+            status = "quarantined"
+        elif node in slow and status not in ("busy", "claimed", "probe_failed"):
+            status = "slow"          # (a probe that failed says more than "slow")
 
-    # task_cmd MUST be last: bash IFS=$'\t' read collapses consecutive tabs
-    # (tab is IFS whitespace), so an empty task_cmd field would be swallowed.
-    # Putting it last lets the final read variable capture "" correctly.
-    fields = "\t".join([jobid, node, part, elapsed, status,
-                        str(gpu_util), mem_str, left, stale_flag, task_cmd])
-    print(f"JOB\t{fields}")
+        if len(task_cmd) > 55:
+            task_cmd = task_cmd[:54] + "…"
+
+        stale_flag = "1" if is_job_stale(polled_at) else "0"
+        # A stale row says HOW stale (feedback #27): a WARN or IDLE row read 20 minutes
+        # ago was taken for the node's state now, and a busy node for an idle one.
+        if stale_flag == "1":
+            age = int(job_age(polled_at) or 0)
+            old = f"{age // 3600}h{age % 3600 // 60:02d}m" if age >= 3600 else f"{age // 60}m"
+            task_cmd = f"[read {old} ago] " + (task_cmd if task_cmd != "—" else "")
+            task_cmd = task_cmd.strip()
+        left = fmt_left(j.get("time_left_secs"))
+
+        # task_cmd MUST be last: bash IFS=$'\t' read collapses consecutive tabs
+        # (tab is IFS whitespace), so an empty task_cmd field would be swallowed.
+        # Putting it last lets the final read variable capture "" correctly.
+        fields = "\t".join([cell(jobid), node, part, elapsed, status,
+                            str(gpu_util), cell(mem_str), cell(left, "—"), stale_flag,
+                            cell(task_cmd, "—")])
+        print(f"JOB\t{fields}")
+
+for jobid in sorted(jobs.keys(), key=lambda x: int(x) if str(x).isdigit() else 0):
+    # One unreadable record must cost one row, not the rest of the table: an
+    # exception here used to end the listing silently at that hold job.
+    try:
+        emit(jobid, jobs[jobid] if isinstance(jobs[jobid], dict) else {})
+    except Exception as e:
+        print("JOB\t" + "\t".join([cell(jobid), "?", "?", "?", "probe_failed", "0", "?", "—", "0",
+                                    cell(f"[unreadable record: {type(e).__name__}: {e}]")]))
 PYEOF
 
 # ── display helpers ───────────────────────────────────────────────────────────
@@ -418,11 +442,15 @@ show_table() {
     _PY="${HIVE_PYTHON:-}"
     [[ -z "$_PY" && -x "${HOME}/.conda/envs/vlm/bin/python3" ]] && _PY="${HOME}/.conda/envs/vlm/bin/python3"
     [[ -z "$_PY" ]] && _PY="$(command -v python3 2>/dev/null)"
-    parsed=$("$_PY" - "$DB_FILE" "$QUEUE_FILE" "$HEALTH_FILE" <<< "$PYTHON_PARSE" 2>/dev/null)
+    local parse_err; parse_err=$(mktemp 2>/dev/null || echo /dev/null)
+    parsed=$("$_PY" - "$DB_FILE" "$QUEUE_FILE" "$HEALTH_FILE" <<< "$PYTHON_PARSE" 2>"$parse_err")
     if [[ -z "$parsed" ]]; then
-        echo -e "\n  ${RED}Failed to parse DB (is python3 available?).${NC}\n"
+        echo -e "\n  ${RED}Failed to parse DB (is python3 available?).${NC}"
+        [[ -s "$parse_err" ]] && tail -3 "$parse_err" | sed 's/^/    /'
+        echo; rm -f "$parse_err"
         return 1
     fi
+    rm -f "$parse_err"
 
     local updated="" is_stale=0
     local -a rows=()
@@ -458,7 +486,7 @@ show_table() {
     print_col "$BOLD" "ELAPSED" 10
     print_col "$BOLD" "STATUS"  6
     print_col "$BOLD" "GPU%"    5
-    print_col "$BOLD" "MEM"     9
+    print_col "$BOLD" "MEM"     13
     print_col "$BOLD" "LEFT"    8
     print_col "$BOLD" "TASK"    0 ""
     printf "${NC}\n"
@@ -542,7 +570,7 @@ show_table() {
         print_col ""             "$elapsed"     10
         print_col "$status_color" "$status_upper" 6
         print_col "$gpu_color"   "$gpu_disp"    5
-        print_col ""             "$mem_str"     9
+        print_col ""             "$mem_str"     13
         # Warn-color the remaining walltime when a node is close to expiry.
         local left_color=""
         case "$left" in

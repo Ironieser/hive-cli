@@ -43,6 +43,7 @@ hive pool add highgpu       # use a named preset
 hive pool add ~/my.slurm    # pass a script path directly
 hive pool add --count 3 --time 12:00:00   # 3 nodes, override wall time
 hive pool add --exclude evc22,evc[40-43]  # keep off these nodes (quarantined nodes are excluded automatically)
+hive pool autoscale                       # what autoscale is set to and would do now
 hive health                 # bad-node quarantine list (self-maintained; see docs/status_model.md)
 hive health report evc43    # quarantine a node now; hive re-probes it and releases it when healthy
 hive pool release 584954    # scancel a specific hold job
@@ -188,6 +189,7 @@ hive submit --after a120 "python report.py"                    # after the WHOLE
 hive wait --array 120        |  hive wait 3 4 5                # one line per task, no logs
 hive cancel --array 120      |  hive cancel --force 3          # --force: scheduler not acting
 hive submit --nodes 4 'python ddp.py --rank $HIVE_GANG_RANK'   # 4 nodes, started together
+hive submit --nodes 2 --same-node 'python ddp.py …'            # 2 hold jobs, may be on one node
 hive submit --timeout 2h --notify 'curl -d "$HIVE_TASK_NAME $HIVE_TASK_STATE" URL' "python x.py"
 hive submit --gpus 2 --cpus 4 --mem 32000 "python x.py"        # cards, CPUs, memory (MiB)
 hive submit --begin 08:00 --warn-before 10m "python x.py"      # not before 8; SIGUSR1 10 min before the node expires
@@ -203,7 +205,7 @@ hive hold 3 | hive unhold 3 | hive priority 10 3               # shape what has 
 | the command's own | `0` = done |
 | `124` | killed by `--timeout` |
 | `125` | never ran: a task it was submitted `--after` did not end done |
-| `126` | a member of its multi-node task failed |
+| `126` | never ran: another member of its multi-node task failed (members that were running end `cancelled`) |
 | `75` / `130` / `2` | never dispatched (`--pending-timeout`) / cancelled / no such task |
 
 A hold job with N GPUs runs up to N single-GPU tasks at once; each sees only its own
@@ -233,8 +235,9 @@ A node with no hold job on it comes back when SLURM reports it rebooted, or when
 
 in `~/.hive/pool_config.json` makes the scheduler keep `min_nodes` usable hold jobs and
 replace the ones about to expire. It submits jobs on its own, so it is bounded:
-`max_nodes` in total, 2 per decision, 12 per day, nothing after `until`.
-`hive pool autoscale` shows what it would do. Other keys: `"prefer_partitions"`,
+`max_nodes` in total, 2 per decision, one decision per 10 minutes, 12 per day, nothing
+after `until` (required). It counts hold jobs by asking SLURM and does nothing when it
+cannot. `hive pool autoscale` shows what it would do. Other keys: `"prefer_partitions"`,
 `"fair_share"`, `"exclude"`, `"auto_prune_days"` (default 14), `"log_keep_days"`.
 
 ### Keeping the queue tidy

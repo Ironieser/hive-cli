@@ -169,6 +169,14 @@ def fmt_mem(mem_used_mib, mem_total_mib):
     return f"{mib_to_g(mem_used_mib)}/{mib_to_g(mem_total_mib)}"
 
 
+def _num(x, default=0):
+    """A number out of whatever the DB holds ("N/A", null, "12.0")."""
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return default
+
+
 def gpu_util_str(job):
     gpus = job.get("gpu", [])
     if not gpus:
@@ -392,17 +400,17 @@ class NodeTop:
             is_expanded = (jid == self.expanded)
 
             status = jdata.get("status", "unknown").upper()
-            node   = jdata.get("node", "?")
-            part   = jdata.get("partition", "?")
-            elapsed = jdata.get("job_elapsed", "?")
-            gpus   = jdata.get("gpu", [])
-            procs  = jdata.get("processes", [])
+            node   = str(jdata.get("node") or "?")
+            part   = str(jdata.get("partition") or "?")
+            elapsed = str(jdata.get("job_elapsed") or "?")
+            gpus   = [g for g in (jdata.get("gpu") or []) if isinstance(g, dict)]
+            procs  = [p_ for p_ in (jdata.get("processes") or []) if isinstance(p_, dict)]
 
             # GPU util / mem
             # over all the hold job's cards: busiest card, memory of all (as hive nodes)
-            util = max((int(g.get("util", 0) or 0) for g in gpus), default=0)
-            mem_used  = sum(int(g.get("mem_used", 0) or 0) for g in gpus)
-            mem_total = sum(int(g.get("mem_total", 0) or 0) for g in gpus)
+            util = max((_num(g.get("util")) for g in gpus), default=0)
+            mem_used  = sum(_num(g.get("mem_used")) for g in gpus)
+            mem_total = sum(_num(g.get("mem_total")) for g in gpus)
             mem_str   = fmt_mem(mem_used, mem_total) if gpus else "?"
 
             # Main task command — prefer authoritative queue data, fall back to probe
@@ -422,9 +430,10 @@ class NodeTop:
                 if name and qt.get("array_index") is not None:
                     name = f"{name}[{qt['array_index']}]"
                 owner  = qt.get("owner") or ""
-                qcmd   = qt.get("cmd", "").replace("\n", " ").strip()
+                qcmd   = " ".join(str(qt.get("cmd") or "").split())
                 _all   = self.jobid_tasks.get(jid, [])
-                _held  = sum(len(t.get("gpu_slots") or []) for t in _all)
+                _held  = min(len(gpus), sum(len(t["gpu_slots"]) if t.get("gpu_slots") is not None
+                                            else len(gpus) for t in _all))
                 share  = f"(+{len(_all) - 1} more, {_held}/{len(gpus)} GPUs) " if len(_all) > 1 else ""
                 prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
                 task_cmd = prefix + qcmd
@@ -499,10 +508,20 @@ class NodeTop:
             row += 1
 
         if row < max_row:
-            busy_count = sum(1 for _, j in self.rows if j.get("status") == "busy")
-            idle_count = sum(1 for _, j in self.rows if j.get("status") == "idle")
-            total = len(self.rows)
-            summary = f"  busy: {busy_count}   idle: {idle_count}   total: {total}"
+            # as shown in the rows: a quarantined or slow node is not "idle"
+            def _shown(j):
+                n_ = j.get("node")
+                st = j.get("status")
+                if st != "busy" and n_ in self.quarantined:
+                    return "quar"
+                if st not in ("busy", "probe_failed") and n_ in self.slow:
+                    return "slow"
+                return st
+            kinds = [_shown(j) for _, j in self.rows]
+            summary = (f"  busy: {kinds.count('busy')}   idle: {kinds.count('idle')}"
+                       + (f"   slow: {kinds.count('slow')}" if "slow" in kinds else "")
+                       + (f"   quarantined: {kinds.count('quar')}" if "quar" in kinds else "")
+                       + f"   total: {len(kinds)}")
             self._safe_addstr(row, 0, summary, curses.color_pair(C_HEADER))
             row += 1
 
@@ -510,7 +529,7 @@ class NodeTop:
 
     def _draw_detail(self, row, max_row, W, jid, jdata):
         """Draw expanded detail panel for a job."""
-        node = jdata.get("node", "?")
+        node = str(jdata.get("node") or "?")
         part = jdata.get("partition", "?")
 
         # Top border

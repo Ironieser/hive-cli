@@ -2391,7 +2391,17 @@ def _cycle(probe_cache, final):
                 return                        # ends the rest next pass
             # Not even worth a probe if the pool has fewer NODES than members: every
             # free hold job used to be probed every cycle for as long as the gang waited.
-            if len({c[1].get("node") for c in candidates}) < len(members):
+            # With --same-node the members only need cards of their own: that is the
+            # way to use several 1-GPU hold jobs of ONE node together — SLURM shows a
+            # job only its own cards, so no single process can see two of them, but
+            # two processes, one in each hold job, can work as one training.
+            same_ok = bool(first.get("gang_same_node"))
+            if same_ok:
+                room = sum(max(0, slot_count(c[1]) - len(used_slots.get(c[0], ()))) for c in candidates)
+                enough = room >= sum(max(1, task_gpus(m)) for m in members)
+            else:
+                enough = len({c[1].get("node") for c in candidates}) >= len(members)
+            if not enough:
                 wait_all("waiting_for_gang")
                 return
             chosen, nodes, why = [], set(), None
@@ -2406,11 +2416,13 @@ def _cycle(probe_cache, final):
                     # node the next members must stay off, exactly like a choice —
                     # else N members ask for N hold jobs of the same node, pass 2 can
                     # use one of them, and the gang never starts.
-                    for jid in set(wanted) - asked:
-                        nodes.add(jobs_db.get(jid, {}).get("node"))
+                    if not same_ok:
+                        for jid in set(wanted) - asked:
+                            nodes.add(jobs_db.get(jid, {}).get("node"))
                     continue
                 chosen.append((m, choice))
-                nodes.add(choice["node"])
+                if not same_ok:
+                    nodes.add(choice["node"])
             if len(chosen) < len(members):
                 for _m, choice in reversed(chosen):
                     release(choice)

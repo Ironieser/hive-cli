@@ -248,7 +248,7 @@ json.dump({"nodes": {"slown": {"state": "slow", "slow_init_secs": 184, "strikes"
           open(H + "/node_health.json", "w"))
 PY
 _nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-if grep -E "^ +700 +two.* BUSY +90% +40G/160G x2" <<<"$_nodes" >/dev/null; then
+if grep -E "^ +700 +two.* BUSY +90% +40G/160G x2 +20h0m " <<<"$_nodes" >/dev/null; then
   echo "  [OK] GPU% is the busiest card, MEM the sum over all cards"
 else echo "  [FAIL] multi-card columns"; echo "$_nodes" | tail -8; fail=1; fi
 if grep -E "^ +701 +slown.* SLOW " <<<"$_nodes" >/dev/null && grep -q "slow: 1" <<<"$_nodes"; then
@@ -258,6 +258,36 @@ if grep -E "^ +702 +oldrow.*\[read 2[45]m ago\]" <<<"$_nodes" >/dev/null; then
   echo "  [OK] a stale row says how old its reading is"
 else echo "  [FAIL] stale age"; echo "$_nodes" | tail -8; fail=1; fi
 rm -f "$HIVE_DIR/node_health.json"
+# A record the table cannot read costs that one row, not the rest of the table.
+"$PY" - <<'PY'
+import json, os, time
+H = os.environ['HIVE_DIR']
+now = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
+ok = lambda node: {"node": node, "partition": "gpu", "job_elapsed": "1h", "processes": [],
+    "gpu": [{"index": 0, "util": 0, "mem_used": 0, "mem_total": 81920}], "status": "idle",
+    "gpu_idle_since": None, "time_left_secs": 72000, "polled_at": now}
+json.dump({"updated": now, "jobs": {
+    "700": ok("first"),
+    "701": dict(ok("nullgpu"), gpu=None),
+    "702": dict(ok("badutil"), gpu=[{"index": 0, "util": "N/A", "mem_used": None, "mem_total": "81920"}]),
+    "703": dict(ok("nocmd"), partition="", job_elapsed=None),
+    "704": "not a record",
+    "705": ok("last")}}, open(H + "/node_monitor.json", "w"))
+json.dump({"version": 1, "next_id": 9, "tasks": {
+    "1": {"id": 1, "name": "multi\nline\tname", "cmd": None, "state": "running", "slurm_jobid": "703",
+          "node": "nocmd", "submitted_at": now, "started_at": now, "log": H + "/logs/task-1.log"},
+    "2": {"id": 2, "name": "old", "cmd": "python x.py", "state": "running", "slurm_jobid": "705",
+          "node": "last", "submitted_at": now, "started_at": now, "log": H + "/logs/task-2.log"}}},
+    open(H + "/queue.json", "w"))
+PY
+_nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+_rows=$(grep -cE "^ +70[0-5] " <<<"$_nodes")
+if [[ "$_rows" == 6 ]] && grep -q "total: 6" <<<"$_nodes" && grep -qE "^ +705 +last" <<<"$_nodes"; then
+  echo "  [OK] null / non-numeric / empty fields: all six rows are shown"
+else echo "  [FAIL] robust table ($_rows rows)"; echo "$_nodes" | tail -12; fail=1; fi
+if grep -E "^ +703 +nocmd +\? +\? +CLAIM" <<<"$_nodes" >/dev/null && grep -q "#1 multi line name" <<<"$_nodes"; then
+  echo "  [OK] empty cells and a name with tab / newline do not shift the columns"
+else echo "  [FAIL] column shift"; echo "$_nodes" | tail -12; fail=1; fi
 "$PY" -m py_compile "$REPO/libexec/hive-top" && echo "  [OK] hive top compiles" || { echo "  [FAIL] hive top"; fail=1; }
 
 echo

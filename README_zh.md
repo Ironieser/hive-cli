@@ -43,6 +43,7 @@ hive pool add highgpu                   # 使用指定 preset
 hive pool add ~/my.slurm                # 直接传 slurm 脚本路径
 hive pool add --count 3 --time 12:00:00 # 同时提交 3 个，覆盖时长
 hive pool add --exclude evc22,evc[40-43] # 不落在这些节点上（已隔离的节点会自动排除）
+hive pool autoscale                      # 自动补充的当前设置，以及它现在会做什么
 hive pool release 584954                # scancel 指定占卡作业
 hive pool release --idle                # 自动 scancel 所有空闲节点
 hive pool config                        # 查看 preset 配置，验证脚本路径
@@ -171,6 +172,7 @@ hive submit --after a120 "python report.py"                    # 等整个数组
 hive wait --array 120        |  hive wait 3 4 5                # 每个任务一行，不打印日志
 hive cancel --array 120      |  hive cancel --force 3          # --force：调度器无响应时使用
 hive submit --nodes 4 'python ddp.py --rank $HIVE_GANG_RANK'   # 4 个节点，同时启动
+hive submit --nodes 2 --same-node 'python ddp.py …'            # 2 个 hold job，可以在同一节点上
 hive submit --timeout 2h --notify 'curl -d "$HIVE_TASK_NAME $HIVE_TASK_STATE" URL' "python x.py"
 hive submit --gpus 2 --cpus 4 --mem 32000 "python x.py"        # GPU 数、CPU 数、内存 (MiB)
 hive submit --begin 08:00 --warn-before 10m "python x.py"      # 8 点后才启动；节点到期前 10 分钟发 SIGUSR1
@@ -186,7 +188,7 @@ hive hold 3 | hive unhold 3 | hive priority 10 3               # 调整尚未启
 | 命令自身的退出码 | `0` = 成功 |
 | `124` | 超过 `--timeout` 被终止 |
 | `125` | 未运行：它 `--after` 的任务没有成功结束 |
-| `126` | 所属多节点任务的某个成员失败 |
+| `126` | 未运行：所属多节点任务的另一个成员失败（已在运行的成员以 `cancelled` 结束）|
 | `75` / `130` / `2` | 一直未派发（`--pending-timeout`）/ 被取消 / 任务不存在 |
 
 拥有 N 张卡的 hold job 最多同时运行 N 个单卡任务，每个任务只能看到自己的卡。
@@ -215,8 +217,9 @@ CUDA context，两步各有时限：
 ```
 
 写入 `~/.hive/pool_config.json` 后，调度器会自动维持 `min_nodes` 个可用的 hold job，并在
-它们到期前提交替换的。它会自行提交作业，因此有四重上限：总数不超过 `max_nodes`，每次
-最多 2 个，每天最多 12 个，`until` 之后停止。`hive pool autoscale` 显示它当前会做什么。
+它们到期前提交替换的。它会自行提交作业，因此有多重上限：总数不超过 `max_nodes`，每次
+最多 2 个，每 10 分钟决策一次，每天最多 12 个，`until`（必填）之后停止。它通过查询
+SLURM 来统计 hold job，查询不到时什么都不做。`hive pool autoscale` 显示它当前会做什么。
 其他配置项：`"prefer_partitions"`、`"fair_share"`、`"exclude"`、`"auto_prune_days"`
 （默认 14）、`"log_keep_days"`。
 
@@ -253,6 +256,8 @@ hive feedback list                                       # 查看已提交的反
 
 每次提交会自动附带 hive 版本与队列/节点状态快照。反馈存入 `feedback/inbox/`，
 参见 [`feedback/TRIAGE.md`](feedback/TRIAGE.md)。
+
+调度器会自动清理结束超过 `auto_prune_days` 天的任务（默认 14 天）。
 
 ## 文件说明
 

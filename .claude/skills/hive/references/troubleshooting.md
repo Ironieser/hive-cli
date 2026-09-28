@@ -19,7 +19,8 @@
 | `hive queue daemon stop` says the scheduler is on another host | — | it leaves a stop request the scheduler honours within seconds; if it does not, log in to that host and stop it there |
 | `pool_empty` although autoscale is on | `hive pool autoscale` | it says why it is not submitting (max_nodes reached by unusable hold jobs, daily limit, `until` passed) |
 | `waiting_for_gang` never clears | `hive nodes` | the pool has fewer free NODES than `--nodes` asks for; two hold jobs on one node are one node |
-| Task `failed` with exit 126 | `hive list` | a member of its multi-node task failed; see that member's log |
+| Task `failed` with exit 126, or `cancelled` with `gang_member_failed` | `hive list --state failed` | another member of its multi-node task failed; that member's log says why |
+| `hive nodes` row says `[unreadable record: …]` | `hive poll` | the node DB holds something the table cannot read for that hold job; the other rows are right |
 | Node shows `SLOW` | `hive health` | works, but CUDA needs minutes to initialise. Takes long tasks (`--est-runtime` ≥ 1h) or `--allow-slow`, after every faster node. A task there is silent for minutes at start-up — that is not a hang (the log header says so). Becomes normal again after 2 checks at normal speed |
 | Node shows `QUAR` | `hive health` | quarantined; auto-released after 2 healthy probes, or `hive health clear NODE` |
 | Quarantined node with no hold job on it | `hive health` RESULT column | the health monitor takes over: released when SLURM reports the node **rebooted** since the quarantine, or when a `hive_canary` job (10 min, 1 GPU, every 6 h, pinned to the node) probes healthy twice. `canary_pending` = waiting in the SLURM queue. Don't cancel `hive_canary` jobs |

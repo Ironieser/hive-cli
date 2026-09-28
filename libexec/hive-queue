@@ -256,6 +256,8 @@ def parse_begin(text, now=None):
             return datetime.fromisoformat(text.replace(" ", "T")).timestamp()
         except ValueError:
             return None
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return None                  # "8": eight what? o'clock is 08:00, a delay is 8h
     secs = parse_duration(text)
     return now + secs if secs else None
 
@@ -463,6 +465,22 @@ def task_elapsed(task):
 
 # ── .hive file parser ─────────────────────────────────────────────────────────
 
+DIRECTIVES = {"workdir", "priority", "name", "owner", "need_mb", "gpus", "est_runtime",
+              "exclude", "timeout", "notify", "after", "after_any", "array", "max_running",
+              "allow_slow", "begin", "cpus", "mem", "warn_before", "nodes", "preempt",
+              "preemptible", "same_node"}
+BOOL_DIRECTIVES = {"allow_slow", "preempt", "preemptible", "same_node"}
+
+
+def parse_bool(text, what):
+    word = str(text).strip().lower()
+    if word in ("1", "true", "yes", "on", "y"):
+        return True
+    if word in ("0", "false", "no", "off", "n"):
+        return False
+    raise ValueError(f"{what} takes yes or no, got '{text}'")
+
+
 def parse_hive_file(path):
     """
     Parse a .hive script file.
@@ -477,9 +495,21 @@ def parse_hive_file(path):
     with open(path) as f:
         for line in f:
             stripped = line.rstrip('\r\n')
-            m = re.match(r'^\s*#HIVE\s+(\w+)\s*=\s*(.+)$', stripped)
+            m = re.match(r'^\s*#HIVE\s+([\w-]+)\s*(?:=\s*(.*))?$', stripped)
             if m:
-                key, val = m.group(1).lower(), m.group(2).strip()
+                # Spelled like the flag (`warn-before`) or like the field
+                # (`warn_before`): both. A directive that is not known, or has no
+                # value where one is needed, is an error — it used to be dropped
+                # without a word, and the task ran without what it had asked for.
+                key = m.group(1).lower().replace("-", "_")
+                val = (m.group(2) or "").strip()
+                if key not in DIRECTIVES:
+                    raise ValueError(f"{path}: unknown directive '#HIVE {m.group(1)}' "
+                                     f"(known: {', '.join(sorted(DIRECTIVES))})")
+                if not val:
+                    if key not in BOOL_DIRECTIVES:
+                        raise ValueError(f"{path}: '#HIVE {m.group(1)}' needs a value")
+                    val = "yes"                       # `#HIVE preemptible`
                 # `#HIVE timeout=90m  # 1.5 hours max`: the remark is not part of the
                 # value. Kept for notify, which is a command and may contain a `#`.
                 if key != "notify":
@@ -519,7 +549,7 @@ def parse_hive_file(path):
     if "exclude" in meta:
         result["exclude"] = meta["exclude"]           # expanded in cmd_submit
     for key in ("after", "after_any", "array", "max_running", "allow_slow", "begin",
-                "cpus", "mem", "warn_before", "nodes", "preempt", "preemptible"):
+                "cpus", "mem", "warn_before", "nodes", "preempt", "preemptible", "same_node"):
         if key in meta:
             result[key] = meta[key]                   # parsed in cmd_submit
     if "timeout" in meta:
@@ -745,7 +775,11 @@ def _submit(args, out):
 
     # Detect .hive file vs plain command string
     if os.path.isfile(target):
-        spec = parse_hive_file(target)
+        try:
+            spec = parse_hive_file(target)
+        except ValueError as e:
+            print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
+            sys.exit(2)
     else:
         spec = {"cmd": target}
 
@@ -882,17 +916,49 @@ def _submit(args, out):
         array_idx, array_cap = list(range(gang)), None
 
     def _flag(name):
-        val = getattr(args, name, None)
+        val = getattr(args, name, None)              # --x / --no-x on the command line win
         if val is None and spec.get(name) is not None:
-            val = str(spec[name]).strip().lower() in ("1", "true", "yes", "on")
+            try:
+                val = parse_bool(spec[name], f"#HIVE {name}=")
+            except ValueError as e:
+                print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
+                sys.exit(2)
         return bool(val)
-    preempt, preemptible = _flag("preempt"), _flag("preemptible")
+    preempt, preemptible, same_node = _flag("preempt"), _flag("preemptible"), _flag("same_node")
+
+    # Combinations that cannot do what they say.
+    problems = []
+    if gang and (preempt or preemptible):
+        problems.append("--nodes cannot be combined with --preempt / --preemptible: a "
+                        "multi-node task neither preempts nor is preempted")
+    if gang and spec.get("gpus") == 0:
+        problems.append("--nodes with --gpus 0: a multi-node task is placed by its GPUs")
+    if gang and max_running is not None and max_running < gang:
+        problems.append(f"--nodes {gang} with --max-running {max_running}: its members start "
+                        f"together, so the cap could never be met")
+    if same_node and not gang:
+        problems.append("--same-node only means something with --nodes")
+    if preempt and preemptible:
+        problems.append("--preempt and --preemptible together: choose one")
+    if problems:
+        for msg in problems:
+            print(f"{C_RED}error:{C_RESET} {msg}", file=sys.stderr)
+        sys.exit(2)
+    if preempt and int(spec.get("priority") or 0) <= 0:
+        print(f"{C_YELLOW}note:{C_RESET} --preempt at priority {spec.get('priority', 0)} will not "
+              f"preempt anything: a victim must have a strictly LOWER priority. "
+              f"Add --priority N.")
 
     # Delayed start, CPU / memory of the step, warning before the node expires.
     begin_ts = None
     b_raw = getattr(args, "begin", None) or spec.get("begin")
     if b_raw:
         begin_ts = parse_begin(b_raw)
+        if begin_ts is not None and begin_ts < time.time() - 60:
+            print(f"{C_RED}error:{C_RESET} --begin '{b_raw}' is in the past "
+                  f"({datetime.fromtimestamp(begin_ts).strftime('%Y-%m-%d %H:%M')})",
+                  file=sys.stderr)
+            sys.exit(2)
         if begin_ts is None:
             print(f"{C_RED}error:{C_RESET} could not parse --begin '{b_raw}' (try 2h, 30m, "
                   f"2026-10-01T08:00, 08:00)", file=sys.stderr)
@@ -926,14 +992,10 @@ def _submit(args, out):
     # --no-slow > #HIVE allow_slow= > decided from the runtime estimate (None).
     allow_slow = getattr(args, "allow_slow", None)
     if allow_slow is None and spec.get("allow_slow") is not None:
-        word = str(spec["allow_slow"]).strip().lower()
-        if word in ("1", "true", "yes", "on"):
-            allow_slow = True
-        elif word in ("0", "false", "no", "off"):
-            allow_slow = False
-        else:
-            print(f"{C_RED}error:{C_RESET} #HIVE allow_slow= takes yes or no, got "
-                  f"'{spec['allow_slow']}'", file=sys.stderr)
+        try:
+            allow_slow = parse_bool(spec["allow_slow"], "#HIVE allow_slow=")
+        except ValueError as e:
+            print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
             sys.exit(2)
 
     # Hard run-time limit: --timeout > #HIVE timeout=. Unlike --est-runtime (a placement
@@ -1050,6 +1112,7 @@ def _submit(args, out):
                 "max_running":   max_running,
                 "allow_slow":    allow_slow,
                 "gang_size":     gang,
+                "gang_same_node": bool(same_node) if gang else None,
                 "preempt":       preempt,
                 "preemptible":   preemptible,
                 "begin_ts":      begin_ts,
@@ -1085,7 +1148,9 @@ def _submit(args, out):
     if gang:
         print(f"Submitted multi-node task #{array_id}: {gang} members "
               f"(ids {created[0]}-{created[-1]}){owner_s}")
-        print(f"  they start together, each on its own node; every member runs the command "
+        print(f"  they start together, each on "
+              + ("its own hold job (the same node is fine)" if same_node else "its own node")
+              + "; every member runs the command "
               f"with $HIVE_GANG_RANK (0..{gang - 1}), $HIVE_GANG_SIZE and $HIVE_GANG_HOSTS")
         print(f"  if one member fails the others are stopped · hive wait --array {array_id} · "
               f"hive cancel --array {array_id}")
@@ -1666,6 +1731,20 @@ def _pending_targets(queue, args, verb):
     if not ids:
         print(f"hive {verb}: give task ID(s) or --array ARRAY_ID", file=sys.stderr)
         sys.exit(2)
+    # One member of a multi-node task stands for all of them: they start together, so
+    # holding or reprioritising one alone either does nothing or splits the gang.
+    whole = []
+    for i in ids:
+        t = queue["tasks"].get(str(i))
+        if t is not None and t.get("gang_size"):
+            mates = [m["id"] for m in array_members(queue, t.get("array_id"))]
+            if set(mates) - set(ids):
+                print(f"#{i} is a member of multi-node task #{t.get('array_id')}: "
+                      f"applied to all {len(mates)} members")
+            whole += mates
+        else:
+            whole.append(i)
+    ids = whole
     targets = []
     for i in dict.fromkeys(ids):
         t = queue["tasks"].get(str(i))
@@ -2012,6 +2091,14 @@ def build_parser():
                     help="Multi-node task: N members that start together, each on a node of "
                          "its own, all running the command with $HIVE_GANG_RANK / "
                          "$HIVE_GANG_SIZE / $HIVE_GANG_HOSTS. If one fails the rest is stopped")
+    ps.add_argument("--same-node", dest="same_node", action="store_true", default=None,
+                    help="With --nodes: the members may share a node, as long as each has "
+                         "its own GPUs. For several 1-GPU hold jobs on one node, whose cards "
+                         "no single process can see together")
+    ps.add_argument("--no-preempt", dest="preempt", action="store_false", default=None,
+                    help="Override `#HIVE preempt=yes` of the file")
+    ps.add_argument("--no-preemptible", dest="preemptible", action="store_false", default=None,
+                    help="Override `#HIVE preemptible=yes` of the file")
     ps.add_argument("--preempt", action="store_true", default=None,
                     help="If no node is free, stop a running lower-priority task that was "
                          "submitted --preemptible (it is requeued)")
@@ -2185,6 +2272,17 @@ def main():
             print("hive wait: give a task ID, several, or --array ARRAY_ID", file=sys.stderr)
             sys.exit(2)
         if len(ids) == 1 and getattr(args, "array", None) is None:
+            one = load_queue().get("tasks", {}).get(str(ids[0]))
+            if one is not None and one.get("gang_size"):
+                # `ID=$(hive submit -q --nodes 4 …); hive wait $ID` — the id names the
+                # multi-node task, and waiting for rank 0 alone reported success while
+                # another member was failing.
+                cmd_wait_many(args, [t["id"] for t in resolve_array(load_queue(), one["array_id"])])
+            if one is not None and one.get("array_id") == ids[0] and one.get("array_index") is not None \
+                    and len(array_members(load_queue(), ids[0])) > 1:
+                print(f"note: #{ids[0]} is member [{one['array_index']}] of array #{ids[0]}; "
+                      f"this waits for that ONE task. The whole array: hive wait --array {ids[0]}",
+                      file=sys.stderr)
             args.id = ids[0]
             cmd_wait(args)
         else:

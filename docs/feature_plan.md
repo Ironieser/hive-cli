@@ -92,7 +92,7 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 | B2 | Warn a task before its node expires (`--signal`-like) | done — `--warn-before` |
 | B3 | Delayed start (`--begin`) | done — `--begin` |
 | B4 | CPU / memory per task | done — `--cpus`, `--mem` |
-| B5 | Multi-node tasks | done — `--nodes N` (all members or none; no partial restart) |
+| B5 | Multi-node tasks | done — `--nodes N` (all members or none; no partial restart); `--same-node` for several hold jobs of one node |
 | B6 | Preemption | done — `--preempt` / `--preemptible`, opt-in on both sides |
 | B7 | Fair share between owners | done — `"fair_share": true` |
 
@@ -102,7 +102,7 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 |---|---|---|
 | C1 | README.md / README_zh.md describe none of the new features | done |
 | C2 | docs/architecture.md: two-pass cycle, GPU slots, node health states | done |
-| C3 | Feedback #18, #19, #27, #33 | open |
-| C4 | Red-team round 3 on everything in this checklist | open |
+| C3 | Feedback #18, #19, #27, #33 | done — #33 wontfix (not reproduced) |
+| C4 | Red-team round 3 on everything in this checklist | done — 29 findings, 8 high; fixed, see the commits "red-team round 3" and "fix(autoscale)" |
 | C5 | Install, live validation | open |
 | C6 | Push the branch, open the pull request | open |
