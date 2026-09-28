@@ -946,6 +946,40 @@ chk("a slow node that stops answering is quarantined", hh.load()["nodes"]["slown
 hs.health_probe = _real_hp
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({})
 
+print("== queue control: hold / unhold / priority ==")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close()
+import argparse as _ap2, io as _io2, contextlib as _cl2
+def _run(fn, *a, **k):
+    out = _io2.StringIO()
+    try:
+        with _cl2.redirect_stdout(out), _cl2.redirect_stderr(out):
+            fn(*a, **k)
+        return None, out.getvalue()
+    except SystemExit as e:
+        return e.code, out.getvalue()
+wdb({"700": node("n1", 72000)})
+wq({"270": dict(task(270, name="first"), cmd="sleep 1"),
+    "271": dict(task(271, name="second", sub=loc(1)), cmd="true"),
+    "272": dict(task(272, name="third", sub=loc(2)), cmd="true"),
+    "273": dict(task(273, name="ran", state="done", sub=loc(3)), cmd="true")})
+_run(hq.cmd_hold, _ap2.Namespace(id=[270, 273], array=None), True)
+chk("hold marks a pending task, skips one that is not pending",
+    rq()["270"].get("held") is True and not rq()["273"].get("held"))
+hs.run_one_cycle(); time.sleep(0.4)
+chk("a held task is passed over, the next one takes the node",
+    rq()["270"]["state"] == "pending" and rq()["270"].get("pending_reason") == "held"
+    and rq()["271"]["state"] in ("running", "done"))
+_run(hq.cmd_priority, _ap2.Namespace(priority=50, id=[272], array=None))
+_run(hq.cmd_hold, _ap2.Namespace(id=[270], array=None), False)
+chk("unhold clears the flag; priority is stored", not rq()["270"].get("held") and rq()["272"]["priority"] == 50)
+hs.run_one_cycle(); time.sleep(0.4)
+chk("the reprioritised task now goes before the older one",
+    rq()["272"]["state"] in ("running", "done") and rq()["270"]["state"] == "pending")
+chk("hold on nothing pending exits 1", _run(hq.cmd_hold, _ap2.Namespace(id=[273], array=None), True)[0] == 1)
+chk("events recorded", {"hold", "unhold", "priority"} <= {e["event"] for e in ev.iter_events()})
+hs.run_one_cycle(); time.sleep(0.4); hs.run_one_cycle()
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({})
+
 print("== queued hold jobs learn about nodes quarantined after they were submitted ==")
 reset_health(); reset_sched_state()
 _upd = os.path.join(hs.HIVE_DIR, "mock_scontrol_update.log")

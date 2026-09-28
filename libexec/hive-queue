@@ -1331,6 +1331,72 @@ def cmd_stats(args):
           f"(both resolved from the history above).{C_RESET}")
 
 
+def _pending_targets(queue, args, verb):
+    """Pending tasks named by `args.id` (one or more) and/or `--array`. Tasks that are
+    not pending are reported and skipped: these commands only shape what has not
+    started yet."""
+    ids = list(getattr(args, "id", None) or [])
+    if getattr(args, "array", None) is not None:
+        ids += [t["id"] for t in array_members(queue, args.array)]
+    if not ids:
+        print(f"hive {verb}: give task ID(s) or --array ARRAY_ID", file=sys.stderr)
+        sys.exit(2)
+    targets = []
+    for i in dict.fromkeys(ids):
+        t = queue["tasks"].get(str(i))
+        if t is None:
+            print(f"Task #{i} not found.", file=sys.stderr)
+        elif t["state"] != "pending":
+            if getattr(args, "array", None) is None:
+                print(f"Task #{i} is {t['state']} — only pending tasks can be changed.")
+        else:
+            targets.append(t)
+    return targets
+
+
+def cmd_hold(args, hold=True):
+    """`hive hold` keeps a pending task out of dispatch until `hive unhold`; it keeps
+    its place, its id and everything that depends on it."""
+    verb = "hold" if hold else "unhold"
+    with QueueLock() as lfd:
+        queue = load_queue(lfd)
+        targets = _pending_targets(queue, args, verb)
+        changed = []
+        for t in targets:
+            if bool(t.get("held")) != hold:
+                t["held"] = hold
+                if hold:
+                    t["pending_reason"] = "held"
+                elif t.get("pending_reason") == "held":
+                    t.pop("pending_reason", None)
+                changed.append(t["id"])
+                ev.record(verb, task=t["id"], name=t.get("name") or None)
+        if changed:
+            save_queue(queue, lfd)
+    what = "held" if hold else "released for dispatch"
+    print(f"{len(changed)} task(s) {what}" + (": " + ", ".join(f"#{i}" for i in changed) if changed else "."))
+    if not targets:
+        sys.exit(1)
+
+
+def cmd_priority(args):
+    """Change the priority of pending tasks (higher dispatches first)."""
+    with QueueLock() as lfd:
+        queue = load_queue(lfd)
+        targets = _pending_targets(queue, args, "priority")
+        for t in targets:
+            old = t.get("priority", 0)
+            t["priority"] = args.priority
+            ev.record("priority", task=t["id"], name=t.get("name") or None,
+                      priority=args.priority, was=old)
+        if targets:
+            save_queue(queue, lfd)
+    print(f"{len(targets)} task(s) now at priority {args.priority}"
+          + (": " + ", ".join(f"#{t['id']}" for t in targets) if targets else "."))
+    if not targets:
+        sys.exit(1)
+
+
 def cmd_wait_many(args, ids):
     """Block until every task in `ids` is terminal. Prints one line per task as it
     ends and a summary — no logs (that is `hive logs ID`), so waiting on a 50-task
@@ -1605,6 +1671,17 @@ def build_parser():
                          f"{LOG_FULL_MAX_LINES} lines, else last {LOG_TAIL_DEFAULT})")
     pg.add_argument("--full", action="store_true", help="Print the whole log regardless of length")
 
+    # hold / unhold / priority
+    for _name, _help in (("hold", "Keep pending task(s) out of dispatch until `unhold`"),
+                         ("unhold", "Let held task(s) be dispatched again")):
+        _p = sub.add_parser(_name, help=_help)
+        _p.add_argument("id", type=int, metavar="ID", nargs="*")
+        _p.add_argument("--array", type=int, metavar="ARRAY_ID")
+    ppr = sub.add_parser("priority", help="Change the priority of pending task(s)")
+    ppr.add_argument("priority", type=int, metavar="N", help="New priority (higher runs first)")
+    ppr.add_argument("id", type=int, metavar="ID", nargs="*")
+    ppr.add_argument("--array", type=int, metavar="ARRAY_ID")
+
     # rm
     pr = sub.add_parser("rm", help="Remove a finished/cancelled task from queue")
     pr.add_argument("id", type=int, metavar="ID")
@@ -1684,6 +1761,12 @@ def main():
         cmd_logs(args)
     elif cmd == "rm":
         cmd_rm(args)
+    elif cmd == "hold":
+        cmd_hold(args, True)
+    elif cmd == "unhold":
+        cmd_hold(args, False)
+    elif cmd == "priority":
+        cmd_priority(args)
     elif cmd == "wait":
         ids = list(args.id or [])
         if getattr(args, "array", None) is not None:

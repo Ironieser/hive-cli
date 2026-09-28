@@ -85,7 +85,7 @@ case "$subcommand" in
         exec "$py" "${HIVE_LIBEXEC}/hive-health" "$@"
         ;;
     # ── Queue shortcuts (hive submit → hive queue submit, etc.) ──────────────
-    submit|wait|list|ls|cancel|logs|rm|stats|prune)
+    submit|wait|list|ls|cancel|logs|rm|stats|prune|hold|unhold|priority)
         py="$(_resolve_python)"
         exec "$py" "${HIVE_LIBEXEC}/hive-queue" "$subcommand" "$@"
         ;;
@@ -124,7 +124,9 @@ case "$subcommand" in
                               Several / an array: one line each, exit 1 if any failed
     list                      Show task queue (shortcut for queue list)
     logs     ID [-f]          Show / follow task log
-    cancel   ID               Cancel pending or running task
+    cancel   ID|--array A     Cancel pending or running task
+    hold     ID…|--array A    Keep pending task(s) out of dispatch; `unhold` to let go
+    priority N ID…|--array A  Change the priority of pending task(s)
     stats    [NAME]           Completed-task runtime history (for --est-runtime)
     prune    [--older-than D] Drop old terminal tasks from the queue (history kept)
     queue    submit|list|wait|cancel|logs|rm|stats|prune|daemon

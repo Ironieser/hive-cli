@@ -1397,7 +1397,9 @@ def run_one_cycle():
                 notify(task, "finish")
                 continue
             held = None
-            if dep == "wait":
+            if task.get("held"):
+                held = "held"                       # `hive hold`; until `hive unhold`
+            elif dep == "wait":
                 held = "waiting_for_dependency"
             elif task.get("array_max_running") and task.get("array_id") is not None \
                     and run_by_array.get(task["array_id"], 0) >= int(task["array_max_running"]):
