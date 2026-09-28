@@ -32,6 +32,7 @@ Exit codes of `hive wait`: `0` done · `1` failed · `75` never dispatched (`--p
 
 ```bash
 hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [--exclude NODES] \
+            [--timeout DUR] [--notify CMD] \
             [--workdir DIR] [--priority N] "command string" | job.hive
 ```
 
@@ -42,6 +43,8 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--est-runtime` | — | `2h`, `90m`, `1-12:00:00`, seconds, or `auto` (P90 of NAME's history). With an estimate the scheduler never places the task on a node whose remaining walltime < estimate + 10 min (`insufficient_walltime`). Without one the task is walltime-blind. |
 | `--need-mb` | 0 | minimum **free** GPU memory; task waits (`waiting_for_mem`) until a card has it |
 | `--gpus` | 1 | GPUs the task may see. A hold job may own more; hive narrows `CUDA_VISIBLE_DEVICES` to the first N so frameworks don't auto-`DataParallel` over cards you didn't ask for. `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`). |
+| `--timeout` | — | hard limit on **run** time (`2h`, `90m`). Over it the task is killed and ends `failed`, exit code 124, `fail_reason: timeout`; not retried. Unlike `--est-runtime`, which only steers placement |
+| `--notify` | `$HIVE_NOTIFY` | shell command run when the task finishes (done / failed / cancelled / timeout) or is requeued after a node loss. See [Notification hook](#notification-hook) |
 | `--exclude` / `-x` | — | nodes the task must not run on (`evc22,evc[40-43]`); it waits (`node_excluded`) rather than use them. Broken nodes don't need this — hive quarantines them itself |
 | `--workdir` / `-w` | cwd | working directory on the node |
 | `--priority` / `-p` | 0 | higher dispatches first (`-p=-5` for negatives) |
@@ -67,7 +70,8 @@ MODEL=/tmp/Qwen3-VL-4B-Instruct
 python eval.py --model $MODEL --skip-existing
 ```
 
-Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`, `exclude`. Other `#` lines
+Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`, `exclude`,
+`timeout`, `notify`. Other `#` lines
 are comments; the rest is the command.
 
 ## `hive list`
@@ -93,6 +97,26 @@ queue · 1 running · 2 pending · 10 of 243 finished in last 7d shown · +233 m
 - For PENDING tasks the NODE column holds the scheduler's `pending_reason`.
 - `(re-disp xN)` marks a task re-dispatched after its node was reclaimed.
 - ELAPSED: `wait:…` since submit for pending; run time for running/finished.
+
+### Notification hook
+
+The hook runs **on the scheduler's host** (see `hive queue daemon status`), not where you
+submitted and not on the compute node; cwd is `$HOME`, limit 60 s, output in
+`~/.hive/logs/notify.log`. A failing hook never changes the task's outcome.
+
+| Variable | Value |
+|---|---|
+| `HIVE_TASK_EVENT` | `finish` or `requeue` (node lost; the task will run again from scratch) |
+| `HIVE_TASK_ID` / `NAME` / `OWNER` | as submitted |
+| `HIVE_TASK_STATE` | `done`, `failed`, `cancelled`; `pending` on `requeue` |
+| `HIVE_TASK_EXIT_CODE` | exit code; 124 = timeout, -1 = declared dead |
+| `HIVE_TASK_FAIL_REASON` | `timeout` or empty |
+| `HIVE_TASK_NODE` / `DURATION_SECS` / `LOG` / `WORKDIR` / `REQUEUE_COUNT` | — |
+
+```bash
+export HIVE_NOTIFY='echo "$HIVE_TASK_ID $HIVE_TASK_NAME $HIVE_TASK_STATE" >> ~/hive-done.txt'
+hive submit --notify 'curl -s -d "task $HIVE_TASK_NAME: $HIVE_TASK_STATE" https://ntfy.sh/mytopic' "python train.py"
+```
 
 ## `pending_reason` values
 

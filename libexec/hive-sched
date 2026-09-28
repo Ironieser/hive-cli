@@ -393,6 +393,40 @@ def health_probe(slurm_jobid):
     return p.get("cuda") or "unknown", p.get("cuda_detail") or ""
 
 
+NOTIFY_TIMEOUT_SECS = 60
+NOTIFY_LOG = os.path.join(LOG_DIR, "notify.log")
+
+
+def notify(task, event):
+    """Run the task's notification hook, detached. `event` is `finish` (the task reached
+    a terminal state) or `requeue` (infra failure, it will run again). The hook gets the
+    task as HIVE_TASK_* variables. It runs on THIS host, under a time limit, with its
+    output in notify.log; whatever it does, the task's outcome is already recorded."""
+    cmd = (task.get("notify") or "").strip()
+    if not cmd:
+        return
+    env = dict(os.environ)
+    fields = {"ID": task.get("id"), "NAME": task.get("name"), "OWNER": task.get("owner"),
+              "STATE": task.get("state"), "EXIT_CODE": task.get("exit_code"),
+              "NODE": task.get("node") or task.get("last_node"),
+              "DURATION_SECS": task.get("duration_secs"), "LOG": task.get("log"),
+              "WORKDIR": task.get("workdir"), "FAIL_REASON": task.get("fail_reason"),
+              "REQUEUE_COUNT": task.get("requeue_count"), "EVENT": event}
+    for k, v in fields.items():
+        env[f"HIVE_TASK_{k}"] = "" if v is None else str(v)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(NOTIFY_LOG, "a") as lf:
+            lf.write(f"[{now_iso()}] task {task.get('id')} {event} "
+                     f"state={task.get('state')}: {cmd}\n")
+            lf.flush()
+            subprocess.Popen(["timeout", str(NOTIFY_TIMEOUT_SECS), "bash", "-c", cmd],
+                             stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, env=env,
+                             cwd=os.path.expanduser("~"), start_new_session=True)
+    except OSError as e:
+        logging.warning("Task %s: notify hook could not be started: %s", task.get("id"), e)
+
+
 def request_repoll(reason):
     """Ask the poller to refresh now instead of waiting for its 900s cycle.
 
@@ -784,6 +818,44 @@ def run_one_cycle():
 
             status = check_task_status(task["id"], task.get("srun_pid"))
 
+            # Hard run-time limit (`hive submit --timeout`). The command's own doing, so
+            # never retried and never a strike against the node.
+            limit = task.get("timeout_secs")
+            ran = _task_age(task, "started", "dispatched")
+            if limit and ran is not None and ran > float(limit) \
+                    and not status.startswith("done:") and not task.get("cancel_requested"):
+                pid = task.get("srun_pid")
+                if pid and _pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                task["state"]         = "failed"
+                task["exit_code"]     = 124
+                task["fail_reason"]   = "timeout"
+                task["finished_at"]   = now_iso()
+                task["finished_ts"]   = now_ts()
+                task["duration_secs"] = _duration_secs(task)
+                task["queued_secs"]   = _queued_secs(task)
+                append_log_note(task, [
+                    "",
+                    f"=== hive: task #{task['id']} exceeded its --timeout of "
+                    f"{_fmt_dur(int(limit))} and was killed at {now_iso()} (exit_code=124) ===",
+                ])
+                if jid:
+                    running_jobids.discard(jid)
+                    freed_jobids.add(jid)
+                changed = True
+                logging.warning("Task %d killed: ran %s, over its timeout of %s (node %s)",
+                                task["id"], _fmt_dur(ran), _fmt_dur(int(limit)),
+                                task.get("node", "?"))
+                ev.record("finish", task=task["id"], name=task.get("name") or None,
+                          state="failed", exit_code=124, reason="timeout",
+                          node=task.get("node"), slurm_jobid=jid,
+                          run_secs=task["duration_secs"], queued_secs=task["queued_secs"])
+                notify(task, "finish")
+                continue
+
             if task.get("cancel_requested") and not status.startswith("done:"):
                 # `hive cancel` may run on ANOTHER node (feedback C5 class): the srun
                 # child lives in this process, so only the scheduler can signal it —
@@ -811,6 +883,7 @@ def run_one_cycle():
                 ev.record("cancel", task=task["id"], name=task.get("name") or None,
                           node=task.get("node"), slurm_jobid=jid,
                           run_secs=task["duration_secs"])
+                notify(task, "finish")
                 continue
 
             if status.startswith("done:"):
@@ -833,6 +906,7 @@ def run_one_cycle():
                           slurm_jobid=jid, run_secs=task["duration_secs"],
                           queued_secs=task["queued_secs"])
 
+                _requeued_for_node = False
                 # ── Node health feedback (hive_health) ───────────────────────
                 node_name = task.get("node")
                 dur = task.get("duration_secs")
@@ -857,6 +931,8 @@ def run_one_cycle():
                                       task=task["id"], reason=sig)
                             if task.get("attempts", 0) < MAX_ATTEMPTS:
                                 task["attempts"]       = task.get("attempts", 0) + 1
+                                _requeued_for_node = True
+                                task["last_node"]      = node_name
                                 task["state"]          = "pending"
                                 task["pending_reason"] = "node_quarantined_redispatch"
                                 task["slurm_jobid"]    = None
@@ -877,6 +953,7 @@ def run_one_cycle():
                                           name=task.get("name") or None,
                                           reason="node_quarantined", prev_node=node_name,
                                           attempts=task["attempts"], checkpoint_lost=False)
+                notify(task, "requeue" if _requeued_for_node else "finish")
 
             elif status == "dead":
                 if _is_crash_orphan(task) and task.get("attempts", 0) < MAX_ATTEMPTS:
@@ -912,6 +989,7 @@ def run_one_cycle():
                     task["requeue_count"]      = task.get("requeue_count", 0) + 1
                     task["checkpoint_warning"] = True
                     task["last_infra_failure"] = now_iso()
+                    task["last_node"]          = prev_node
                     task["state"]              = "pending"
                     task["pending_reason"]     = "infra_failure_redispatch"
                     task["slurm_jobid"]        = None
@@ -941,6 +1019,7 @@ def run_one_cycle():
                               reason="infra_failure", prev_node=prev_node, slurm_jobid=jid,
                               attempts=task["attempts"], requeue_count=task["requeue_count"],
                               checkpoint_lost=True)
+                    notify(task, "requeue")
                 else:
                     task["state"]       = "failed"
                     task["exit_code"]   = -1
@@ -957,6 +1036,7 @@ def run_one_cycle():
                               state="failed", exit_code=-1, node=task.get("node"),
                               slurm_jobid=jid, run_secs=task["duration_secs"],
                               queued_secs=task["queued_secs"])
+                    notify(task, "finish")
 
         # ── (1b) Periodic health checks of quarantined nodes ─────────────────
         # Re-probe each quarantined node (through one of its hold jobs that isn't

@@ -47,6 +47,8 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--est-runtime 2h\|90m\|auto` | walltime-aware placement (`auto` = P90 of NAME's history) |
 | `--need-mb 60000` | hold until a GPU has that much free memory (big models) |
 | `--gpus N` | GPUs the task may see (default **1**; extras are hidden so frameworks don't auto-DataParallel) |
+| `--timeout 2h` | kill the task after that much run time (failed, exit 124) — use it for anything that can hang |
+| `--notify CMD` | run CMD when the task finishes or is requeued (`HIVE_TASK_*` env; runs on the scheduler host; default `$HIVE_NOTIFY`) |
 | `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
 | `--priority N` | higher dispatches first |

@@ -148,6 +148,13 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   `"health_canary": false` in `pool_config.json`). The pollers filter `hive_canary` out
   by job name, or a canary would show up as a hold job. The offline suite mocks
   `scontrol`/`sbatch`/`scancel` — keep it that way, the real ones are on `PATH`.
+- **`--timeout` is enforced, `--est-runtime` is a hint.** Over `timeout_secs` of run time
+  the scheduler SIGTERMs the step: `failed`, exit 124, `fail_reason: timeout`. It is the
+  command's doing — never retried, never a strike against the node.
+- **The notify hook runs in the scheduler, detached, after the outcome is recorded.**
+  `notify(task, event)` is called on every terminal transition and on requeue; it must
+  stay non-blocking (it runs inside the `queue.lock` cycle) and must never be able to
+  change a task's state. Pending tasks cancelled by the CLI do not fire it.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

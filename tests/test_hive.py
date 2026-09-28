@@ -703,6 +703,87 @@ chk("HIVE_HEALTH_CANARY=0 -> no canary", not os.path.exists(os.path.join(hs.HIVE
 os.environ.pop("HIVE_HEALTH_CANARY"); os.environ.pop("HIVE_CANARY_GAP")
 reset_health(); reset_sched_state()
 
+print("== task timeout + notification hook ==")
+reset_health(); reset_sched_state()
+open(ev.EVENTS_FILE, "w").close()
+_nf = os.path.join(hs.HIVE_DIR, "notified.txt")
+_hook = f'echo "$HIVE_TASK_ID $HIVE_TASK_EVENT $HIVE_TASK_STATE $HIVE_TASK_EXIT_CODE $HIVE_TASK_FAIL_REASON $HIVE_TASK_NAME" >> {_nf}'
+def notified():
+    for _ in range(40):
+        if os.path.exists(_nf):
+            time.sleep(0.2); return open(_nf).read().splitlines()
+        time.sleep(0.1)
+    return []
+def clear_notified():
+    try: os.remove(_nf)
+    except FileNotFoundError: pass
+# (1) over the limit -> killed, failed/124, not retried, node not struck
+_sl = _sp.Popen(["sleep", "60"], start_new_session=True)
+t = dict(task(170, name="slow", state="running", jid="700", node="nodeX", st=loc(-120)),
+         timeout_secs=60, notify=_hook, srun_pid=_sl.pid)
+t["started_ts"] = t["dispatched_ts"] = time.time() - 120
+open(os.path.join(hs.HEARTBEAT_DIR, "170"), "w").write("x")          # it is alive
+open(t["log"], "w").write("running\n")
+wdb({"700": node("nodeX", 72000)}); wq({"170": t})
+hs.run_one_cycle()
+t = rq()["170"]
+chk("over --timeout -> failed, exit 124, fail_reason timeout",
+    (t["state"], t["exit_code"], t.get("fail_reason")) == ("failed", 124, "timeout"))
+time.sleep(0.3)
+chk("the step was signalled", _sl.poll() is not None)
+_sl.poll() is None and _sl.kill()
+chk("log says why", "exceeded its --timeout" in open(t["log"]).read())
+chk("finish event carries reason=timeout",
+    any(e["event"] == "finish" and e.get("reason") == "timeout" for e in ev.iter_events()))
+chk("a timeout is not a strike against the node", not hh.load()["nodes"].get("nodeX", {}).get("strikes"))
+chk("hook ran with the task in its environment", notified() == ["170 finish failed 124 timeout slow"])
+# (2) under the limit -> untouched
+clear_notified()
+t = dict(task(171, name="fine", state="running", jid="700", node="nodeX", st=loc(-10)), timeout_secs=60, notify=_hook)
+t["started_ts"] = t["dispatched_ts"] = time.time() - 10
+open(os.path.join(hs.HEARTBEAT_DIR, "171"), "w").write("x")
+wq({"171": t}); hs.run_one_cycle()
+chk("under the limit -> still running, no hook", rq()["171"]["state"] == "running" and not os.path.exists(_nf))
+# (3) normal finish fires the hook; a task without one fires nothing
+open(os.path.join(hs.HEARTBEAT_DIR, "171.exit"), "w").write("0")
+hs.run_one_cycle()
+chk("hook on a normal finish", notified() == ["171 finish done 0  fine"])
+clear_notified()
+t = task(172, name="quiet", state="running", jid="700", node="nodeX", st=loc(-10)); t["started_ts"] = time.time() - 10
+open(os.path.join(hs.HEARTBEAT_DIR, "172.exit"), "w").write("3")
+wq({"172": t}); hs.run_one_cycle(); time.sleep(0.5)
+chk("no hook configured -> nothing runs", rq()["172"]["state"] == "failed" and not os.path.exists(_nf))
+# (4) infra requeue -> event `requeue`, state pending
+wdb({})
+stale_hb(173); open(os.path.join(hs.LOG_DIR, "task-173.log"), "w").write("x")
+t = dict(task(173, name="lost", state="running", jid="2001", node="gone", st=loc(-450), sub=loc(-500),
+              dispatched=loc(-450)), notify=_hook)
+wq({"173": t}); hs.run_one_cycle()
+chk("hook on infra requeue says requeue/pending", notified() == ["173 requeue pending   lost"])
+clear_notified()
+# (5) a broken hook never affects the task
+t = dict(task(174, name="badhook", state="running", jid="700", node="nodeX", st=loc(-10)), notify="exit 7; }{ syntax")
+t["started_ts"] = time.time() - 10
+open(os.path.join(hs.HEARTBEAT_DIR, "174.exit"), "w").write("0")
+wdb({"700": node("nodeX", 72000)}); wq({"174": t}); hs.run_one_cycle()
+chk("failing hook leaves the task done", rq()["174"]["state"] == "done")
+# (6) submit side
+os.environ["HIVE_NOTIFY"] = "echo env-hook"
+wq({})
+_ns = _ap_early = __import__("argparse").Namespace(cmd_or_file="true", workdir=None, priority=None, name="s", owner=None,
+        need_mb=None, gpus=None, est_runtime=None, exclude=None, timeout="90m", notify=None)
+import io as _io, contextlib as _cl
+with _cl.redirect_stdout(_io.StringIO()):
+    hq.cmd_submit(_ns)
+t = max(rq().values(), key=lambda t: t["id"])
+chk("--timeout parsed to seconds; $HIVE_NOTIFY is the default hook",
+    t["timeout_secs"] == 5400 and t["notify"] == "echo env-hook")
+os.environ.pop("HIVE_NOTIFY")
+open(os.path.join(hs.HIVE_DIR, "t.hive"), "w").write("#HIVE timeout=2h\n#HIVE notify=echo hi\necho x\n")
+_pf = hq.parse_hive_file(os.path.join(hs.HIVE_DIR, "t.hive"))
+chk("#HIVE timeout= / notify= parsed", _pf.get("timeout") == "2h" and _pf.get("notify") == "echo hi")
+reset_health(); reset_sched_state()
+
 print("== node exclusion: hive submit --exclude, hive pool add --exclude ==")
 chk("expand_nodes: names, ranges, padding, duplicates",
     hh.expand_nodes("evc22,evc[1-3,07],gpu01,evc22") == ["evc22", "evc1", "evc2", "evc3", "evc07", "gpu01"])

@@ -316,6 +316,10 @@ def parse_hive_file(path):
         result["est_runtime"] = meta["est_runtime"]   # parsed/resolved in cmd_submit
     if "exclude" in meta:
         result["exclude"] = meta["exclude"]           # expanded in cmd_submit
+    if "timeout" in meta:
+        result["timeout"] = meta["timeout"]           # parsed in cmd_submit
+    if "notify" in meta:
+        result["notify"] = meta["notify"]
 
     return result
 
@@ -510,6 +514,21 @@ def cmd_submit(args):
             print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
             sys.exit(2)
 
+    # Hard run-time limit: --timeout > #HIVE timeout=. Unlike --est-runtime (a placement
+    # hint) this one is enforced: the scheduler kills the step when it is exceeded.
+    timeout_secs = None
+    to_raw = getattr(args, "timeout", None) or spec.get("timeout")
+    if to_raw:
+        timeout_secs = parse_duration(to_raw)
+        if not timeout_secs:
+            print(f"{C_RED}error:{C_RESET} could not parse --timeout '{to_raw}' "
+                  f"(try 2h, 90m, 1-12:00:00)", file=sys.stderr)
+            sys.exit(2)
+
+    # Notification hook: --notify > #HIVE notify= > $HIVE_NOTIFY.
+    notify = (getattr(args, "notify", None) or spec.get("notify")
+              or os.environ.get("HIVE_NOTIFY") or "").strip()
+
     # Runtime estimate (drives walltime-aware scheduling). Source priority:
     # CLI --est-runtime > #HIVE est_runtime=. Value 'auto' resolves from history.
     est_raw = None
@@ -564,6 +583,8 @@ def cmd_submit(args):
             "need_mb":      spec.get("need_mb", 0),
             "gpus":         spec.get("gpus", DEFAULT_TASK_GPUS),
             "exclude_nodes": exclude_nodes,
+            "timeout_secs":  timeout_secs,
+            "notify":        notify,
             "est_runtime_secs":    est_secs,
             "est_source":          est_source,
             "requeue_count":       0,
@@ -581,6 +602,11 @@ def cmd_submit(args):
                   priority=spec.get("priority") or None)
 
     print(f"Submitted task #{task_id}" + (f"  (owner: {spec['owner']})" if spec.get("owner") else ""))
+    if timeout_secs:
+        print(f"  timeout: {fmt_elapsed(timeout_secs)} of run time, then the task is killed "
+              f"(failed, exit 124)")
+    if notify:
+        print(f"  notify: runs on the scheduler's host when the task finishes or is requeued")
     if exclude_nodes:
         print(f"  excluded nodes: {', '.join(exclude_nodes)}")
     if est_secs:
@@ -1211,6 +1237,13 @@ def build_parser():
                          f"may own several; extra ones are hidden via CUDA_VISIBLE_DEVICES so "
                          f"frameworks don't auto-DataParallel. Use --gpus 2 for real multi-GPU; "
                          f"the task then only places on a hold job with >= 2 GPUs")
+    ps.add_argument("--timeout", metavar="DUR",
+                    help="Kill the task after this much RUN time (2h, 90m, 1-12:00:00). "
+                         "It ends as failed with exit code 124 and is not retried")
+    ps.add_argument("--notify", metavar="CMD",
+                    help="Shell command run when the task finishes or is requeued, with "
+                         "HIVE_TASK_ID/NAME/STATE/EXIT_CODE/NODE/LOG/... in its environment. "
+                         "Runs on the SCHEDULER's host. Default: $HIVE_NOTIFY")
     ps.add_argument("--exclude", "-x", metavar="NODES",
                     help="Nodes this task must not run on (evc22,evc[40-43]). The task "
                          "waits (node_excluded) rather than use them")
