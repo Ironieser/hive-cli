@@ -90,7 +90,8 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
 - **A probe that ran and got no answer from the GPU is a verdict, not a miss.** `nvidia-smi`
   runs in the background under its own deadline (`gpu_query_shell` in `hive_health.py`,
   duplicated in the two bash pollers) because a wedged driver blocks it in uninterruptible
-  sleep where `timeout` can't end it. `gpu_unresponsive` / `no_gpu_devices` — only when
+  sleep where `timeout` can't end it. The deadline is 60 s, not less: healthy normal-
+  partition nodes answer in up to ~25 s, wedged ones took 116 s+. `gpu_unresponsive` / `no_gpu_devices` — only when
   SLURM granted a GPU (`CUDA_VISIBLE_DEVICES` set), so a CPU-only hold job is never at
   fault — strike the node and are never carried forward; an srun that couldn't run stays
   `probe_unverifiable`, never strikes, and backs off per hold job. Without this, three

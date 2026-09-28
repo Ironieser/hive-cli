@@ -52,8 +52,8 @@ NODE_DB_STALE_SECS = 1800   # node DB older than this → force a re-poll instea
 ORPHAN_GRACE_SECS  = 90     # running task w/ no srun+heartbeat+exit older than this → crash orphan
 MAX_ATTEMPTS       = 3      # requeue cap for crash orphans (prevents infinite redispatch)
 STARVATION_CYCLES  = 3      # consecutive starved cycles before forcing a poller re-poll
-LIVE_PROBE_TIMEOUT = 75     # verify-before-dispatch probe: srun + GPU query deadline (20 s) +
-                            # CUDA probe + step teardown, which a wedged driver stretches to 15 s
+LIVE_PROBE_TIMEOUT = 150    # verify-before-dispatch probe: GPU query (deadline 60 s) + CUDA
+                            # probe, each ~25 s on a slow-but-healthy node, + step teardown
 VERIFY_EVERY_DISPATCH = True  # live-probe (memory + CUDA context) before EVERY dispatch, not
                               # only for uncertain nodes: the DB can be a poll cycle stale
                               # (feedback #14) and nvidia-smi can't see a CUDA-init fault
@@ -472,7 +472,7 @@ def _run_probe(argv, timeout, stop_on=None):
                 pass
             break
         buf += chunk
-        if stop_on and stop_on.encode() in buf:
+        if stop_on and any(s.encode() in buf for s in stop_on):
             break
     if rc is None:
         proc.terminate()                    # srun cancels the step
@@ -503,12 +503,14 @@ def live_probe(slurm_jobid):
     rc, raw = _run_probe(
         ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
          "bash", "-c", probe],
-        LIVE_PROBE_TIMEOUT, stop_on=f"{hh.GPU_MARKER} hung")
+        LIVE_PROBE_TIMEOUT, stop_on=(f"{hh.GPU_MARKER} hung", hh.CUDA_SLOW_DETAIL))
     gpu_part, _, cuda_part = raw.partition(hh.CUDA_MARKER)
     lines, granted, fault = hh.parse_gpu_query(gpu_part.splitlines())
     if fault:
         return {"ok": False, "fault": fault}
-    if rc != 0 or not lines:
+    # rc is None when we stopped reading at a verdict; the verdict still counts.
+    stopped_on_verdict = rc is None and hh.CUDA_SLOW_DETAIL in cuda_part
+    if (rc != 0 and not stopped_on_verdict) or not lines:
         return {"ok": False}
     agg = _max_gpu(lines)
     if agg is None:

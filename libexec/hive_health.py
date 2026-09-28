@@ -98,6 +98,8 @@ print("CUDA_PROBE ok" if r == 0 else f"CUDA_PROBE fail cuMemAlloc={r}")
 '''.strip("\n")
 
 CUDA_MARKER = "---CUDA---"
+CUDA_INIT_DEADLINE = 60     # seconds to create a CUDA context; a healthy node needs 1-3
+CUDA_SLOW_DETAIL = "cuda_init_slow"
 
 # ── The GPU query: nvidia-smi under a deadline that survives a hung driver ───
 # A node whose NVIDIA driver is wedged (observed on evc22, 2026-09-28: kernel thread
@@ -112,9 +114,11 @@ CUDA_MARKER = "---CUDA---"
 # uninterruptible sleep and ignores SIGKILL until the call returns, and `timeout`
 # waits for it. So the query runs in the background with its output in a file (it must
 # not hold the step's stdout open) and the step stops waiting at the deadline.
-GPU_QUERY_DEADLINE = 20     # seconds; a healthy node answers in well under 10. Measured on
-                            # the wedged node: +4 s step start, +15 s step teardown after
-                            # the verdict, so callers need ~deadline + 30 s of srun timeout
+GPU_QUERY_DEADLINE = 60     # seconds. Measured 2026-09-28 on normal-partition nodes: a
+                            # HEALTHY node can take 24 s to answer (evc45, valid reading),
+                            # wedged ones took 116-154 s (evc22/evc29/evc34). 20 s
+                            # quarantined evc45 by mistake. Callers need about
+                            # deadline + 30 s of srun timeout (step start + teardown).
 GPU_MARKER = "GPU_PROBE"
 GPU_QUERY_FIELDS = "utilization.gpu,memory.used,memory.total"
 
@@ -180,10 +184,23 @@ def cuda_probe_shell():
     override = os.environ.get("HIVE_CUDA_PROBE_CMD")
     if override:
         return override
+    # Same background + deadline pattern as the GPU query, for the same reason. It
+    # also catches a node that works but crawls: evc45 (2026-09-28) answered nvidia-smi
+    # in 24 s and then took 184 s to create a CUDA context. Every CUDA init of every
+    # task would pay that, so it is reported as a failure (`cuda_init_slow`), and the
+    # 3-minute wait is not spent holding queue.lock.
     py = shlex.quote(sys.executable or "python3")
+    ticks = max(1, int(float(os.environ.get("HIVE_CUDA_PROBE_DEADLINE", CUDA_INIT_DEADLINE)) * 2))
     return (f"PY={py}; [ -x \"$PY\" ] || PY=python3; "
-            f"\"$PY\" - <<'HIVE_CUDA_PROBE_EOF' 2>/dev/null || echo 'CUDA_PROBE unknown python_failed'\n"
-            f"{CUDA_PROBE_PY}\nHIVE_CUDA_PROBE_EOF")
+            '_c=$(mktemp 2>/dev/null || echo "/tmp/hive_cudap.$$"); '
+            "( \"$PY\" - >\"$_c\" 2>/dev/null <<'HIVE_CUDA_PROBE_EOF'\n"
+            f"{CUDA_PROBE_PY}\nHIVE_CUDA_PROBE_EOF\n"
+            'echo $? >"$_c.rc" ) >/dev/null 2>&1 &\n'
+            f'_i=0; while [ ! -s "$_c.rc" ] && [ "$_i" -lt {ticks} ]; do sleep 0.5; _i=$((_i+1)); done; '
+            'if [ ! -s "$_c.rc" ]; then echo "CUDA_PROBE fail '
+            f'{CUDA_SLOW_DETAIL}"; '
+            'elif [ -s "$_c" ]; then cat "$_c"; else echo "CUDA_PROBE unknown python_failed"; fi; '
+            'rm -f "$_c" "$_c.rc"')
 
 
 def parse_cuda_probe(lines):

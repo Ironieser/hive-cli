@@ -560,6 +560,20 @@ chk("dbpost still carries a transient probe miss forward", _carry("srun_failed")
 chk("dbpost does NOT carry an unresponsive-GPU verdict forward", _carry("gpu_unresponsive") == "probe_failed")
 sys.argv = _argv
 
+# A node that works but crawls (evc45: nvidia-smi 24 s, CUDA context 184 s).
+reset_health(); reset_sched_state()
+_cmd = os.environ.pop("HIVE_CUDA_PROBE_CMD")
+_bin = os.path.join(hs.HIVE_DIR, "slowpy"); open(_bin, "w").write("#!/bin/bash\nsleep 4\necho CUDA_PROBE ok\n"); os.chmod(_bin, 0o755)
+_exe, sys.executable = sys.executable, _bin
+os.environ["HIVE_CUDA_PROBE_DEADLINE"] = "1"
+_t0 = time.time(); _p = hs.live_probe("700"); _dt = time.time() - _t0
+chk("CUDA context not created by the deadline -> fail cuda_init_slow",
+    _p.get("ok") is True and _p.get("cuda") == "fail" and _p.get("cuda_detail") == "cuda_init_slow")
+chk("...reported at the deadline, not after the slow init finished", _dt < 3.5)
+os.environ["HIVE_CUDA_PROBE_DEADLINE"] = "20"
+chk("a context created in time still reads ok", hs.live_probe("700").get("cuda") == "ok")
+sys.executable = _exe; os.environ.pop("HIVE_CUDA_PROBE_DEADLINE"); os.environ["HIVE_CUDA_PROBE_CMD"] = _cmd
+
 print("== probe backoff / pending reasons / starvation backoff ==")
 reset_health(); reset_sched_state()
 _real_probe, _calls = hs.live_probe, []
