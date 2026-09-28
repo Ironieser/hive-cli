@@ -236,8 +236,10 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   scheduler and holds the whole hold job. `pick_slots()` decides per card; "nothing
   usable on this hold job" is node-level (pop + backoff), "usable but not for this
   task" is task-level. A partially used hold job reads `busy` to the poller and is
-  still a candidate (`partial`). Validated offline only: the pool has had no
-  multi-GPU hold job to try it on.
+  still a candidate (`partial`). Inside a step `nvidia-smi` lists ALL the hold job's
+  cards — it is CUDA that sees only the task's — so the usage sampler picks its lines
+  by position. To try changes on several cards without waiting for H100s, a 2×V100
+  hold job (`--gres=gpu:tesla_v100-pcie-32gb:2`, normal partition) starts at once.
 - **GPU visibility is narrowed, never widened.** SLURM's cgroup already scopes an
   `srun --overlap` step to the hold-job's own GPUs, renumbered `0..N-1` — verified on
   multi-tenant nodes, so hive never needs `--gres`/`--gpu-bind` on the step. But a hold
