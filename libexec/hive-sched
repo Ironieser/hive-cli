@@ -414,6 +414,38 @@ def finished_health_probes():
     return done
 
 
+_excl_synced = None        # quarantined set last pushed onto the queued hold jobs
+_excl_thread = None
+
+
+def sync_excludes_async(quarantined):
+    """Push newly quarantined nodes onto the exclude lists of queued hold jobs, in the
+    background (a few scontrol calls). Retried next cycle if SLURM could not be asked."""
+    global _excl_synced, _excl_thread
+    want = frozenset(quarantined)
+    if want == _excl_synced or (_excl_thread and _excl_thread.is_alive()):
+        return
+    if _excl_synced is not None and want <= _excl_synced:
+        _excl_synced = want                     # the list only shrank: nothing to add
+        return
+
+    def run():
+        global _excl_synced
+        try:
+            done = hh.sync_pending_excludes(want)
+        except Exception as e:
+            logging.warning("Could not update queued hold jobs' exclude lists: %s", e)
+            return
+        if done is None:
+            return
+        _excl_synced = want
+        for jid, nodes in done.items():
+            logging.info("Queued hold job %s now excludes %s", jid, ", ".join(nodes))
+
+    _excl_thread = threading.Thread(target=run, name="sync-excludes", daemon=True)
+    _excl_thread.start()
+
+
 def health_probe(slurm_jobid):
     """(verdict, detail) for the periodic check of a quarantined node — the same
     guarded probe as verify-before-dispatch, so a wedged driver reads `fail` here too
@@ -1524,6 +1556,8 @@ def run_one_cycle():
 
         if health_changed:
             hh.save(health)
+        if quarantined:
+            sync_excludes_async(quarantined)
 
         # ── (3) Starvation watchdog ──────────────────────────────────────────
         # Only tasks that wanted a node count: one held by a dependency or a

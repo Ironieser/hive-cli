@@ -26,6 +26,9 @@ cat > "$TMP/bin/squeue" <<'EOF'
 # a 20h TimeLeft, in either the poll (%i|...|%L) or daemon (%i|...|%L|%j) format.
 jid=""; prev=""
 for a in "$@"; do [[ "$prev" == "-j" ]] && jid="$a"; prev="$a"; done
+# pending jobs of the user (`-t PD`): two queued hold jobs and one foreign job
+if [[ "$*" == *"-t PD"* ]]; then
+  [[ -e "$HIVE_DIR/mock_pending" ]] && printf '5001\n5002\n5003\n'; exit 0; fi
 if [[ -n "$jid" ]]; then
   # canary jobs (42xx): state comes from $HIVE_DIR/mock_canary_state, empty = finished
   if [[ "$jid" == 42* ]]; then
@@ -46,6 +49,15 @@ EOF
 # scontrol show node: booted long ago unless $HIVE_DIR/mock_boot holds another BootTime.
 cat > "$TMP/bin/scontrol" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$1 $2" == "show job" ]]; then
+  case "$3" in
+    5001) exc="evc[1-3]"; out="$HIVE_DIR/pool-logs/slurm-5001.out";;
+    5002) exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-5002.out";;
+    *)    exc="(null)";   out="/somewhere/else/slurm-$3.out";;        # not a hold job
+  esac
+  printf 'JobId=%s JobName=hold\n   ExcNodeList=%s\n   StdOut=%s\n' "$3" "$exc" "$out"; exit 0
+fi
+if [[ "$1" == "update" ]]; then echo "$*" >> "$HIVE_DIR/mock_scontrol_update.log"; exit 0; fi
 node="${@: -1}"
 boot="$(cat "$HIVE_DIR/mock_boot" 2>/dev/null || echo 2020-01-01T00:00:00)"
 state="$(cat "$HIVE_DIR/mock_node_state" 2>/dev/null || echo IDLE)"

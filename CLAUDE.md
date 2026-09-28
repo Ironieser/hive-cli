@@ -177,6 +177,10 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
 - **The user's command runs in a subshell** in the dispatch wrapper. Without it a
   command containing `exit N` ended the wrapper before the footer and the exit file
   were written, and the task surfaced as a crash orphan / "declared dead" (-1).
+- **Queued hold jobs follow the quarantine list.** When the list grows the scheduler
+  (background thread) adds the new nodes to `ExcNodeList` of the user's PENDING hold
+  jobs via `scontrol update`. A hold job is recognised by its stdout being under
+  `pool-logs/`; jobs submitted any other way are never modified. Add-only.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

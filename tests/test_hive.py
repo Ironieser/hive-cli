@@ -876,6 +876,28 @@ chk("hive stats shows GPU peak (P90) and mean util", "GPU-PEAK" in _buf.getvalue
 open(ev.EVENTS_FILE, "w").close(); wq({})
 reset_health(); reset_sched_state()
 
+print("== queued hold jobs learn about nodes quarantined after they were submitted ==")
+reset_health(); reset_sched_state()
+_upd = os.path.join(hs.HIVE_DIR, "mock_scontrol_update.log")
+open(os.path.join(hs.HIVE_DIR, "mock_pending"), "w").write("1")
+chk("only jobs logging to pool-logs/ count as hold jobs", hh.pending_hold_jobs() == {"5001": "evc[1-3]", "5002": ""})
+chk("missing nodes are added, present ones are not repeated",
+    hh.sync_pending_excludes({"evc2", "evc48"}) == {"5001": ["evc48"], "5002": ["evc2", "evc48"]})
+_u = open(_upd).read()
+chk("the job's own exclude list is kept", "JobId=5001 ExcNodeList=evc[1-3],evc48" in _u
+    and "JobId=5002 ExcNodeList=evc2,evc48" in _u and "5003" not in _u)
+os.remove(_upd)
+hs._excl_synced = None
+d = hh.load(); hh.quarantine(d, "evc48", "wedged", "verify"); d["nodes"]["evc48"]["last_check"] = time.time(); hh.save(d)
+wdb({}); wq({})
+hs.run_one_cycle(); hs._excl_thread.join(5)
+chk("the scheduler pushes the quarantine list in the background", "ExcNodeList=evc[1-3],evc48" in open(_upd).read())
+os.remove(_upd); hs.run_one_cycle()
+(hs._excl_thread and hs._excl_thread.join(5))
+chk("...once, not every cycle", not os.path.exists(_upd))
+os.remove(os.path.join(hs.HIVE_DIR, "mock_pending"))
+reset_health(); reset_sched_state()
+
 print("== phase 3: dependencies, arrays, concurrency caps ==")
 import argparse as _ap
 def _capture(fn, *a):

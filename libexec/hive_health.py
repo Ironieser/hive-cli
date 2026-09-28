@@ -419,6 +419,55 @@ def check_without_hold_job(data, node, partition=None, now=None):
     return record_check(data, node, None, "no_hold_job")
 
 
+# ── Hold jobs that are still queued when a node is quarantined ──────────────
+# `pool add` excludes the nodes quarantined at submit time. A hold job that waits in
+# the SLURM queue for hours can still be started on a node quarantined in the meantime
+# (861821 → evc48, 2026-09-28) and then sits there unused for its whole walltime. So
+# the exclusion is pushed onto the queued hold jobs whenever the list grows.
+POOL_LOG_DIR = os.path.join(HIVE_DIR, "pool-logs")
+
+
+def pending_hold_jobs():
+    """{jobid: ExcNodeList} of this user's PENDING hold jobs. A hold job is recognised
+    by its stdout being under pool-logs/ (`pool add` sets that), so jobs the user
+    submitted some other way are never touched. None if SLURM could not be asked."""
+    out = _slurm(["squeue", "-h", "-u", os.environ.get("USER", ""), "-t", "PD", "-o", "%i"])
+    if out is None:
+        return None
+    jobs = {}
+    for jid in out.split():
+        info = _slurm(["scontrol", "show", "job", jid])
+        if not info:
+            continue
+        kv = dict(re.findall(r"(\w+)=(\S+)", info))
+        if not kv.get("StdOut", "").startswith(POOL_LOG_DIR + os.sep):
+            continue
+        exc = kv.get("ExcNodeList", "")
+        jobs[jid] = "" if exc in ("(null)", "") else exc
+    return jobs
+
+
+def sync_pending_excludes(nodes):
+    """Add `nodes` to the exclude list of every queued hold job that lacks them.
+    Only ever adds. Returns {jobid: [nodes added]}, or None if SLURM could not be asked."""
+    jobs = pending_hold_jobs()
+    if jobs is None:
+        return None
+    done = {}
+    for jid, exc in jobs.items():
+        try:
+            have = set(expand_nodes(exc))
+        except ValueError:
+            continue
+        add = sorted(set(nodes) - have)
+        if not add:
+            continue
+        merged = ",".join(([exc] if exc else []) + add)
+        if _slurm(["scontrol", "update", f"JobId={jid}", f"ExcNodeList={merged}"]) is not None:
+            done[jid] = add
+    return done
+
+
 # ── Node lists (`hive pool add --exclude`, `hive submit --exclude`) ──────────
 def expand_nodes(spec):
     """Node names from a SLURM-style list: 'evc22,evc[1-3,07],gpu01' →

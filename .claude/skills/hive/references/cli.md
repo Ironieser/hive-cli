@@ -246,7 +246,8 @@ hive pool release --idle | JOBID # ⚠ HUMAN-ONLY: refuses without a TTY; no --y
 `~/.hive/pool-logs/`. It excludes every quarantined node (`hive health`) by itself —
 SLURM favours broken nodes because their GPUs are always free — plus `--exclude`, the
 script's own `#SBATCH --exclude`, and an `"exclude"` key in `pool_config.json` (top
-level or per preset). `--no-auto-exclude` turns the first off. Excluded nodes come back by themselves: see
+level or per preset). `--no-auto-exclude` turns the first off. Hold jobs still waiting in the SLURM queue get
+nodes quarantined later added to their exclude list automatically. Excluded nodes come back by themselves: see
 the health monitor in [troubleshooting.md](troubleshooting.md). Never `scancel` hold jobs directly: running tasks on them would
 be orphaned and requeued.
 
