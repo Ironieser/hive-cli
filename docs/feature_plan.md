@@ -15,7 +15,7 @@ daemon restart. Status is updated here as phases land.
 | — | Slow-node tier, partition preference | `SLOW` node state, `--allow-slow` / `--no-slow`, `"prefer_partitions"` in pool_config.json | done |
 | 4 | GPU-slot scheduling | several tasks on one multi-GPU hold job, one card each | planned |
 | 5 | Queue control | `hive hold` / `unhold` / `priority N` (pending tasks, ids or `--array`); `hive wait ID ID …` | done |
-| 5 | Probes outside `queue.lock` | `hive submit` / `cancel` never wait on a node probe | health checks done (background threads); verify-before-dispatch still inline |
+| 5 | Probes outside `queue.lock` | `hive submit` / `cancel` never wait on a node probe | done: health checks in background threads, verify probes between two passes of the cycle, in parallel |
 | 5 | Reap after scheduler death | feedback #18/#19: `hive list` / `hive wait` restart a dead scheduler | done |
 
 Not planned: multi-node tasks (a step cannot span hold jobs; needs a per-node launcher

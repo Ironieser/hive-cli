@@ -84,6 +84,9 @@ _starve_threshold = STARVATION_CYCLES
 # stacks probe steps on the node.
 PROBE_BACKOFF_BASE = 60
 PROBE_BACKOFF_MAX  = 600
+PROBE_BACKOFF_BUSY = 45     # flat wait for "busy / dirty right now" — one cycle is
+                            # skipped, enough to let the task try the next node; a
+                            # just-freed card often still shows memory for seconds
 _probe_backoff = {}
 
 # Node rejections are logged when the reason changes, else at most this often — the
@@ -372,13 +375,14 @@ def probe_backoff_reason(jid):
     return None
 
 
-def note_probe_result(jid, answered, reason="probe_unverifiable"):
-    """Arm / clear the per-job probe backoff."""
+def note_probe_result(jid, answered, reason="probe_unverifiable", cap=None):
+    """Arm / clear the per-job probe backoff. `cap` is a flat wait, for rejections
+    that can end at any moment (a card that is busy or dirty right now)."""
     if answered:
         _probe_backoff.pop(jid, None)
         return
     fails = _probe_backoff.get(jid, (0, 0))[0] + 1
-    wait = min(PROBE_BACKOFF_BASE * (2 ** (fails - 1)), PROBE_BACKOFF_MAX)
+    wait = cap if cap else min(PROBE_BACKOFF_BASE * (2 ** (fails - 1)), PROBE_BACKOFF_MAX)
     _probe_backoff[jid] = (fails, time.time() + wait, reason)
 
 
@@ -1013,8 +1017,52 @@ def _is_crash_orphan(task):
     return age is None or age > ORPHAN_GRACE_SECS
 
 
+PROBE_PARALLEL_MAX = 8      # verify probes run at once, outside queue.lock
+
+
+def probe_nodes(wanted):
+    """{jid: live_probe result} for `wanted` ({jid: skip_cuda}), probed in parallel.
+    Called WITHOUT queue.lock: a probe takes 8 s on a healthy node and up to
+    LIVE_PROBE_TIMEOUT on a bad one, and `hive submit` / `cancel` / `list` used to
+    wait behind every one of them."""
+    results = {}
+
+    def run(jid, skip_cuda):
+        try:
+            results[jid] = live_probe(jid, skip_cuda=skip_cuda)
+        except Exception as e:
+            logging.warning("Probe of hold job %s failed: %s", jid, e)
+            results[jid] = {"ok": False}
+
+    items = list(wanted.items())
+    for k in range(0, len(items), PROBE_PARALLEL_MAX):
+        threads = [threading.Thread(target=run, args=it, daemon=True)
+                   for it in items[k:k + PROBE_PARALLEL_MAX]]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(LIVE_PROBE_TIMEOUT + 30)
+    return results
+
+
 def run_one_cycle():
+    """One scheduler cycle, in two passes so that no node is probed under queue.lock.
+
+    Pass 1 does everything that needs no probe (reaping, timeouts, gates) and, instead
+    of probing, notes which hold job each dispatchable task would take. Those are then
+    probed in parallel with the lock released, and pass 2 — a full pass again, on the
+    queue as it is by then — dispatches with the answers. A task whose node is rejected
+    in pass 2 waits for the next cycle rather than triggering more probes."""
+    wanted = _cycle({}, final=False)
+    if wanted:
+        _cycle(probe_nodes(wanted), final=True)
+    else:
+        _cycle({}, final=True)
+
+
+def _cycle(probe_cache, final):
     global _starve_streak, _starve_threshold
+    wanted = {}        # pass 1: hold jobs to probe before pass 2 — {jid: skip_cuda}
     _reap_children()   # clear exited srun zombies so liveness checks stay truthful
     jobs_db, db_updated = load_node_db()
     changed = False
@@ -1476,9 +1524,22 @@ def run_one_cycle():
                         reason = node_reject = held
                         candidates.pop(i)      # node-level: silent last time, not re-probed yet
                         continue
-                    # On a slow node the CUDA probe would take minutes (while holding
-                    # queue.lock) to say what the periodic check already established.
-                    p = live_probe(jid, skip_cuda=is_slow)
+                    # Probes are made between the two passes (see run_one_cycle). On a
+                    # slow node the CUDA part is skipped: it would take minutes to say
+                    # what the periodic check already established.
+                    if jid in probe_cache:
+                        p = probe_cache[jid]
+                    elif final:
+                        reason = "verifying_node"      # not probed this cycle; next one
+                        i += 1
+                        continue
+                    elif jid in wanted:
+                        i += 1                         # another task asked for this node
+                        continue
+                    else:
+                        wanted[jid] = is_slow
+                        reason = "verifying_node"
+                        break
                     if p.get("fault"):
                         # srun ran, SLURM granted a GPU, and the GPU did not answer.
                         # No user code involved, but one slow nvidia-smi on a loaded
@@ -1504,7 +1565,8 @@ def run_one_cycle():
                             ev.record("quarantine", node=node_name, source="verify",
                                       reason=p["fault"])
                         continue
-                    note_probe_result(jid, p["ok"])
+                    if not p["ok"]:
+                        note_probe_result(jid, False)
                     if not p["ok"]:
                         reason = node_reject = "probe_unverifiable"
                         candidates.pop(i)      # node-level: can't confirm free this cycle
@@ -1515,6 +1577,10 @@ def run_one_cycle():
                     # A node the DB called idle but that is actually occupied:
                     if p["util"] >= 5 and used >= 500:
                         reason = node_reject = "node_busy_on_verify"
+                        # Step aside for a while: a task takes the FIRST node that is
+                        # not yet verified, so a node that keeps being rejected would
+                        # be probed again every cycle and the ones behind it never.
+                        note_probe_result(jid, False, reason, cap=PROBE_BACKOFF_BUSY)
                         candidates.pop(i)      # node-level
                         log_reject(jid, node_name, reason, f"util={p['util']}% used={used}MiB")
                         continue
@@ -1536,6 +1602,7 @@ def run_one_cycle():
                             ev.record("quarantine", node=node_name, source="verify",
                                       reason=p.get("cuda_detail"))
                         continue
+                    note_probe_result(jid, True)
                     # Verified clean: keep the live reading so the next task doesn't
                     # pay for another srun probe on the same node this cycle.
                     info = dict(info, _live=(used, total))
@@ -1543,6 +1610,7 @@ def run_one_cycle():
 
                 if used > GPU_CLEAN_MB:
                     reason = node_reject = "gpu_dirty"   # zombie / co-tenant memory resident
+                    note_probe_result(jid, False, reason, cap=PROBE_BACKOFF_BUSY)
                     candidates.pop(i)          # node-level
                     log_reject(jid, info.get("node", "?"), reason, f"used={used}MiB")
                     continue
@@ -1627,7 +1695,9 @@ def run_one_cycle():
         # ── (3) Starvation watchdog ──────────────────────────────────────────
         # Only tasks that wanted a node count: one held by a dependency or a
         # concurrency cap is not helped by re-polling the pool.
-        if starved and dispatched == 0:
+        if not final:
+            pass                     # pass 1 never dispatches; pass 2 does the counting
+        elif starved and dispatched == 0:
             _starve_streak += 1
             if _starve_streak >= _starve_threshold:
                 request_repoll(f"starvation: {starved} pending, 0 dispatched "
@@ -1640,6 +1710,7 @@ def run_one_cycle():
 
         if changed:
             save_queue(queue, lfd)
+    return wanted
 
 
 def scheduler_loop():

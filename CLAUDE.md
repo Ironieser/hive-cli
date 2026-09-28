@@ -164,8 +164,14 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
 - **Health probes of quarantined nodes run in background threads** (`start_health_probe`
   / `finished_health_probes`); the cycle starts one and applies its verdict on a later
   cycle. They target nodes known to be slow or wedged (60–150 s each) and, run inline,
-  delayed dispatch by minutes on an idle pool. Verify-before-dispatch is still inline.
+  delayed dispatch by minutes on an idle pool.
   The tests set `hs.HEALTH_ASYNC = False` so one cycle yields one verdict.
+- **No node is probed under `queue.lock`.** A cycle is two passes of `_cycle()`: pass 1
+  reaps, applies the gates and notes which hold job each dispatchable task would take
+  (`wanted`); `probe_nodes()` probes those in parallel with the lock released; pass 2 is
+  a full pass again, on the queue as reloaded, and dispatches from `probe_cache`. Pass 2
+  never probes: a task whose node is rejected there shows `verifying_node` and is tried
+  next cycle. Everything in `_cycle` must therefore be safe to run twice in a row.
 - **A task's finish time is its exit file's mtime**, not the cycle that noticed it.
 - **Dependencies and concurrency caps are gates that need no node.** They are checked
   before the candidate loop (`waiting_for_dependency`, `array_limit`, `owner_limit`),

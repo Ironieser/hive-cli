@@ -46,6 +46,7 @@ def loc(o=0):
 
 
 def wdb(jobs):
+    hs._probe_backoff.clear()      # a new pool: nothing learned about the old one applies
     json.dump({"updated": utc(), "jobs": jobs}, open(hs.NODE_DB, "w"))
 
 
@@ -945,6 +946,44 @@ hs.run_one_cycle()
 chk("a slow node that stops answering is quarantined", hh.load()["nodes"]["slown"]["state"] == "quarantined")
 hs.health_probe = _real_hp
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({})
+
+print("== verify probes run outside queue.lock, in parallel ==")
+reset_health(); reset_sched_state()
+import fcntl as _fc
+_lock_free, _real_lp2 = [], hs.live_probe
+def _probe_checks_lock(jid, **kw):
+    fd = open(hs.QUEUE_LOCK, "w")
+    try:
+        _fc.flock(fd, _fc.LOCK_EX | _fc.LOCK_NB); _lock_free.append(True); _fc.flock(fd, _fc.LOCK_UN)
+    except OSError:
+        _lock_free.append(False)
+    fd.close(); time.sleep(1.0)
+    return {"ok": True, "util": 0, "mem_used": 10, "mem_total": 81920, "cuda": "ok", "cuda_detail": ""}
+hs.live_probe = _probe_checks_lock
+wdb({str(700 + i): node(f"p{i}", 72000) for i in range(3)})
+wq({str(280 + i): dict(task(280 + i, name=f"par{i}", sub=loc(i)), cmd="true") for i in range(3)})
+_t0 = time.time(); hs.run_one_cycle(); _dt = time.time() - _t0
+chk("queue.lock is free while nodes are probed", _lock_free == [True, True, True])
+chk("three probes of 1s each take ~1s, not 3s", _dt < 2.2)
+chk("all three tasks dispatched in that one cycle, one node each",
+    sorted(t.get("node") for t in rq().values()) == ["p0", "p1", "p2"])
+# a node rejected in pass 2 does not trigger more probes in the same cycle
+_n = []
+def _dirty_first(jid, **kw):
+    _n.append(jid)
+    used = 40000 if jid == "700" else 10
+    return {"ok": True, "util": 0, "mem_used": used, "mem_total": 81920, "cuda": "ok", "cuda_detail": ""}
+hs.live_probe = _dirty_first
+time.sleep(0.4); hs.run_one_cycle()
+wdb({"700": node("d0", 72000), "701": node("d1", 72000)})
+wq({"285": dict(task(285, name="one"), cmd="true")})
+hs.run_one_cycle()
+chk("one task -> one probe; its node is dirty -> it waits for the next cycle",
+    _n == ["700"] and rq()["285"]["state"] == "pending")
+hs.run_one_cycle(); time.sleep(0.3)
+chk("next cycle probes the other node and dispatches", rq()["285"].get("node") == "d1")
+hs.live_probe = _real_lp2
+reset_health(); reset_sched_state(); wq({})
 
 print("== queue control: hold / unhold / priority ==")
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close()

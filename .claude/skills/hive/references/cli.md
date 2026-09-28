@@ -150,6 +150,7 @@ hive submit --notify 'curl -s -d "task $HIVE_TASK_NAME: $HIVE_TASK_STATE" https:
 | `waiting_for_dependency` | A task it was submitted `--after` has not ended yet |
 | `array_limit` / `owner_limit` | The array's `%N` / the owner's `--max-running` is reached; it starts when one of them ends |
 | `node_slow` | Only SLOW nodes are free and the task does not accept them → `--allow-slow`, or give an `--est-runtime` ≥ 1 h, or wait for a fast node |
+| `verifying_node` | The node it would take is being probed; decided within a cycle (~30 s) |
 | `held` | `hive hold` was used on it; `hive unhold ID` lets it go |
 | `node_excluded` | The only free nodes are in the task's `--exclude` list |
 | `insufficient_gpus` | No hold job owns `--gpus N` cards → add a `--gres=gpu:N` hold job or lower N |
