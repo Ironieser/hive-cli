@@ -656,10 +656,11 @@ hs.run_one_cycle()
 chk("while the canary runs: still quarantined, no second canary",
     hrec("evcC")["state"] == "quarantined" and hrec("evcC")["last_result"] == "canary_running"
     and open(os.path.join(hs.HIVE_DIR, "mock_sbatch.log")).read().count("hive_canary") == 1)
-mock("mock_canary_state")                         # job left the queue
+mock("mock_canary_state"); mock("mock_canary_purged", "1")   # finished AND purged from squeue
 d = hh.load(); d["nodes"]["evcC"]["last_check"] = 0; hh.save(d)
 hs.run_one_cycle()
-chk("canary came back healthy twice -> released", hrec("evcC")["state"] == "ok")
+chk("canary came back healthy twice -> released (squeue: Invalid job id)", hrec("evcC")["state"] == "ok")
+mock("mock_canary_purged")
 
 # (3) canary on a node that is still broken -> quarantine re-armed, next one in 6 h
 quarantine_old("evcB"); mock("mock_sbatch.log")

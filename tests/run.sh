@@ -28,7 +28,10 @@ jid=""; prev=""
 for a in "$@"; do [[ "$prev" == "-j" ]] && jid="$a"; prev="$a"; done
 if [[ -n "$jid" ]]; then
   # canary jobs (42xx): state comes from $HIVE_DIR/mock_canary_state, empty = finished
-  if [[ "$jid" == 42* ]]; then cat "$HIVE_DIR/mock_canary_state" 2>/dev/null; exit 0; fi
+  if [[ "$jid" == 42* ]]; then
+    # a purged job makes the real squeue fail like this
+    [[ -e "$HIVE_DIR/mock_canary_purged" ]] && { echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; }
+    cat "$HIVE_DIR/mock_canary_state" 2>/dev/null; exit 0; fi
   case ",$jid," in *",700,"*|*",9001,"*) echo "$jid";; esac; exit 0; fi
 fmt=""; for a in "$@"; do [[ "$a" == "%i|"* ]] && fmt="$a"; done
 if [[ "$fmt" == *"%j" ]]; then

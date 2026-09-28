@@ -298,6 +298,21 @@ def _slurm(argv):
     return out.stdout if out.returncode == 0 else None
 
 
+def job_state(jobid):
+    """SLURM state of a job still in the queue, "" once it has left it, None when
+    squeue could not be asked. A finished job is purged after a few minutes and
+    `squeue -j` then FAILS with "Invalid job id specified" — that is "left the
+    queue", not "could not ask" (the first canary sat at canary_unknown over this)."""
+    try:
+        out = subprocess.run(["squeue", "-h", "-j", str(jobid), "-o", "%T"],
+                             capture_output=True, text=True, timeout=SLURM_CMD_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return "" if "invalid job id" in (out.stderr or "").lower() else None
+    return (out.stdout or "").strip().split("\n")[0].strip()
+
+
 def node_info(node):
     """{State, BootTime (epoch | None), Partitions [..]} from `scontrol show node`."""
     out = _slurm(["scontrol", "show", "node", node])
@@ -362,10 +377,9 @@ def check_without_hold_job(data, node, partition=None, now=None):
     rec = _rec(data, node)
     can = rec.get("canary")
     if can:
-        state = _slurm(["squeue", "-h", "-j", str(can["jobid"]), "-o", "%T"])
+        state = job_state(can["jobid"])
         if state is None:
             return record_check(data, node, None, "canary_unknown")   # squeue failed: wait
-        state = state.strip().split("\n")[0].strip()
         if state:                                   # still queued / running
             if now - float(can.get("submitted") or now) > CANARY_MAX_WAIT_SECS:
                 _slurm(["scancel", str(can["jobid"])])
