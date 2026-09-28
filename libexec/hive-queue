@@ -292,7 +292,14 @@ def expand_after(text, queue):
             continue
         m = re.fullmatch(r"[aA](\d+)", part)
         if m:
-            members = [t["id"] for t in array_members(queue, int(m.group(1)))]
+            aid = int(m.group(1))
+            members = [t["id"] for t in array_members(queue, aid)]
+            # …and the members that were pruned: the event log still knows them, and
+            # a failed one must still fail what was submitted after the array.
+            members += sorted({e.get("task") for e in ev.iter_events()
+                               if e.get("event") == "submit" and e.get("array_id") == aid
+                               and e.get("task") is not None} - set(members))
+            members.sort()
             if not members:
                 raise ValueError(f"array #{m.group(1)} not found (for --after a{m.group(1)})")
             arrays.append(int(m.group(1)))
@@ -328,7 +335,7 @@ def array_members(queue, array_id):
                    if t.get("array_id") == array_id), key=lambda t: t["id"])
 
 
-NEED_MB_IDLE_USED = 600   # MiB an idle card may already show as used
+NEED_MB_IDLE_USED = 1500  # MiB an idle card may already show as used
 
 
 def largest_card_mb():
@@ -378,8 +385,10 @@ def history_need_mb(name):
     # 86 GB and wait forever on an idle pool. Capped at the largest card in the pool
     # minus what an idle card shows as used; without pool data, at the measured peak.
     card = largest_card_mb()
-    if card and want > card - NEED_MB_IDLE_USED:
-        want = max(p90, card - NEED_MB_IDLE_USED) if p90 <= card else card - NEED_MB_IDLE_USED
+    if card:
+        want = min(want, card - NEED_MB_IDLE_USED)
+    else:
+        want = min(want, int(-(-p90 // 500) * 500))   # pool unknown: the peak, no headroom
     return int(want), len(peaks)
 
 
@@ -528,6 +537,8 @@ _sched_checked = 0.0
 
 
 STOP_WAIT_SECS = 30
+STOP_WAIT_REMOTE_SECS = 90
+SCHED_STOP_REQ = os.path.join(HIVE_DIR, "sched.stop-request")
 
 
 def ensure_sched(queue, every=60):
@@ -599,15 +610,41 @@ def cmd_daemon(args):
         if pid is None or not is_sched_running():
             print("hive-sched is not running")
             return
+        _, host = read_sched_pid()
+        if host and host != socket.gethostname():
+            # Its PID means nothing here: signalling it would hit whatever process of
+            # ours has that number on THIS host. Ask through the shared FS instead;
+            # the scheduler looks for the request every second between passes.
+            try:
+                open(SCHED_STOP_REQ, "w").close()
+            except OSError as e:
+                print(f"hive-sched runs on {host}; could not leave a stop request: {e}",
+                      file=sys.stderr)
+                sys.exit(1)
+            for _ in range(STOP_WAIT_REMOTE_SECS * 2):
+                if not os.path.exists(SCHED_HB) and not os.path.exists(SCHED_PID):
+                    print(f"hive-sched stopped (PID {pid} on {host})")
+                    return
+                time.sleep(0.5)
+            try:
+                os.remove(SCHED_STOP_REQ)
+            except OSError:
+                pass
+            print(f"hive-sched (PID {pid} on {host}) did not stop within "
+                  f"{STOP_WAIT_REMOTE_SECS}s. Log in to {host} and run "
+                  f"`hive queue daemon stop` there.", file=sys.stderr)
+            sys.exit(1)
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             print("hive-sched: process not found (stale PID file)")
             return
+        except PermissionError:
+            print(f"hive-sched: PID {pid} is not ours (stale PID file)")
+            return
         # It finishes the pass it is in before exiting (a pass is short: nothing is
         # probed inside one). Wait for that, so `restart` does not find the old one
         # still alive and start nothing.
-        _, host = read_sched_pid()
         if not host or host == socket.gethostname():
             for _ in range(STOP_WAIT_SECS * 5):
                 try:
@@ -1178,7 +1215,8 @@ def cmd_cancel(args):
         if not members:
             print(f"Array #{args.array}: no pending or running task.")
         for tid in members:
-            cmd_cancel(argparse.Namespace(id=tid, array=None))
+            cmd_cancel(argparse.Namespace(id=tid, array=None,
+                                          force=getattr(args, "force", False)))
         if args.id is None:
             return
     if args.id is None:
@@ -1206,7 +1244,22 @@ def cmd_cancel(args):
             _, sched_host = read_sched_pid()
             sched_local = (not sched_host) or sched_host == socket.gethostname()
             sched_alive = is_sched_running()
-            if sched_alive:
+            if getattr(args, "force", False):
+                # The scheduler is alive but not acting (stuck, or not the one that
+                # owns this task). Mark it cancelled here and now; stop the step
+                # ourselves only where its PID means something.
+                if sched_local and srun_pid:
+                    try:
+                        os.kill(srun_pid, signal.SIGTERM)
+                        print(f"Sent SIGTERM to srun PID {srun_pid}")
+                    except (ProcessLookupError, PermissionError):
+                        print(f"srun process {srun_pid} already gone")
+                else:
+                    print(f"{C_YELLOW}Warning:{C_RESET} the step runs under the scheduler on "
+                          f"{sched_host or '?'}; it is NOT stopped from here and may keep its "
+                          f"GPU on {task.get('node') or '?'} until that scheduler acts.")
+                task.pop("cancel_requested", None)
+            elif sched_alive:
                 # Always through the scheduler when there is one, also on this host:
                 # it stops the step AND records run time and GPU usage and runs the
                 # --notify hook. Killing srun from here skipped all three.
@@ -1578,7 +1631,7 @@ def cmd_wait_many(args, ids):
     verbose = len(ids) <= WAIT_MANY_VERBOSE
     print(f"Waiting for {len(ids)} task(s): #{ids[0]}–#{ids[-1]}" if len(ids) > 3
           else f"Waiting for task(s): {', '.join('#' + str(i) for i in ids)}", flush=True)
-    gone = None
+    gone, seen_in_queue = None, {}
     while True:
         _q = load_queue()
         ensure_sched(_q)
@@ -1590,8 +1643,10 @@ def cmd_wait_many(args, ids):
                 # Not in the queue: pruned or removed, and the event log remembers how
                 # it ended — or an id that never existed, which is an error, not a
                 # success.
-                if gone is None:
+                if gone is None or i not in gone:       # also pruned DURING the wait
                     gone = final_states_from_events([j for j in ids if str(j) not in tasks])
+                if i not in gone and i in seen_in_queue:
+                    gone[i] = seen_in_queue[i]           # pruned before its event was read
                 states[i] = gone.get(i, "unknown")
                 if i not in reported:
                     reported.add(i)
@@ -1602,6 +1657,8 @@ def cmd_wait_many(args, ids):
                         print(f"  #{i} ended {states[i]} (since removed from the queue)", flush=True)
                 continue
             states[i] = t["state"]
+            if t["state"] in TERMINAL_STATES:
+                seen_in_queue[i] = t["state"]
             if t["state"] in TERMINAL_STATES and i not in reported:
                 reported.add(i)
                 if not verbose and t["state"] == "done":
@@ -1859,6 +1916,9 @@ def build_parser():
     pc.add_argument("id", type=int, metavar="ID", nargs="?")
     pc.add_argument("--array", type=int, metavar="ARRAY_ID",
                     help="Cancel every pending/running task of this array")
+    pc.add_argument("--force", action="store_true",
+                    help="Do not wait for the scheduler: mark the task cancelled now. For a "
+                         "scheduler that is alive but not acting (task stuck in CANCELLING)")
 
     # logs
     pg = sub.add_parser("logs", help="Show task log")

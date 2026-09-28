@@ -29,6 +29,7 @@ for d in (hs.HIVE_DIR, hs.HEARTBEAT_DIR, hs.LOG_DIR):
 # when it looks dead, and real SLURM is next on PATH after the mocks. The fake heartbeat
 # from run.sh goes stale after 90 s, so the starter itself is disarmed.
 _daemon_calls = []
+_real_cmd_daemon = hq.cmd_daemon        # only ever called with `stop` and os.kill patched
 hq.cmd_daemon = lambda a: _daemon_calls.append(getattr(a, "subcmd", None))
 hs.HEALTH_ASYNC = False   # health probes inline, so one cycle = one verdict; the
                           # background path has its own test
@@ -546,6 +547,7 @@ chk("gpu query parser: step never ran -> no verdict", hh.parse_gpu_query([]) == 
 
 def reset_sched_state():
     hs._probe_backoff.clear(); hs._reject_logged.clear()
+    getattr(hs, "_freed_at", {}).clear(); getattr(hs, "_task_skip", {}).clear()
     hs._starve_streak = 0; hs._starve_threshold = hs.STARVATION_CYCLES
 reset_health(); reset_sched_state()
 os.environ.update({"MOCK_GPU_HANG": "4", "HIVE_GPU_QUERY_DEADLINE": "1", "CUDA_VISIBLE_DEVICES": "0"})
@@ -605,7 +607,7 @@ chk("a silent hold job is probed once, then backed off", _calls == ["700"])
 chk("unanswered probes never strike the node", not hh.load()["nodes"].get("silent", {}).get("strikes"))
 chk("tasks behind the first keep the node-level reason",
     [rq()[k].get("pending_reason") for k in ("140", "141")] == ["probe_unverifiable"] * 2)
-hs._probe_backoff["700"] = (1, time.time() - 1, "probe_unverifiable")   # backoff elapsed
+hs._probe_backoff["700"] = (1, time.time() - 1, "probe_unverifiable", False)   # backoff elapsed
 hs.run_one_cycle()
 chk("...and probed again once the backoff elapsed", _calls == ["700", "700"])
 chk("backoff grows with consecutive failures", hs._probe_backoff["700"][0] == 2
@@ -1051,7 +1053,7 @@ _u = open(_upd).read()
 chk("the job's own exclude list is kept", "JobId=5001 ExcNodeList=evc1,evc2,evc3,evc48" in _u
     and "JobId=5002 ExcNodeList=evc2,evc48" in _u and "5003" not in _u)
 chk("what hive added is remembered per job",
-    hh.load_hive_excludes() == {"5001": ["evc48"], "5002": ["evc2", "evc48"]})
+    hh.hive_excludes() == {"5001": ["evc48"], "5002": ["evc2", "evc48"]})
 chk("names that are not node names never reach SLURM",
     hh.sync_pending_excludes({"evc48", "evc50 --partition=debug", "ty po"}) is not None
     and "debug" not in open(_upd).read() and "ty po" not in open(_upd).read())
@@ -1279,10 +1281,13 @@ for _ in range(30):
 chk("the hook gets the task's owner, not the scheduler's environment", open(_ef).read().strip() == "[][agentB][570]")
 os.environ.pop("SECRET_OF_AGENT_A"); os.environ.pop("HIVE_OWNER")
 hs._notify_running.clear(); hs._notify_waiting.clear()
-for i in range(40):
-    hs.notify(dict(task(600 + i, name="f", state="failed"), notify="sleep 2"), "finish")
-chk("at most NOTIFY_MAX_PARALLEL hooks run at once; the rest wait",
-    len(hs._notify_running) == hs.NOTIFY_MAX_PARALLEL and len(hs._notify_waiting) == 40 - hs.NOTIFY_MAX_PARALLEL)
+_many = [dict(task(600 + i, name="f", state="failed"), notify="sleep 2") for i in range(40)]
+for t_ in _many:
+    hs.notify(t_, "finish")
+chk("at most NOTIFY_MAX_PARALLEL hooks run at once",
+    len(hs._notify_running) == hs.NOTIFY_MAX_PARALLEL and not hs._notify_waiting)
+chk("the rest is owed on the task itself, so a restart cannot lose it",
+    sum(1 for t_ in _many if t_.get("notify_pending") == "finish") == 40 - hs.NOTIFY_MAX_PARALLEL)
 for p_ in hs._notify_running: p_.kill()
 hs._notify_running.clear(); hs._notify_waiting.clear()
 
@@ -1319,7 +1324,7 @@ hs.health_probe = _hp
 reset_health(); reset_sched_state()
 two = node("X", 72000); two["gpu"] = two["gpu"] * 2
 wdb({"701": node("X", 72000), "702": two, "703": dict(node("Y", 72000), gpu=two["gpu"])})
-d = hh.load(); hh.strike(d, "X", "earlier", "verify"); hh.save(d)      # X has one strike
+d = hh.load(); hh.verify_strike(d, "X", "earlier"); hh.save(d)         # X has one verify strike
 _lp = hs.live_probe
 hs.live_probe = lambda jid, **kw: ({"ok": False, "fault": "gpu_unresponsive"} if jid == "702"
     else {"ok": True, "util": 0, "mem_used": 10, "mem_total": 81920, "cuda": "ok", "cuda_detail": ""})
@@ -1331,10 +1336,11 @@ chk("drop_node keeps the index on the right entry",
     hs.drop_node([("a", {"node": "X"}, 0), ("b", {"node": "Y"}, 0)], "X", 1) == 0)
 # a clean verify forgives old strikes
 reset_health(); reset_sched_state()
-d = hh.load(); hh.strike(d, "okn", "one slow answer", "verify"); hh.save(d)
-wdb({"700": node("okn", 72000)}); wq({"591": dict(task(591, name="c"), cmd="true")})
+d = hh.load(); hh.verify_strike(d, "okn", "one slow answer"); hh.strike(d, "okn", "task died at CUDA init"); hh.save(d)
+wdb({"700": node("okn", 72000)}); wq({"591": dict(task(591, name="c"), cmd="sleep 2")})
 hs.run_one_cycle(); time.sleep(0.3)
-chk("a clean verify probe clears earlier verify strikes", hh.load()["nodes"]["okn"]["strikes"] == 0)
+chk("a clean verify probe clears earlier verify strikes", hh.load()["nodes"]["okn"].get("verify_strikes") == 0)
+chk("...but NOT the strikes of tasks that died there", hh.load()["nodes"]["okn"]["strikes"] == 1)
 hs.live_probe = _lp
 
 # one scheduler per cluster
@@ -1359,7 +1365,7 @@ hs._stop_requested = False; hs.shutdown = _rs
 open(os.path.join(hs.HIVE_DIR, "mock_pending"), "w").write("1")
 _no_excl = lambda: os.path.exists(hh.EXCL_FILE) and os.remove(hh.EXCL_FILE)
 _no_excl()
-hh.save_hive_excludes({"5001": ["evc2"]})            # hive had added evc2 to job 5001 (evc[1-3])
+hh.track_excludes("5001", ["evc2"])            # hive had added evc2 to job 5001 (evc[1-3])
 _upd = os.path.join(hs.HIVE_DIR, "mock_scontrol_update.log")
 os.path.exists(_upd) and os.remove(_upd)
 _d = hh.sync_pending_excludes(set())                   # nothing quarantined any more
@@ -1376,6 +1382,194 @@ chk("script excludes: several options per line, quotes, remarks",
     hp2.script_excludes(_scr) == ["evc7", "evc8,evc9", "evc10"])
 chk("an exclude given as a JSON list is accepted",
     hp2.build_exclude(_scr, None, [["evc50", "evc51"], None], False)[0] == "evc7,evc8,evc9,evc10,evc50,evc51")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
+
+print("== red team, round 2 ==")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close()
+hs._freed_at.clear(); hs._task_skip.clear()
+_ok = lambda **k: dict({"ok": True, "util": 0, "mem_used": 10, "mem_total": 81920,
+                        "gpus": [(0, 10, 81920)], "cuda": "ok", "cuda_detail": ""}, **k)
+_lpR = hs.live_probe
+
+# F1: a node whose task just ended is reused at once, although the DB still says busy
+wdb({"700": node("n0", 72000, st="busy")})
+t = task(700, name="ends", state="running", jid="700", node="n0", st=loc(-30)); t["started_ts"] = time.time() - 30
+t["gpu_slots"] = [0]
+open(os.path.join(hs.HEARTBEAT_DIR, "700.exit"), "w").write("0")
+wq({"700": t, "701": dict(task(701, name="next"), cmd="sleep 2")})
+hs.live_probe = lambda jid, **kw: _ok()
+hs.run_one_cycle()
+chk("the freed hold job takes the next task in the same cycle", rq()["701"].get("node") == "n0")
+# ...and still next cycle, if this one could not use it yet (memory not released)
+reset_sched_state(); hs._freed_at.clear()
+wdb({"700": node("n0", 72000, st="busy")})
+t = task(702, name="ends", state="running", jid="700", node="n0", st=loc(-30)); t["started_ts"] = time.time() - 30
+t["gpu_slots"] = [0]
+open(os.path.join(hs.HEARTBEAT_DIR, "702.exit"), "w").write("0")
+wq({"702": t, "703": dict(task(703, name="next"), cmd="sleep 2")})
+hs.live_probe = lambda jid, **kw: _ok(mem_used=30000, gpus=[(0, 30000, 81920)])
+hs.run_one_cycle()
+chk("memory still resident -> not dispatched yet", rq()["703"]["state"] == "pending")
+hs._probe_backoff.clear()
+hs.live_probe = lambda jid, **kw: _ok()
+hs.run_one_cycle()
+chk("...a later cycle still offers the freed hold job (DB says busy until the next poll)",
+    rq()["703"].get("node") == "n0")
+chk("once the DB has a newer reading the node is no longer forced",
+    (hs._freed_at.__setitem__("700", time.time() - 100), wdb({"700": node("n0", 72000, st="busy")}),
+     hs.recently_freed(json.load(open(hs.NODE_DB))["jobs"]))[2] == set())
+
+# F2: a node the task cannot use (walltime, card size) is not the one it asks to probe
+reset_sched_state(); hs._freed_at.clear()
+_seen = []
+hs.live_probe = lambda jid, **kw: (_seen.append(jid), _ok())[1]
+wdb({"701": node("short", 1800), "702": node("long", 36000)})
+wq({"710": dict(task(710, name="two_h", est=7200), cmd="true")})
+hs.run_one_cycle(); time.sleep(0.3)
+chk("walltime is checked BEFORE the probe: only the usable node is probed",
+    _seen == ["702"] and rq()["710"].get("node") == "long")
+_seen.clear()
+small = dict(node("small", 72000), gpu=[{"index": 0, "util": 0, "mem_used": 10, "mem_total": 24000}])
+wdb({"701": small, "702": node("big", 72000)})
+wq({"711": dict(task(711, name="big_mem", need_mb=60000), cmd="true")})
+hs.run_one_cycle(); time.sleep(0.3)
+chk("a card smaller than --need-mb is skipped without a probe", _seen == ["702"] and rq()["711"].get("node") == "big")
+# memory short only right now: the task looks elsewhere next cycle
+_seen.clear(); reset_sched_state()
+hs.live_probe = lambda jid, **kw: (_seen.append(jid),
+    _ok(mem_used=4000, gpus=[(0, 4000, 81920)]) if jid == "701" else _ok())[1]
+wdb({"701": node("part", 72000), "702": node("free", 72000)})
+wq({"712": dict(task(712, name="needs79", need_mb=79000), cmd="true")})
+hs.run_one_cycle()
+chk("first node has too little free memory for this task", rq()["712"]["state"] == "pending")
+hs.run_one_cycle(); time.sleep(0.3)
+chk("next cycle it probes the OTHER node and runs", _seen == ["701", "702"] and rq()["712"].get("node") == "free")
+
+# F3: a node that passes every probe while every task dies at CUDA init IS quarantined
+reset_health(); reset_sched_state(); hs._freed_at.clear(); hs._task_skip.clear()
+hs.live_probe = lambda jid, **kw: _ok()
+def _dies(i):
+    t = task(i, name="dies", state="running", jid="700", node="sick", st=loc(-20)); t["started_ts"] = time.time() - 20
+    t["gpu_slots"] = [0]
+    open(t["log"], "w").write("RuntimeError: CUDA error: CUDA-capable device(s) is/are busy or unavailable\n")
+    open(os.path.join(hs.HEARTBEAT_DIR, f"{i}.exit"), "w").write("1")
+    return t
+wdb({"700": node("sick", 72000)})
+wq({"720": _dies(720), "721": dict(task(721, name="probe_ok"), cmd="sleep 2")})
+hs.run_one_cycle()          # strike 1, then 721 is verified clean and dispatched there
+chk("strike from the task survives a clean verify probe", hh.load()["nodes"]["sick"]["strikes"] == 1
+    and rq()["721"].get("node") == "sick")
+q_ = rq(); q_["722"] = _dies(722); q_["721"]["state"] = "cancelled"; wq(q_)
+hs.run_one_cycle()
+chk("second task dying at CUDA init quarantines the node", hh.load()["nodes"]["sick"]["state"] == "quarantined")
+
+# F5: busy nodes back off for longer each time, so the node behind them is reached
+reset_health(); reset_sched_state(); hs._freed_at.clear()
+hs.note_probe_result("b1", False, "node_busy_on_verify", cap=hs.PROBE_BACKOFF_BUSY)
+_w1 = hs._probe_backoff["b1"][1] - time.time()
+hs.note_probe_result("b1", False, "node_busy_on_verify", cap=hs.PROBE_BACKOFF_BUSY)
+_w2 = hs._probe_backoff["b1"][1] - time.time()
+chk("busy backoff doubles (45s, 90s, …) instead of staying at 45s", 40 < _w1 < 50 and 85 < _w2 < 95)
+for _ in range(6): hs.note_probe_result("b1", False, "node_busy_on_verify", cap=hs.PROBE_BACKOFF_BUSY)
+chk("...up to a limit", hs._probe_backoff["b1"][1] - time.time() <= hs.PROBE_BACKOFF_BUSY_MAX + 1)
+hs.note_probe_result("b1", False)
+chk("one unanswered probe after many 'busy' starts at the base wait, not at ten minutes",
+    hs._probe_backoff["b1"][1] - time.time() <= hs.PROBE_BACKOFF_BASE + 1)
+_seen.clear(); reset_sched_state()
+hs.live_probe = lambda jid, **kw: (_seen.append(jid),
+    _ok() if jid == "703" else _ok(util=90, mem_used=30000, gpus=[(90, 30000, 81920)]))[1]
+wdb({"701": node("busyA", 72000), "702": node("busyB", 72000), "703": node("freeC", 72000)})
+wq({"730": dict(task(730, name="patient"), cmd="true")})
+for _ in range(3):
+    hs.run_one_cycle()
+    for k, v in list(hs._probe_backoff.items()):          # 38 s pass between cycles
+        hs._probe_backoff[k] = (v[0], v[1] - 38, v[2], v[3])
+time.sleep(0.3)
+chk("two busy nodes do not hide the free one behind them", rq()["730"].get("node") == "freeC")
+hs.live_probe = _lpR
+
+# F6: a stuck main loop is not reported as alive for ever
+_ex = []; _oe = os._exit; os._exit = lambda c: (_ex.append(c), (_ for _ in ()).throw(SystemExit(c)))
+_ts = hs.time.sleep; hs._last_pass = time.time() - hs.MAIN_STALL_SECS - 5
+try:
+    hs.heartbeat_forever()
+except SystemExit:
+    pass
+os._exit = _oe; hs._last_pass = time.time()
+chk("no pass for MAIN_STALL_SECS -> the scheduler gives up its place", _ex == [1])
+
+# F4 / F12: stop request through the shared FS; only our own pid file is removed
+open(hs.SCHED_STOP_REQ, "w").close()
+chk("a stop request file is seen once", hs.stop_requested() is True and hs.stop_requested() is False)
+open(hs.SCHED_PID, "w").write("4242\notherhost\n"); open(hs.SCHED_HB, "w").write("x")
+hs.remove_own_files()
+chk("another scheduler's pid file is left alone", os.path.exists(hs.SCHED_PID))
+open(hs.SCHED_PID, "w").write(f"{os.getpid()}\n{hs.socket.gethostname()}\n")
+hs.remove_own_files()
+chk("our own is removed", not os.path.exists(hs.SCHED_PID))
+open(hs.SCHED_PID, "w").write("999999\notherhost\n"); open(hs.SCHED_HB, "w").write("x")
+_killed = []; _ok_kill = os.kill
+os.kill = lambda pid, sig: _killed.append((pid, sig))
+hq.STOP_WAIT_REMOTE_SECS = 1
+_c, _o = _rc(_real_cmd_daemon, _apR.Namespace(subcmd="stop"))
+os.kill = _ok_kill
+chk("stop of a scheduler on ANOTHER host signals nothing here",
+    _killed == [] and _c == 1 and "otherhost" in _o)
+chk("...it leaves a request the scheduler picks up (withdrawn when not honoured)",
+    not os.path.exists(hq.SCHED_STOP_REQ))
+open(hs.SCHED_PID, "w").write("999999\notherhost\n"); open(hs.SCHED_HB, "w").write("x")
+
+# F7: cancel --force
+wq({"740": dict(task(740, name="stuck", state="running", jid="700", node="n0", st=loc(-30)), cancel_requested=loc(-20))})
+_rc(hq.cmd_cancel, _apR.Namespace(id=740, array=None, force=False))
+chk("plain cancel on a live scheduler only asks", rq()["740"]["state"] == "running")
+_rc(hq.cmd_cancel, _apR.Namespace(id=740, array=None, force=True))
+chk("cancel --force ends it now", rq()["740"]["state"] == "cancelled" and not rq()["740"].get("cancel_requested"))
+
+# F10
+for i, pk in enumerate((76000, 77000, 78000)):
+    ev.record("finish", task=850 + i, name="huge2", state="done", run_secs=100, gpu_peak_mb=pk)
+wdb({"700": node("n", 72000)})
+chk("--need-mb auto leaves room for what an idle card already uses",
+    hq.history_need_mb("huge2")[0] == 81920 - hq.NEED_MB_IDLE_USED)
+os.remove(hs.NODE_DB)
+chk("...and without pool data asks for the measured peak, not more", hq.history_need_mb("huge2")[0] == 78000)
+wdb({})
+
+# F11
+json.dump({"version": 1, "next_id": 760, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="arr", array="0-1"))
+ev.record("finish", task=760, name="arr", state="failed", exit_code=1, run_secs=3)
+q_ = rq(); q_.pop("760"); wq(q_)                       # member 0 failed and was pruned
+_rc(hq.cmd_submit, _nsR(name="dep", after="a760"))
+chk("--after aN still includes a pruned member", _new()["depends_on"] == [760, 761])
+wdb({"700": node("n0", 72000)})
+hs.run_one_cycle()
+chk("...so the dependant fails with it", _new().get("fail_reason") == "dependency_failed")
+
+# F9: pool add recording a job while a sync runs is not overwritten
+_no_excl_state()
+open(os.path.join(hs.HIVE_DIR, "mock_pending"), "w").write("1")
+_orig = hh.pending_hold_jobs
+def _slow_list():
+    r = _orig(); hh.track_excludes("5009", ["evc43"]); return r      # pool add, mid-sync
+hh.pending_hold_jobs = _slow_list
+hh.sync_pending_excludes({"evc43"})
+hh.pending_hold_jobs = _orig
+chk("an entry recorded during a sync survives it", hh.hive_excludes().get("5009") == ["evc43"])
+hh.track_excludes("4000", ["evc1"])
+d_ = hh.load_hive_excludes(); d_["4000"]["t"] = time.time() - hh.EXCL_KEEP_SECS - 5; hh.save_hive_excludes(d_)
+hh.sync_pending_excludes({"evc43"})
+chk("an old entry of a job that left the queue is dropped", "4000" not in hh.hive_excludes())
+os.remove(os.path.join(hs.HIVE_DIR, "mock_pending")); _no_excl_state()
+_u2 = os.path.join(hs.HIVE_DIR, "mock_scontrol_update.log"); os.path.exists(_u2) and os.remove(_u2)
+
+# a command that starts with a dash
+wdb({"700": node("n0", 72000)})
+wq({"750": dict(task(750, name="dash"), cmd="-notacommand 2>/dev/null; echo after-dash")})
+hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle()
+chk("a command starting with '-' runs as a command", "after-dash" in open(rq()["750"]["log"]).read())
+hs._freed_at.clear(); hs._task_skip.clear()
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
 
 print("== a dead scheduler is restarted by list / wait (feedback #18/#19) ==")

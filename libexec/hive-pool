@@ -231,9 +231,7 @@ def cmd_add(args):
             m = re.search(r"(\d+)\s*$", result.stdout.strip())
             if m and auto_added:
                 try:
-                    tracked = hh.load_hive_excludes()
-                    tracked[m.group(1)] = list(auto_added)
-                    hh.save_hive_excludes(tracked)
+                    hh.track_excludes(m.group(1), auto_added)
                 except OSError:
                     pass
         else:

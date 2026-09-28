@@ -420,9 +420,13 @@ def check_without_hold_job(data, node, partition=None, now=None):
             return record_check(data, node, "unknown", "canary: no output")
         outcome = None
         slowest = max((cuda_secs(d) or 0 for v, d in verdicts if v == "ok"), default=0)
-        if slowest > CUDA_INIT_DEADLINE and all(v == "ok" for v, _ in verdicts) \
-                and may_become_slow(rec):
-            return "slow" if mark_slow(data, node, slowest) else None
+        if slowest > CUDA_INIT_DEADLINE and all(v == "ok" for v, _ in verdicts):
+            if may_become_slow(rec):
+                return "slow" if mark_slow(data, node, slowest) else None
+            # Out for a real fault and now merely slow: not a healthy probe (the
+            # check through a hold job judges it the same way).
+            return record_check(data, node, "unknown",
+                                f"canary: slow init {slowest}s on a node quarantined for a fault")
         for verdict, detail in verdicts:
             outcome = record_check(data, node, verdict, f"canary: {detail}".rstrip(": ")) or outcome
             if outcome == "released":
@@ -490,12 +494,53 @@ def valid_node_name(name):
     return bool(NODE_NAME_RE.match(str(name or "")))
 
 
+class ExcludesLock:
+    """Serialises read-modify-write of pool_excludes.json between `hive pool add` and
+    the scheduler's sync thread."""
+    def __enter__(self):
+        import fcntl
+        os.makedirs(HIVE_DIR, exist_ok=True)
+        self._fd = open(EXCL_FILE + ".lock", "w")
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        import fcntl
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fd.close()
+
+
+EXCL_KEEP_SECS = 900     # an entry this young is kept even if its job is not (yet)
+                         # in a squeue listing: the listing may predate the job
+
+
+def track_excludes(jobid, nodes):
+    """Record that hive put `nodes` on job `jobid`'s exclude list."""
+    with ExcludesLock():
+        tracked = load_hive_excludes()
+        tracked[str(jobid)] = {"nodes": sorted(nodes), "t": time.time()}
+        save_hive_excludes(tracked)
+
+
+def hive_excludes():
+    """{jobid: [nodes hive added]} — the file without its timestamps."""
+    return {j: list(v["nodes"]) for j, v in load_hive_excludes().items()}
+
+
 def load_hive_excludes():
     try:
         with open(EXCL_FILE) as f:
             data = json.load(f)
-        return {str(k): list(v) for k, v in data.items()} if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError, TypeError):
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for k, v in data.items():
+            if isinstance(v, dict):
+                out[str(k)] = {"nodes": list(v.get("nodes") or []), "t": float(v.get("t") or 0)}
+            else:
+                out[str(k)] = {"nodes": list(v or []), "t": 0.0}
+        return out
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return {}
 
 
@@ -520,6 +565,8 @@ def sync_pending_excludes(nodes):
         return None
     want = {n for n in nodes if valid_node_name(n)}
     tracked = load_hive_excludes()
+    known_at_start = set(tracked)
+    updates = {}
     done = {}
     for jid, exc in jobs.items():
         try:
@@ -527,22 +574,30 @@ def sync_pending_excludes(nodes):
         except ValueError:
             done["_failed"] = True           # a list we cannot read: do not touch it
             continue
-        ours = set(tracked.get(jid, []))
+        ours = set(tracked.get(jid, {}).get("nodes", []))
         base = [n for n in have if n not in ours]          # the job's own exclusions
         target = base + sorted(want - set(base))
         if set(target) == set(have):
-            tracked[jid] = sorted(want - set(base))
+            updates[jid] = sorted(want - set(base))
             continue
         if _slurm(["scontrol", "update", f"JobId={jid}",
                    f"ExcNodeList={','.join(target)}"]) is None:
             done["_failed"] = True
             continue
-        tracked[jid] = sorted(want - set(base))
+        updates[jid] = sorted(want - set(base))
         done[jid] = (sorted(set(target) - set(have)), sorted(set(have) - set(target)))
-    for jid in [j for j in tracked if j not in jobs]:       # started or gone
-        del tracked[jid]
+    # Written back on top of the file as it is NOW, not as it was read: `hive pool add`
+    # may have recorded a new job meanwhile, and only entries this run knew about and
+    # no longer finds in the queue are dropped.
     try:
-        save_hive_excludes(tracked)
+        with ExcludesLock():
+            fresh = load_hive_excludes()
+            for jid, nodes in updates.items():
+                fresh[jid] = {"nodes": nodes, "t": fresh.get(jid, {}).get("t") or time.time()}
+            for jid in known_at_start:
+                if jid not in jobs and time.time() - fresh.get(jid, {}).get("t", 0) > EXCL_KEEP_SECS:
+                    fresh.pop(jid, None)             # started or gone
+            save_hive_excludes(fresh)
     except OSError:
         pass
     return done
@@ -747,6 +802,32 @@ def strike(data, node, reason, source="auto"):
     _hist(rec, "strike", reason=reason, strikes=rec["strikes"])
     if rec.get("state") != "quarantined" and rec["strikes"] >= STRIKES_TO_QUARANTINE:
         quarantine(data, node, f"{rec['strikes']} fast CUDA-init failures; last: {reason}", source)
+        return True
+    return False
+
+
+def verify_strike(data, node, reason):
+    """Count one verify probe the GPU did not answer. Its own counter: task-failure
+    strikes (`strikes`) are cleared by a task that SUCCEEDS on the node, and must not
+    be cleared by a probe that merely answers — such a node passes every probe while
+    every task dies at CUDA init. Returns True if it tipped the node into quarantine."""
+    rec = _rec(data, node)
+    rec["verify_strikes"] = int(rec.get("verify_strikes", 0)) + 1
+    rec["last_strike"] = time.time()
+    _hist(rec, "verify_strike", reason=reason, strikes=rec["verify_strikes"])
+    if rec.get("state") != "quarantined" and rec["verify_strikes"] >= STRIKES_TO_QUARANTINE:
+        quarantine(data, node, f"{rec['verify_strikes']} verify probes unanswered; last: {reason}",
+                   "verify")
+        rec["verify_strikes"] = 0
+        return True
+    return False
+
+
+def clear_verify_strikes(data, node):
+    """A verify probe answered cleanly: two misses have to be in a row to count."""
+    rec = data.get("nodes", {}).get(node)
+    if rec and rec.get("verify_strikes"):
+        rec["verify_strikes"] = 0
         return True
     return False
 

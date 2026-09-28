@@ -175,7 +175,18 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
 - **One scheduler per cluster, and it says so itself.** The heartbeat is written by its
   own thread every 15 s, never per cycle: it must mean "the process is alive", because
   `hive list` / `hive wait` start a scheduler when it looks dead (`ensure_sched`).
-  `hive-sched` also refuses to start next to a live one (`another_scheduler`).
+  `hive-sched` also refuses to start next to a live one (`another_scheduler`), and
+  exits when its main loop has not finished a pass for `MAIN_STALL_SECS`. Across
+  hosts it is stopped by a request file (`sched.stop-request`), never by PID.
+- **Task strikes and verify strikes are separate counters** (`strikes`,
+  `verify_strikes`). A clean verify probe clears only the latter: a node can pass every
+  probe while every task dies at CUDA init, and only a task that succeeds clears that.
+- **A freed hold job stays offered until the node DB has caught up** (`_freed_at`), and
+  **gates that need no probe run before the probe** (walltime, card size, exclusion,
+  slow): pass 1 asks for the FIRST eligible node, so everything that makes a node
+  ineligible for the task has to be known before that — or remembered afterwards
+  (`_task_skip` for the task, `_probe_backoff` for the node, and candidates with a
+  rejection on record are sorted last). Each of these was a stuck queue in review.
 - **The scheduler stops between passes, not inside one** (`handle_signal` defers while
   `_in_cycle`). Events and notify hooks fire during a pass, the queue and the health
   list are saved at its end; `hive queue daemon stop` waits for the process to go.

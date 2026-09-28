@@ -15,7 +15,7 @@ hive wait ID [--pending-timeout SEC] [--log-lines N | --full-log | --no-log]
 hive wait ID ID … | --array A [--pending-timeout SEC] # several: one line each, no logs
 hive list [--owner NAME|all] [--state S] [--limit N] [--days N] [--all]
 hive logs ID [-n N | --full] [-f]
-hive cancel ID | --array A                            # pending or running
+hive cancel ID | --array A [--force]                  # pending or running
 hive hold ID… | --array A      ·  hive unhold …       # keep pending tasks out of dispatch
 hive priority N ID… | --array A                       # reprioritise pending tasks
 hive stats [NAME]                                     # min/median/P90/max run time by name

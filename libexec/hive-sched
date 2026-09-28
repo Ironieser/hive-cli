@@ -84,9 +84,11 @@ _starve_threshold = STARVATION_CYCLES
 # stacks probe steps on the node.
 PROBE_BACKOFF_BASE = 60
 PROBE_BACKOFF_MAX  = 600
-PROBE_BACKOFF_BUSY = 45     # flat wait for "busy / dirty right now" — one cycle is
-                            # skipped, enough to let the task try the next node; a
-                            # just-freed card often still shows memory for seconds
+PROBE_BACKOFF_BUSY = 45     # first wait for "busy / dirty right now" (a just-freed card
+                            # often still shows memory for seconds); doubles up to
+PROBE_BACKOFF_BUSY_MAX = 300  # …this. It has to outgrow the cycle: with a flat 45 s two
+                            # busy nodes took turns being probed and the free node
+                            # behind them never was.
 _probe_backoff = {}
 
 # Node rejections are logged when the reason changes, else at most this often — the
@@ -387,9 +389,17 @@ def note_probe_result(jid, answered, reason="probe_unverifiable", cap=None):
     if answered:
         _probe_backoff.pop(jid, None)
         return
-    fails = _probe_backoff.get(jid, (0, 0))[0] + 1
-    wait = cap if cap else min(PROBE_BACKOFF_BASE * (2 ** (fails - 1)), PROBE_BACKOFF_MAX)
-    _probe_backoff[jid] = (fails, time.time() + wait, reason)
+    prev = _probe_backoff.get(jid)
+    # Consecutive rejections of the SAME kind: six "busy" must not turn one
+    # unanswered probe into a ten-minute wait.
+    busy = bool(cap)
+    same = prev is not None and (prev[3] if len(prev) > 3 else False) == busy
+    fails = (prev[0] if same else 0) + 1
+    if busy:
+        wait = min(cap * (2 ** (fails - 1)), PROBE_BACKOFF_BUSY_MAX)
+    else:
+        wait = min(PROBE_BACKOFF_BASE * (2 ** (fails - 1)), PROBE_BACKOFF_MAX)
+    _probe_backoff[jid] = (fails, time.time() + wait, reason, busy)
 
 
 # Health checks of quarantined nodes run in the background. They probe nodes that are
@@ -614,9 +624,11 @@ def notify(task, event):
         env[f"HIVE_TASK_{k}"] = "" if v is None else str(v)
     header = (f"[{now_iso()}] task {task.get('id')} {event} "
               f"state={task.get('state')}: {cmd}\n")
-    if len(_notify_waiting) >= NOTIFY_QUEUE_MAX:
-        logging.warning("Task %s: notify hook dropped, %d already waiting",
-                        task.get("id"), len(_notify_waiting))
+    _notify_running[:] = [p for p in _notify_running if p.poll() is None]
+    if len(_notify_running) >= NOTIFY_MAX_PARALLEL:
+        # No room now. Owed ON THE TASK, which is saved with the queue, not in a list
+        # in memory that a restart would lose; the cycle retries it (`notify_pending`).
+        task["notify_pending"] = event
         return
     _notify_waiting.append((cmd, env, header))
     drain_notify()
@@ -1046,7 +1058,7 @@ def dispatch_task(task, slurm_jobid, node_name):
         # the command (an unbalanced quote or parenthesis) is then that bash's error
         # and exit code, and not a parse error of this wrapper, which used to end without
         # footer or exit file and left the task to be "declared dead" minutes later.
-        f"bash -c {q(cmd)} >> {lf} 2>&1\n"
+        f"bash -c -- {q(cmd)} >> {lf} 2>&1\n"
         f"_EC=$?\n"
         # ── Footer (double-quotes so $(date) and $_EC are expanded by bash) ──
         f'echo "" >> {lf}\n'
@@ -1158,6 +1170,33 @@ def probe_nodes(wanted):
     return results
 
 
+# Hold jobs whose task ended, and when. The node DB goes on calling them `busy` until
+# the poller comes round again (900 s), so they are offered for dispatch — verified —
+# until the DB has a reading newer than the moment they were freed.
+FREED_KEEP_SECS = 1800
+_freed_at = {}
+
+
+def recently_freed(jobs_db):
+    now, out = time.time(), set()
+    for jid, ts in list(_freed_at.items()):
+        info = jobs_db.get(jid)
+        polled = _age_seconds(info.get("polled_at")) if info else None
+        if info is None or now - ts > FREED_KEEP_SECS \
+                or (polled is not None and now - polled > ts and not info.get("carried_forward")):
+            del _freed_at[jid]           # gone, too old, or the DB has caught up
+        else:
+            out.add(jid)
+    return out
+
+
+# A task rejected by a gate that is about the TASK, after the node was probed (not
+# enough free memory or cards for it right now), looks elsewhere for a while: pass 1
+# takes the first eligible node, and would otherwise ask for the same one every cycle.
+TASK_SKIP_SECS = 90
+_task_skip = {}           # (task id, jid) → epoch until which the task skips that job
+
+
 def run_one_cycle():
     """One scheduler cycle, in two passes so that no node is probed under queue.lock.
 
@@ -1174,12 +1213,13 @@ def run_one_cycle():
 
 
 def _guarded_cycle(probe_cache, final):
-    global _in_cycle
+    global _in_cycle, _last_pass
     _in_cycle = True
     try:
         return _cycle(probe_cache, final)
     finally:
         _in_cycle = False
+        _last_pass = time.time()
         if _stop_requested:
             shutdown(signal.SIGTERM)
 
@@ -1549,13 +1589,25 @@ def _cycle(probe_cache, final):
         # or actually-occupied GPU (feedback C1/C2). A reason is recorded on each
         # task that can't be placed this cycle.
         for state in (_probe_backoff, _reject_logged):
-            for gone in [j for j in state if j not in jobs_db]:
+            for gone in [j for j in state
+                         if (j[1] if isinstance(j, tuple) else j) not in jobs_db]:
                 del state[gone]
+        for jid in freed_jobids:
+            _freed_at.setdefault(jid, time.time())
+        freed_jobids = recently_freed(jobs_db) - full_jids
+        now_ = time.time()
+        for key in [k for k, until in _task_skip.items() if until < now_]:
+            del _task_skip[key]
         candidates = get_candidates(jobs_db, full_jids, freed_jobids, quarantined, partial_jids)
         # Fast nodes first, preferred partitions first ("prefer_partitions" in
         # pool_config.json); the sort is stable, so trusted-idle-first is kept within.
         prefer = preferred_partitions()
+        # …and hold jobs that were rejected lately (they keep their record until a probe
+        # of them comes back clean) after the ones with nothing against them: a task
+        # takes the first eligible node, and two nodes that are busy on verify must not
+        # take turns being that node while a free one waits behind them.
         candidates.sort(key=lambda c: (c[1].get("node") in slow,
+                                       c[0] in _probe_backoff,
                                        partition_rank(c[1].get("partition"), prefer)))
         n_quarantined_jobs = sum(1 for i in jobs_db.values() if i.get("node") in quarantined)
         pending = sorted(
@@ -1595,8 +1647,9 @@ def _cycle(probe_cache, final):
         # Hooks owed for tasks the CLI finished itself (a pending task cancelled).
         for t in tasks.values():
             if t.get("notify_pending"):
-                notify(t, t.pop("notify_pending"))
-                changed = True
+                owed = t.pop("notify_pending")
+                notify(t, owed)
+                changed = changed or t.get("notify_pending") != owed
 
         # Dependency failures first, to a fixpoint: `pending` is in priority order, so
         # a dependant can come BEFORE what it depends on, and one pass would move a
@@ -1710,6 +1763,35 @@ def _cycle(probe_cache, final):
                     reason = "insufficient_gpus"
                     i += 1
                     continue
+                # Walltime gate (task-level; only when the task carries a runtime
+                # estimate — see WALLTIME_MARGIN_SECS): never place a long task on a
+                # node that will be reclaimed mid-run. -1 (unlimited) and None
+                # (unknown / older poller) never block. BEFORE the probe, like every
+                # gate that needs none: a node this task cannot use must not be the
+                # one it asks to have probed.
+                node_left = db_time_left(info, db_updated)
+                est = task.get("est_runtime_secs")
+                if est and node_left is not None and node_left >= 0 \
+                        and node_left < (int(est) + WALLTIME_MARGIN_SECS):
+                    reason = "insufficient_walltime"
+                    log_once = (task["id"], jid, "walltime")
+                    if _reject_logged.get(log_once, (None, 0))[1] < time.time() - REJECT_LOG_EVERY:
+                        _reject_logged[log_once] = (reason, time.time())
+                        logging.info("Task %d skips %s: node walltime %s < est %s + margin",
+                                     task["id"], info.get("node", "?"),
+                                     _fmt_dur(node_left), _fmt_dur(int(est)))
+                    i += 1
+                    continue
+                # A card smaller than the task needs will never do (task-level).
+                biggest = max((r[2] for r in readings), default=0)
+                if need_mb and biggest and want_gpus > 0 and biggest < need_mb:
+                    reason = "waiting_for_mem"
+                    i += 1
+                    continue
+                if _task_skip.get((task["id"], jid), 0) > time.time():
+                    reason = task.get("pending_reason") or "waiting_for_gpu"
+                    i += 1
+                    continue
                 # …and enough of them must be free of other hive tasks (task-level).
                 if taken and want_gpus > len(readings) - len(taken):
                     reason = "waiting_for_gpu"
@@ -1747,10 +1829,9 @@ def _cycle(probe_cache, final):
                         reason = node_reject = p["fault"]
                         candidates.pop(i)      # node-level
                         health_changed = True
-                        tripped = hh.strike(health, node_name, f"verify: {p['fault']}",
-                                            "verify")
-                        log_reject(jid, node_name, p["fault"],
-                                   f"strike {health['nodes'][node_name]['strikes']}")
+                        tripped = hh.verify_strike(health, node_name, p["fault"])
+                        log_reject(jid, node_name, p["fault"], "quarantined" if tripped else
+                                   f"verify strike {health['nodes'][node_name].get('verify_strikes')}")
                         if tripped:
                             quarantined.add(node_name)
                             # this probe WAS the first health check
@@ -1795,9 +1876,10 @@ def _cycle(probe_cache, final):
                                       reason=p.get("cuda_detail"))
                         continue
                     note_probe_result(jid, True)
-                    # A clean answer forgives the strikes earlier verify probes left:
-                    # they are meant to catch two misses in a row, not two in a month.
-                    if not is_slow and hh.clear_strikes(health, node_name):
+                    # A clean answer forgives the VERIFY strikes earlier probes left —
+                    # two misses must be in a row — and only those: strikes from tasks
+                    # that died at CUDA init are cleared by a task that succeeds.
+                    if hh.clear_verify_strikes(health, node_name):
                         health_changed = True
                     # Verified clean: keep the live reading so the next task doesn't
                     # pay for another srun probe on the same node this cycle.
@@ -1820,24 +1902,10 @@ def _cycle(probe_cache, final):
                             f"gpu{s}: util={u}% used={m}MiB" for s, (u, m, _t) in enumerate(readings)
                             if s not in taken))
                     else:
+                        _task_skip[(task["id"], jid)] = time.time() + TASK_SKIP_SECS
                         i += 1
                     continue
                 used = max((readings[s][1] for s in slots), default=0)
-
-                # Walltime gate (task-level; only when the task carries a runtime
-                # estimate — see WALLTIME_MARGIN_SECS): never place a long task on a
-                # node that will be reclaimed mid-run. -1 (unlimited) and None
-                # (unknown / older poller) never block.
-                node_left = db_time_left(info, db_updated)
-                est = task.get("est_runtime_secs")
-                if est and node_left is not None and node_left >= 0 \
-                        and node_left < (int(est) + WALLTIME_MARGIN_SECS):
-                    reason = "insufficient_walltime"
-                    logging.info("Task %d skips %s: node walltime %s < est %s + margin",
-                                 task["id"], info.get("node", "?"),
-                                 _fmt_dur(node_left), _fmt_dur(int(est)))
-                    i += 1
-                    continue
 
                 # These slots are taken (whether or not the launch below succeeds); the
                 # hold job stays a candidate while it has others left.
@@ -1927,13 +1995,56 @@ def _cycle(probe_cache, final):
 HEARTBEAT_EVERY = 15
 
 
+MAIN_STALL_SECS = 900        # no pass finished for this long → the scheduler is stuck
+SCHED_STOP_REQ = os.path.join(HIVE_DIR, "sched.stop-request")
+_last_pass = time.time()
+
+
 def heartbeat_forever():
-    """The heartbeat says the PROCESS is alive, so it must not depend on how long a
-    cycle takes: written once per cycle it went stale whenever a cycle ran over 90 s,
-    and another host then saw "no scheduler" and started a second one."""
+    """The heartbeat says the scheduler is alive AND working. It must not depend on
+    how long a cycle takes — written once per cycle it went stale whenever a cycle ran
+    over 90 s, and another host then started a second scheduler — but a main loop that
+    has not finished a pass for MAIN_STALL_SECS (blocked on queue.lock, say) is not
+    alive in any useful sense: it says so and exits, so that `hive list` / `hive wait`
+    can start a working one instead of reporting "running" for ever."""
     while True:
+        stalled = time.time() - _last_pass
+        if stalled > MAIN_STALL_SECS:
+            logging.error("hive-sched: no pass finished for %ds — main loop is stuck; "
+                          "exiting so that a new scheduler can be started", stalled)
+            remove_own_files()
+            os._exit(1)
         write_heartbeat()
         time.sleep(HEARTBEAT_EVERY)
+
+
+def stop_requested():
+    """`hive queue daemon stop` from ANOTHER host cannot signal us; it leaves a file."""
+    if not os.path.exists(SCHED_STOP_REQ):
+        return False
+    try:
+        os.remove(SCHED_STOP_REQ)
+    except OSError:
+        pass
+    return True
+
+
+def remove_own_files():
+    """Remove sched.pid / sched.heartbeat if they are OURS (a second scheduler that is
+    told to go away must not take the first one's files with it)."""
+    try:
+        with open(SCHED_PID) as f:
+            lines = f.read().split("\n")
+        ours = int(lines[0].strip()) == os.getpid() and \
+            (len(lines) < 2 or not lines[1].strip() or lines[1].strip() == socket.gethostname())
+    except (OSError, ValueError, IndexError):
+        ours = False
+    if ours:
+        for path in (SCHED_PID, SCHED_HB):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def another_scheduler():
@@ -1958,13 +2069,18 @@ def another_scheduler():
 def scheduler_loop():
     logging.info("hive-sched started (PID %d, host %s)", os.getpid(), socket.gethostname())
     threading.Thread(target=heartbeat_forever, name="heartbeat", daemon=True).start()
+    global _last_pass
     while True:
         try:
             run_one_cycle()
+            _last_pass = time.time()
         except Exception as e:
             logging.error("Cycle error: %s", e, exc_info=True)
         roll_log()
-        time.sleep(POLL_INTERVAL)
+        for _ in range(POLL_INTERVAL):
+            if stop_requested():
+                shutdown(0)
+            time.sleep(1)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1987,15 +2103,8 @@ def handle_signal(signum, frame):
 
 
 def shutdown(signum=0):
-    logging.info("hive-sched stopping (signal %d)", signum)
-    try:
-        os.remove(SCHED_PID)
-    except FileNotFoundError:
-        pass
-    try:
-        os.remove(SCHED_HB)
-    except FileNotFoundError:
-        pass
+    logging.info("hive-sched stopping (%s)", f"signal {signum}" if signum else "stop request")
+    remove_own_files()
     sys.exit(0)
 
 
