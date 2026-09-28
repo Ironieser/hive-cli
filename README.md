@@ -88,8 +88,8 @@ hive prune --older-than 7d                              # drop old terminal task
 hive queue daemon start|stop|status|logs               # manage the scheduler (auto-started by submit)
 ```
 
-`hive wait` exit codes for agents: **0** done · **1** failed · **75** never dispatched
-(`--pending-timeout`) · **130** cancelled.
+`hive wait` exits with the task's own exit code (**0** done); see the table below for
+the reserved values.
 
 `.hive` script format (like `#SBATCH` directives):
 
@@ -177,6 +177,66 @@ avoids placing it on a soon-expiring node in the first place:
 
 A task whose *own* command crashes (node still alive) is marked `failed` and **not** retried.
 
+### Pipelines, sweeps, multi-node, limits
+
+```bash
+ID=$(hive submit -q --name train "python train.py")           # -q prints only the id
+hive submit --after $ID "python eval.py"                       # runs only if train ended done
+hive submit --after-any $ID "bash cleanup.sh"                  # runs whatever the outcome
+hive submit --array 0-9%4 'python train.py --seed $HIVE_ARRAY_INDEX'   # sweep, 4 at a time
+hive submit --after a120 "python report.py"                    # after the WHOLE array 120
+hive wait --array 120        |  hive wait 3 4 5                # one line per task, no logs
+hive cancel --array 120      |  hive cancel --force 3          # --force: scheduler not acting
+hive submit --nodes 4 'python ddp.py --rank $HIVE_GANG_RANK'   # 4 nodes, started together
+hive submit --timeout 2h --notify 'curl -d "$HIVE_TASK_NAME $HIVE_TASK_STATE" URL' "python x.py"
+hive submit --gpus 2 --cpus 4 --mem 32000 "python x.py"        # cards, CPUs, memory (MiB)
+hive submit --begin 08:00 --warn-before 10m "python x.py"      # not before 8; SIGUSR1 10 min before the node expires
+hive submit --priority 9 --preempt "python urgent.py"          # may stop a --preemptible task
+hive submit --preemptible --est-runtime 12h "python long.py"   # agrees to be stopped and requeued
+hive submit --max-running 3 …   (or export HIVE_MAX_RUNNING=3) # at most 3 tasks of this owner at once
+hive submit --exclude evc22 --no-slow "python x.py"            # not on these nodes / not on slow ones
+hive hold 3 | hive unhold 3 | hive priority 10 3               # shape what has not started yet
+```
+
+| Exit code of `hive wait ID` | Meaning |
+|---|---|
+| the command's own | `0` = done |
+| `124` | killed by `--timeout` |
+| `125` | never ran: a task it was submitted `--after` did not end done |
+| `126` | a member of its multi-node task failed |
+| `75` / `130` / `2` | never dispatched (`--pending-timeout`) / cancelled / no such task |
+
+A hold job with N GPUs runs up to N single-GPU tasks at once; each sees only its own
+cards. `hive stats` shows, per task name, run times and the measured GPU memory peak;
+`--est-runtime auto` and `--need-mb auto` take their values from there.
+
+### Node health
+
+hive keeps its own list of bad nodes (`hive health`). Before every dispatch it asks the
+GPU for a reading and creates a CUDA context, each under a deadline:
+
+| Node state | What was seen | What hive does |
+|---|---|---|
+| `QUAR` | the GPU did not answer, lists no device, or CUDA cannot create a context | no dispatch; re-probed every 10 min; new hold jobs are kept off the node |
+| `SLOW` | the context is created, but takes minutes | only tasks with `--est-runtime` ≥ 1h or `--allow-slow`, after every faster node |
+| ok | — | — |
+
+A node with no hold job on it comes back when SLURM reports it rebooted, or when a small
+`hive_canary` job on it probes healthy.
+
+### Pool autoscale
+
+```json
+"autoscale": {"enabled": true, "preset": "highgpu", "min_nodes": 6, "max_nodes": 8,
+              "time": "7-00:00:00", "renew_before": "12h", "until": "2026-12-31"}
+```
+
+in `~/.hive/pool_config.json` makes the scheduler keep `min_nodes` usable hold jobs and
+replace the ones about to expire. It submits jobs on its own, so it is bounded:
+`max_nodes` in total, 2 per decision, 12 per day, nothing after `until`.
+`hive pool autoscale` shows what it would do. Other keys: `"prefer_partitions"`,
+`"fair_share"`, `"exclude"`, `"auto_prune_days"` (default 14), `"log_keep_days"`.
+
 ### Keeping the queue tidy
 
 ```bash
@@ -185,6 +245,7 @@ hive prune --older-than 7d      # drop terminal tasks finished >7d ago (default)
 hive prune --keep 50            # or keep the 50 most-recent terminal tasks
 ```
 
+The scheduler does this by itself for tasks finished more than `auto_prune_days` ago.
 `prune` never touches pending/running tasks; task logs are kept unless `--logs` is given.
 Runtime history stays in `events.jsonl` regardless.
 

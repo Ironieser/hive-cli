@@ -54,6 +54,11 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--array 0-9%4` | sweep: one task per index (`$HIVE_ARRAY_INDEX`, single-quote the command), at most 4 at once. `hive wait --array ID`, `hive cancel --array ID` |
 | `--max-running N` | cap for the whole owner: at most N of its tasks run at once (`export HIVE_MAX_RUNNING=N`) |
 | `--allow-slow` | accept a SLOW node (CUDA init takes minutes there, then normal speed). Automatic for `--est-runtime` ≥ 1h; `--no-slow` to refuse. Give long training / serving jobs an estimate so they use these nodes and leave the fast ones for short runs |
+| `--nodes N` | multi-node task: N members start together, one node each, with `$HIVE_GANG_RANK/SIZE/HOSTS`; one fails → all stop |
+| `--preemptible` / `--preempt` | a long low-priority task agrees to be stopped and requeued / an urgent one may stop such a task |
+| `--begin 2h\|08:00` | not before that time |
+| `--cpus N` `--mem MB` | CPU / memory limit of the task (hold jobs have few CPUs; tasks sharing one fight over them) |
+| `--warn-before 10m` | SIGUSR1 to the command that long before its node expires, to checkpoint |
 | `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
 | `--priority N` | higher dispatches first |

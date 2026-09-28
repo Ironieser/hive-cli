@@ -73,35 +73,35 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 
 | # | Item | Status |
 |---|---|---|
-| A1 | Dispatch latency: wake the scheduler on submit and on a task's exit instead of waiting out the 30 s cycle | open |
-| A2 | `hive top`: SLOW state, several tasks on one hold job, array index | open |
-| A3 | `hive nodes`: GPU% / MEM over all cards of a hold job, not only card 0 | open |
-| A4 | Canary jobs wait hours in a busy partition | open |
-| A5 | "healthy probes → node released" never seen live | open |
-| A6 | Steady-state speed of slow nodes has no healthy same-model reference | open |
-| A7 | `--timeout` counts the CUDA init time of a slow node | open |
-| A8 | Every array member is a full task record | open |
-| A9 | `queue.json` and task logs grow without bound unless `hive prune` is run by hand | open |
-| A10 | `--need-mb auto` / `--est-runtime auto` need one finished run | open |
+| A1 | Dispatch latency: wake the scheduler on submit and on a task's exit instead of waiting out the 30 s cycle | done — sched.wake + exit files end the wait; at least 3 s between cycles |
+| A2 | `hive top`: SLOW state, several tasks on one hold job, array index | done |
+| A3 | `hive nodes`: GPU% / MEM over all cards of a hold job, not only card 0 | done — busiest card, memory summed, `xN` |
+| A4 | Canary jobs wait hours in a busy partition | not fixable in hive: the canary is already the smallest job SLURM accepts (1 CPU, 4 GB, 1 GPU, 15 min); in a busy partition it waits for priority like any job. Reboot detection does not depend on it |
+| A5 | "healthy probes → node released" never seen live | open until C5 |
+| A6 | Steady-state speed of slow nodes has no healthy same-model reference | cannot be verified: every H100-PCIe node tried was slow or wedged, so there is no healthy reference |
+| A7 | `--timeout` counts the CUDA init time of a slow node | done |
+| A8 | Every array member is a full task record | not changed: members stay full task records (1000 members ≈ 15 MB of queue.json). Bounded by the 1000-member limit and by A9 |
+| A9 | `queue.json` and task logs grow without bound unless `hive prune` is run by hand | done — `auto_prune_days` (default 14), `log_keep_days` (default off) |
+| A10 | `--need-mb auto` / `--est-runtime auto` need one finished run | by design: a first run has no history; `auto` then submits without the constraint and says so |
 
 ## B. SLURM features that were left out
 
 | # | Item | Status |
 |---|---|---|
-| B1 | Pool autoscale: replace hold jobs before they expire, keep N nodes | open |
-| B2 | Warn a task before its node expires (`--signal`-like) | open |
-| B3 | Delayed start (`--begin`) | open |
-| B4 | CPU / memory per task | open |
-| B5 | Multi-node tasks | open |
-| B6 | Preemption | open |
-| B7 | Fair share between owners | open |
+| B1 | Pool autoscale: replace hold jobs before they expire, keep N nodes | done — `"autoscale"` in pool_config.json, `hive pool autoscale` |
+| B2 | Warn a task before its node expires (`--signal`-like) | done — `--warn-before` |
+| B3 | Delayed start (`--begin`) | done — `--begin` |
+| B4 | CPU / memory per task | done — `--cpus`, `--mem` |
+| B5 | Multi-node tasks | done — `--nodes N` (all members or none; no partial restart) |
+| B6 | Preemption | done — `--preempt` / `--preemptible`, opt-in on both sides |
+| B7 | Fair share between owners | done — `"fair_share": true` |
 
 ## C. Housekeeping
 
 | # | Item | Status |
 |---|---|---|
-| C1 | README.md / README_zh.md describe none of the new features | open |
-| C2 | docs/architecture.md: two-pass cycle, GPU slots, node health states | open |
+| C1 | README.md / README_zh.md describe none of the new features | done |
+| C2 | docs/architecture.md: two-pass cycle, GPU slots, node health states | done |
 | C3 | Feedback #18, #19, #27, #33 | open |
 | C4 | Red-team round 3 on everything in this checklist | open |
 | C5 | Install, live validation | open |

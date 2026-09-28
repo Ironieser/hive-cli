@@ -4,6 +4,18 @@
   "exclude": "",
   "health_canary": true,
   "prefer_partitions": [],
+  "fair_share": false,
+  "auto_prune_days": 14,
+  "log_keep_days": 0,
+  "autoscale": {
+    "enabled": false,
+    "preset": "highgpu",
+    "min_nodes": 4,
+    "max_nodes": 6,
+    "time": "7-00:00:00",
+    "renew_before": "12h",
+    "until": "2026-12-31"
+  },
   "presets": {
     "normal": {
       "script": "~/1_normal_gpu.slurm",

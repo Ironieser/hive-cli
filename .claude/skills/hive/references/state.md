@@ -43,6 +43,9 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `depends_on` (ids), `depends_mode` (`ok` | `any`), `failed_dependency`.
 - `array_id`, `array_index`, `array_max_running`; `max_running` (owner cap).
 - `fail_reason` (`timeout` | `dependency_failed`), `exit_code` (124 / 125 for those).
+- `gang_size`, `gang_hosts` (multi-node members; `array_id` / `array_index` = rank),
+  `preempt`, `preemptible`, `preempt_count`, `begin_ts`, `cpus`, `mem_mb`,
+  `warn_before_secs`, `warned_ts`.
 - `gpu_slots`: positions of the cards it holds within the hold job (absent on tasks
   dispatched before GPU slots: those hold the whole hold job).
 - `gpu_peak_mb`, `gpu_avg_util`, `gpu_max_util`, `gpu_samples`: measured on the node.

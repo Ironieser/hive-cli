@@ -49,7 +49,8 @@ cancelled · `2` an id that never existed · `75` pending timeout. Test for `!= 
 ```bash
 hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [--exclude NODES] \
             [--timeout DUR] [--notify CMD] [--after ID,ID | --after-any ID,ID] \
-            [--array SPEC] [--max-running N] \
+            [--array SPEC] [--max-running N] [--nodes N] [--preempt] [--preemptible] \
+            [--begin WHEN] [--cpus N] [--mem MiB] [--warn-before DUR] \
             [--workdir DIR] [--priority N] "command string" | job.hive
 ```
 
@@ -68,6 +69,12 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--array` | — | one task per index: `0-9`, `1,3,5`, `0-20:5`; append `%N` to run at most N at once (`0-9%4`). Same command for all, index in `$HIVE_ARRAY_INDEX`. See [Arrays](#arrays) |
 | `--max-running` | `$HIVE_MAX_RUNNING` | cap on the **owner**: while any pending or running task of the owner carries a cap, at most that many (the lowest, if they differ) of the owner's tasks run at once — also the ones submitted without the flag (`owner_limit`). Needs an owner |
 | `--allow-slow` / `--no-slow` | by estimate | whether the task may run on a **SLOW** node (works, but CUDA needs minutes to initialise — measured 146 s vs 4 s — then runs at its normal rate). Default: allowed when `--est-runtime` ≥ 1 h. Slow nodes are only used after every faster node |
+| `--nodes` | — | multi-node task, 2–16 members. See [Multi-node tasks](#multi-node-tasks) |
+| `--preemptible` | no | the task may be stopped and **requeued** (it starts afresh; at most 5 times) when a `--preempt` task of strictly higher priority finds no node. Pending reason afterwards: `preempted` |
+| `--preempt` | no | when no node is free, stop ONE running `--preemptible` task of lower priority. Shows `preempting` until it has the node |
+| `--begin` | — | earliest start: a delay (`2h`), a date and time (`2026-10-01T08:00`) or a time of day (`08:00`, tomorrow if past). `waiting_for_begin` until then |
+| `--cpus` / `--mem` | all / none | CPUs and memory (MiB) of the task's step. They cannot exceed what the hold job has; a task over its `--mem` is killed by SLURM |
+| `--warn-before` | — | send `SIGUSR1` to the command this long before its node's walltime ends (once). The command must trap it: untrapped, SIGUSR1 ends a process. The notify hook gets `HIVE_TASK_EVENT=expiring` |
 | `--exclude` / `-x` | — | nodes the task must not run on (`evc22,evc[40-43]`); it waits (`node_excluded`) rather than use them. Broken nodes don't need this — hive quarantines them itself |
 | `--workdir` / `-w` | cwd | working directory on the node |
 | `--priority` / `-p` | 0 | higher dispatches first (`-p=-5` for negatives) |
@@ -94,7 +101,8 @@ python eval.py --model $MODEL --skip-existing
 ```
 
 Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`, `exclude`,
-`timeout`, `notify`, `after`, `after_any`, `array`, `max_running`, `allow_slow`. Other `#` lines
+`timeout`, `notify`, `after`, `after_any`, `array`, `max_running`, `allow_slow`, `nodes`,
+`preempt`, `preemptible`, `begin`, `cpus`, `mem`, `warn_before`. Other `#` lines
 are comments; the rest is the command.
 
 ## `hive list`
@@ -137,6 +145,22 @@ log. Inside the command: `HIVE_TASK_ID`, `HIVE_TASK_NAME`, `HIVE_TASK_OWNER`,
 `HIVE_ARRAY_ID`, `HIVE_ARRAY_INDEX`. `--after 120` waits for task 120 only — member `[0]`; the
 whole array is `--after a120`.
 
+### Multi-node tasks
+
+```bash
+hive submit --name ddp --nodes 4 --est-runtime 6h \
+  'python train.py --rank $HIVE_GANG_RANK --world $HIVE_GANG_SIZE --master $(echo $HIVE_GANG_HOSTS | cut -d, -f1)'
+#   Submitted multi-node task #300: 4 members (ids 300-303)
+hive wait --array 300
+```
+
+The command runs once per member, on N **different nodes**, all started in the same
+scheduler cycle or not at all (`waiting_for_gang` until N nodes are free at once).
+`HIVE_GANG_HOSTS` lists the nodes in rank order. hive starts the processes; connecting
+them (rank 0 listening, the others joining) is the command's job. If one member fails, is
+cancelled or loses its node, the others are stopped and what has not started fails with
+exit code 126 (`gang_member_failed`). A multi-node task is never restarted in part.
+
 ### Notification hook
 
 The hook runs **on the scheduler's host** (see `hive queue daemon status`), not where you
@@ -148,11 +172,11 @@ hooks run at once; `--notify ''` switches `$HIVE_NOTIFY` off for one task.
 
 | Variable | Value |
 |---|---|
-| `HIVE_TASK_EVENT` | `finish` or `requeue` (node lost; the task will run again from scratch) |
+| `HIVE_TASK_EVENT` | `finish`, `requeue` (node lost or preempted; the task will run again from scratch) or `expiring` (`--warn-before`) |
 | `HIVE_TASK_ID` / `NAME` / `OWNER` | as submitted |
 | `HIVE_TASK_STATE` | `done`, `failed`, `cancelled`; `pending` on `requeue` |
 | `HIVE_TASK_EXIT_CODE` | exit code; 124 = timeout, 125 = dependency failed (never ran), -1 = declared dead |
-| `HIVE_TASK_FAIL_REASON` | `timeout`, `dependency_failed` or empty |
+| `HIVE_TASK_FAIL_REASON` | `timeout`, `dependency_failed`, `gang_member_failed` or empty |
 | `HIVE_TASK_NODE` / `DURATION_SECS` / `LOG` / `WORKDIR` / `REQUEUE_COUNT` | — |
 | `HIVE_TASK_GPU_PEAK_MB` / `GPU_AVG_UTIL` | measured GPU usage (empty if nothing was sampled) |
 
@@ -172,6 +196,9 @@ hive submit --notify 'curl -s -d "task $HIVE_TASK_NAME: $HIVE_TASK_STATE" https:
 | `array_limit` / `owner_limit` | The array's `%N` / the owner's `--max-running` is reached; it starts when one of them ends |
 | `node_slow` | Only SLOW nodes are free and the task does not accept them → `--allow-slow`, or give an `--est-runtime` ≥ 1 h, or wait for a fast node |
 | `verifying_node` | The node it would take is being probed; decided within a cycle (~30 s) |
+| `waiting_for_begin` | `--begin` lies in the future |
+| `waiting_for_gang` | A multi-node task needs N nodes free at the same time |
+| `preempted` / `preempting` | It was stopped for a task of higher priority and waits again / it has asked a `--preemptible` task to stop |
 | `waiting_for_gpu` | The hold jobs with enough cards have them taken by other hive tasks; it starts when one ends |
 | `held` | `hive hold` was used on it; `hive unhold ID` lets it go |
 | `node_excluded` | The only free nodes are in the task's `--exclude` list |
@@ -214,7 +241,9 @@ the rest describe nodes and apply to everyone.
 | `SLOW` | works, but CUDA needs minutes to initialise (`hive health`) | long tasks / `--allow-slow` only, after faster nodes |
 | `CPU` | hold job has no GPU | no |
 
-`LEFT` = remaining walltime (red under 1 h). `node!` = that row's poll is > 10 min old.
+GPU% is the busiest card of the hold job, MEM the sum over its cards (`x2` = two cards).
+`LEFT` = remaining walltime (red under 1 h). `node!` = that row's poll is > 10 min old;
+its TASK column then says how old (`[read 25m ago]`).
 The header shows when the pool was last polled; the poller runs every 15 min, and every
 dispatch is live-verified anyway, so a slightly stale table is normal.
 
@@ -274,7 +303,14 @@ hive pool release --idle | JOBID # ⚠ HUMAN-ONLY: refuses without a TTY; no --y
 `~/.hive/pool-logs/`. It excludes every quarantined node (`hive health`) by itself —
 SLURM favours broken nodes because their GPUs are always free — plus `--exclude`, the
 script's own `#SBATCH --exclude`, and an `"exclude"` key in `pool_config.json` (top
-level or per preset). `--no-auto-exclude` turns the first off. Hold jobs still waiting in the SLURM queue get
+level or per preset). `--no-auto-exclude` turns the first off.
+
+**Autoscale.** With an `"autoscale"` block in `~/.hive/pool_config.json` the scheduler keeps
+`min_nodes` usable hold jobs by itself and replaces the ones about to expire; agents do not
+need to `pool add`. `hive pool autoscale` shows the setting and what it would do now. It
+is bounded by `max_nodes`, 2 submissions per decision, 12 per day and its `until` date.
+
+ Hold jobs still waiting in the SLURM queue get
 nodes quarantined later added to their exclude list automatically. Excluded nodes come back by themselves: see
 the health monitor in [troubleshooting.md](troubleshooting.md). Never `scancel` hold jobs directly: running tasks on them would
 be orphaned and requeued.

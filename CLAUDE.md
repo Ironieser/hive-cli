@@ -223,6 +223,21 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   probe. `pool add` does not exclude slow nodes. A node hive quarantined for a FAULT
   becomes slow only after `HEALTH_OK_STREAK` slow-but-ok probes in a row and its
   minimum hold (`hh.slow_probe`); one put away by an agent or by hand never does.
+- **Placement is decided, then committed.** `find_slot()` says where a task can run and
+  reserves its cards, `commit()` dispatches, `release()` gives a reservation back. A
+  multi-node task (`gang_size`; members are an array, `array_index` = rank) places
+  ALL members through `find_slot(avoid_nodes=…)` or releases every reservation; a
+  member that fails, is cancelled or is requeued ends the gang (`abort_broken_gangs`).
+- **Preemption is opt-in on both sides and is a requeue, not a cancel.** The victim
+  gets `cancel_requested` + `preempted_by`; the cancel branch of step (1) turns that
+  into `pending`. Never pick a victim of equal priority, a gang member, or one that
+  did not say `preemptible`.
+- **Autoscale spends allocation by itself**, so every path in `hive_autoscale.plan()`
+  must be bounded: `max_nodes` counts unusable hold jobs too, and "SLURM could not be
+  asked" means submit nothing. It runs in a thread and goes through `hive pool add`.
+- **The scheduler wakes on `sched.wake` and on exit files** (`idle_wait`), at least
+  `MIN_CYCLE_GAP` after the last cycle. CLI commands that change what may run call
+  `wake_scheduler()`.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

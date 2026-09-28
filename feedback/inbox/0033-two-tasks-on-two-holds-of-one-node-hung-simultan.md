@@ -2,15 +2,15 @@
 id: 33
 title: Two tasks on two holds of one node hung simultaneously (unconfirmed; see #28/#30)
 severity: medium
-status: triaged
+status: wontfix
 tags: [scheduler, hang]
 submitter: si384883
 hive_version: 0.4.0
 task_ids: [9181, 9182, 9185]
 created: 2026-09-25T15:36:38
-updated: 2026-09-25T06:53:38
+updated: 2026-09-28T15:36:34
 source: cli
-triage_note: Node-health theme: co-tenant / broken node (evc43, evc50) accepts dispatch, CUDA init fails. Needs squeue -w foreign-job detection + auto-quarantine after N fast failures (ROADMAP C4). Not fixed yet.
+triage_note: Not reproduced (the reporter marked it unconfirmed). The suspected cause, a degraded or co-tenant node that accepts dispatch, is now covered by verify-before-dispatch with a CUDA-context probe, the SLOW / QUAR node states and --timeout for tasks that hang. Reopen with a task id if it happens again.
 ---
 
 Two tasks on two holds of the same node (evc104) both hung at the same moment (supplements #28/#30; cause unconfirmed)
