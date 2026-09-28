@@ -15,10 +15,11 @@ single iteration costs you one short command and a few lines of output.
 
 ```bash
 export HIVE_OWNER=my-agent-or-project      # once per session: tags every submit, scopes hive list
-ID=$(hive submit --name train_v1 --est-runtime 2h \
-      "python train.py --config v1.yaml --output_dir runs/v1 --resume" | grep -oP '#\K\d+')
+ID=$(hive submit -q --name train_v1 --est-runtime 2h \
+      "python train.py --config v1.yaml --output_dir runs/v1 --resume")
 hive wait "$ID" --pending-timeout 1800      # blocks; prints state changes, then the log TAIL
-# exit codes:  0 done · 1 failed · 75 never dispatched · 130 cancelled
+# exit code = the command's own (0 done) · 124 timeout · 125 dependency failed
+#             · 75 never dispatched · 130 cancelled        → test for != 0
 ```
 
 `hive wait` prints the last 40 log lines plus the header (node, cmd, GPU visibility). That
@@ -49,9 +50,9 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--gpus N` | GPUs the task may see (default **1**; extras are hidden so frameworks don't auto-DataParallel) |
 | `--timeout 2h` | kill the task after that much run time (failed, exit 124) — use it for anything that can hang |
 | `--notify CMD` | run CMD when the task finishes or is requeued (`HIVE_TASK_*` env; runs on the scheduler host; default `$HIVE_NOTIFY`) |
-| `--after ID,ID` | pipeline: run only after those tasks ended done (fails with them, exit 125). `--after-any` = whatever their outcome |
+| `--after ID,ID` | pipeline: run only after those tasks ended done (fails with them, exit 125). `--after aN` = after the whole array N. `--after-any` = whatever their outcome |
 | `--array 0-9%4` | sweep: one task per index (`$HIVE_ARRAY_INDEX`, single-quote the command), at most 4 at once. `hive wait --array ID`, `hive cancel --array ID` |
-| `--max-running N` | don't take more than N nodes at once for this owner |
+| `--max-running N` | cap for the whole owner: at most N of its tasks run at once (`export HIVE_MAX_RUNNING=N`) |
 | `--allow-slow` | accept a SLOW node (CUDA init takes minutes there, then normal speed). Automatic for `--est-runtime` ≥ 1h; `--no-slow` to refuse. Give long training / serving jobs an estimate so they use these nodes and leave the fast ones for short runs |
 | `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |

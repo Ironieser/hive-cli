@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -91,18 +92,39 @@ def script_excludes(script):
     found = []
     try:
         with open(script) as f:
-            for line in f:
-                m = re.match(r"^\s*#SBATCH\s+(?:--exclude(?:=|\s+)|-x\s*)(\S+)", line)
-                if m:
-                    found.append(m.group(1))
+            lines = f.readlines()
     except OSError:
-        pass
-    return found
+        return found
+    for line in lines:
+        m = re.match(r"^\s*#SBATCH\s+(.*)$", line)
+        if not m:
+            continue
+        # One #SBATCH line may carry several options, quoted or not:
+        #   #SBATCH -p gpu -x evc7      #SBATCH --partition=gpu --exclude="evc8,evc9"
+        try:
+            words = shlex.split(m.group(1), comments=True)
+        except ValueError:
+            words = m.group(1).split()
+        k = 0
+        while k < len(words):
+            w = words[k]
+            if w.startswith("--exclude="):
+                found.append(w[len("--exclude="):])
+            elif w in ("--exclude", "-x") and k + 1 < len(words):
+                found.append(words[k + 1])
+                k += 1
+            elif re.fullmatch(r"-x\S+", w) and not w.startswith("--"):
+                found.append(w[2:])                  # -xevc7
+            k += 1
+    return [x for x in found if x]
 
 
 def build_exclude(script, cli, config_lists, auto):
     """(merged --exclude value or None, quarantined nodes that were added)."""
-    parts = script_excludes(script) + [x for x in config_lists if x] + ([cli] if cli else [])
+    flat = []
+    for x in config_lists:                      # a string, or a JSON list of them
+        flat += [str(y) for y in x] if isinstance(x, (list, tuple)) else ([str(x)] if x else [])
+    parts = script_excludes(script) + [x for x in flat if x] + ([cli] if cli else [])
     known = set()
     for p in parts:
         try:
@@ -110,7 +132,8 @@ def build_exclude(script, cli, config_lists, auto):
         except ValueError as e:
             print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
             sys.exit(2)
-    added = sorted(hh.quarantined_nodes() - known) if auto else []
+    added = sorted(n for n in hh.quarantined_nodes() - known
+                   if hh.valid_node_name(n)) if auto else []
     parts += added
     return (",".join(parts) or None), added
 
@@ -127,7 +150,14 @@ def cmd_add(args):
         script = os.path.expanduser(target)
         preset_name = os.path.basename(script)
         desc = ""
+        # The standing "exclude" of pool_config.json applies to a script path too.
         config_excl = []
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE) as f:
+                    config_excl = [json.load(f).get("exclude")]
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
     else:
         config = load_config()
         preset_name, preset = get_preset(config, target)
@@ -188,7 +218,7 @@ def cmd_add(args):
     if auto_added:
         print(f"  {C_DIM}excluding quarantined node(s): {', '.join(auto_added)}  "
               f"(hive health; --no-auto-exclude to skip){C_RESET}")
-    requested = [x for x in config_excl + [args.exclude] if x]
+    requested = [str(x) for x in config_excl + [args.exclude] if x]
     if requested:
         print(f"  {C_DIM}excluding: {', '.join(requested)}{C_RESET}")
 
@@ -196,6 +226,16 @@ def cmd_add(args):
         result = subprocess.run(build_cmd(), capture_output=True, text=True)
         if result.returncode == 0:
             print(f"  {C_GREEN}✓{C_RESET} {result.stdout.strip()}")
+            # Remember which exclusions are hive's, so they can be lifted when the
+            # node leaves quarantine while this job still waits in the queue.
+            m = re.search(r"(\d+)\s*$", result.stdout.strip())
+            if m and auto_added:
+                try:
+                    tracked = hh.load_hive_excludes()
+                    tracked[m.group(1)] = list(auto_added)
+                    hh.save_hive_excludes(tracked)
+                except OSError:
+                    pass
         else:
             print(f"  {C_RED}✗{C_RESET} {result.stderr.strip()}", file=sys.stderr)
 

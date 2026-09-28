@@ -97,6 +97,17 @@ def cmd_list(args):
 def cmd_report(args):
     node = args.node
     reason = args.reason or "reported via hive health"
+    # The name ends up in every hold job's --exclude: one typo made SLURM refuse the
+    # whole list, the really bad nodes with it, and nothing ever releases a node that
+    # does not exist.
+    if not hh.valid_node_name(node):
+        print(f"{C_RED}error:{C_RESET} '{node}' is not a node name", file=sys.stderr)
+        sys.exit(2)
+    if hh.node_info(node) is None and not getattr(args, "force", False) \
+            and hh._slurm(["scontrol", "--version"]) is not None:
+        print(f"{C_RED}error:{C_RESET} SLURM knows no node '{node}' (hive nodes lists yours; "
+              f"--force to record it anyway)", file=sys.stderr)
+        sys.exit(2)
     with QueueLock():
         data = hh.load()
         fresh = hh.quarantine(data, node, reason, "agent",
@@ -157,6 +168,8 @@ def build_parser():
     pr = sub.add_parser("report", help="Quarantine a node now")
     pr.add_argument("node")
     pr.add_argument("--reason", "-r", metavar="TEXT")
+    pr.add_argument("--force", action="store_true",
+                    help="Record the node although SLURM does not know it")
     pc = sub.add_parser("clear", help="Release a node manually")
     pc.add_argument("node")
     pc.add_argument("--reason", "-r", metavar="TEXT")

@@ -124,7 +124,7 @@ case "$subcommand" in
                               Several / an array: one line each, exit 1 if any failed
     list                      Show task queue (shortcut for queue list)
     logs     ID [-f]          Show / follow task log
-    cancel   ID|--array A     Cancel pending or running task
+    cancel   ID|--array A     Cancel pending or running task (the scheduler stops it, ≤30s)
     hold     ID…|--array A    Keep pending task(s) out of dispatch; `unhold` to let go
     priority N ID…|--array A  Change the priority of pending task(s)
     stats    [NAME]           Completed-task runtime history (for --est-runtime)

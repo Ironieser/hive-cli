@@ -123,6 +123,13 @@ GPU_QUERY_DEADLINE = 60     # seconds. Measured 2026-09-28 on normal-partition n
 GPU_MARKER = "GPU_PROBE"
 GPU_QUERY_FIELDS = "utilization.gpu,memory.used,memory.total"
 
+# $var = a fresh temp file that is proven writable (its .rc twin too), or empty.
+TMPFILE_SH = ('{var}=; for _d in "${{TMPDIR:-}}" /tmp /dev/shm; do '
+              '[ -n "$_d" ] && [ -d "$_d" ] || continue; '
+              '_t=$(mktemp -p "$_d" hive_probe.XXXXXXXX 2>/dev/null) || continue; '
+              'if echo x >"$_t" 2>/dev/null && echo x >"$_t.rc" 2>/dev/null; then '
+              ': >"$_t"; rm -f "$_t.rc"; {var}=$_t; break; fi; rm -f "$_t" "$_t.rc"; done; ')
+
 
 def gpu_query_shell(fields=GPU_QUERY_FIELDS, deadline=None):
     """Shell snippet printing, in order: `GPU_PROBE granted=<CUDA_VISIBLE_DEVICES>`
@@ -133,14 +140,18 @@ def gpu_query_shell(fields=GPU_QUERY_FIELDS, deadline=None):
     ticks = max(1, int(deadline * 2))
     return (
         f'echo "{GPU_MARKER} granted=${{CUDA_VISIBLE_DEVICES:-}}"; '
-        '_o=$(mktemp 2>/dev/null || echo "/tmp/hive_gpuq.$$"); '
+        # No predictable fallback name: it would be written through a symlink another
+        # user planted. And "cannot write a temp file" (/tmp full, TMPDIR exported from
+        # another host) must not read as a GPU that does not answer.
+        + TMPFILE_SH.format(var="_o") +
+        f'if [ -z "$_o" ]; then echo "{GPU_MARKER} nowrite"; else '
         f'( nvidia-smi --query-gpu={fields} --format=csv,noheader,nounits >"$_o" 2>&1; '
         'echo $? >"$_o.rc" ) </dev/null >/dev/null 2>&1 & '
         f'_i=0; while [ ! -s "$_o.rc" ] && [ "$_i" -lt {ticks} ]; do sleep 0.5; _i=$((_i+1)); done; '
         '_HIVE_GPU_HUNG=; '
         f'if [ -s "$_o.rc" ]; then cat "$_o"; echo "{GPU_MARKER} rc=$(cat "$_o.rc")"; '
         f'else _HIVE_GPU_HUNG=1; echo "{GPU_MARKER} hung"; fi; '
-        'rm -f "$_o" "$_o.rc"; '
+        'rm -f "$_o" "$_o.rc"; fi; '
     )
 
 
@@ -162,6 +173,8 @@ def parse_gpu_query(lines):
                 granted = rest[len("granted="):].strip()
             elif rest == "hung":
                 hung = True
+            elif rest == "nowrite":
+                return [], granted, None          # could not run: no verdict at all
             elif rest.startswith("rc="):
                 answered = True
             continue
@@ -195,7 +208,8 @@ def cuda_probe_shell(deadline=None):
         deadline = float(os.environ.get("HIVE_CUDA_PROBE_DEADLINE", CUDA_INIT_DEADLINE))
     ticks = max(1, int(float(deadline) * 2))
     return (f"PY={py}; [ -x \"$PY\" ] || PY=python3; "
-            '_c=$(mktemp 2>/dev/null || echo "/tmp/hive_cudap.$$"); '
+            + TMPFILE_SH.format(var="_c") +
+            'if [ -z "$_c" ]; then echo "CUDA_PROBE unknown no_tmp"; else\n'
             "( \"$PY\" - >\"$_c\" 2>/dev/null <<'HIVE_CUDA_PROBE_EOF'\n"
             f"{CUDA_PROBE_PY}\nHIVE_CUDA_PROBE_EOF\n"
             'echo $? >"$_c.rc" ) >/dev/null 2>&1 &\n'
@@ -203,7 +217,7 @@ def cuda_probe_shell(deadline=None):
             'if [ ! -s "$_c.rc" ]; then echo "CUDA_PROBE fail '
             f'{CUDA_SLOW_DETAIL}"; '
             'elif [ -s "$_c" ]; then cat "$_c"; else echo "CUDA_PROBE unknown python_failed"; fi; '
-            'rm -f "$_c" "$_c.rc"')
+            'rm -f "$_c" "$_c.rc"\nfi')
 
 
 def parse_cuda_probe(lines):
@@ -220,9 +234,11 @@ def parse_cuda_probe(lines):
     return "unknown", "no_probe_output"
 
 
-def cuda_probe(slurm_jobid, timeout=CUDA_PROBE_TIMEOUT):
+def cuda_probe(slurm_jobid, timeout=None):
     """Standalone CUDA-context probe through hold job `slurm_jobid`.
     Returns (verdict, detail) — see parse_cuda_probe; srun failure → ('unknown', ...)."""
+    if timeout is None:     # the in-step deadline plus step start and teardown
+        timeout = float(os.environ.get("HIVE_CUDA_PROBE_DEADLINE", CUDA_INIT_DEADLINE)) + 45
     try:
         out = subprocess.run(
             ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
@@ -282,7 +298,7 @@ PROBE_DIR            = os.path.join(HIVE_DIR, "health-probes")
 CANARY_NAME          = "hive_canary"   # the pollers filter this name out of the pool
 CANARY_INTERVAL_SECS = 6 * 3600
 CANARY_MAX_WAIT_SECS = 24 * 3600       # still queued after this → cancel, try later
-CANARY_TIME          = "00:10:00"
+CANARY_TIME          = "00:15:00"   # two probes of up to SLOW_CUDA_DEADLINE + the gap
 CANARY_GAP_SECS      = 60              # between the two probes of one canary
 CANARY_SEP           = "---HIVE-CANARY-PROBE---"
 SLURM_CMD_TIMEOUT    = 15
@@ -347,7 +363,9 @@ def submit_canary(node, partition=None):
     os.makedirs(PROBE_DIR, exist_ok=True)
     out_pat = os.path.join(PROBE_DIR, f"{node}-%j.out")
     gap = os.environ.get("HIVE_CANARY_GAP", str(CANARY_GAP_SECS))
-    probe = full_probe_shell()
+    # Same patience as the periodic check: a slow node must be able to show that it
+    # works, or the canary re-quarantines it every six hours for ever.
+    probe = full_probe_shell(cuda_deadline=SLOW_CUDA_DEADLINE)
     script = ("#!/bin/bash\n"
               f'echo "HIVE_CANARY start node=$(hostname -s) job=$SLURM_JOB_ID"\n'
               f"echo {CANARY_SEP}\n{probe}\n"
@@ -401,6 +419,10 @@ def check_without_hold_job(data, node, partition=None, now=None):
         if not verdicts:
             return record_check(data, node, "unknown", "canary: no output")
         outcome = None
+        slowest = max((cuda_secs(d) or 0 for v, d in verdicts if v == "ok"), default=0)
+        if slowest > CUDA_INIT_DEADLINE and all(v == "ok" for v, _ in verdicts) \
+                and may_become_slow(rec):
+            return "slow" if mark_slow(data, node, slowest) else None
         for verdict, detail in verdicts:
             outcome = record_check(data, node, verdict, f"canary: {detail}".rstrip(": ")) or outcome
             if outcome == "released":
@@ -449,40 +471,94 @@ def pending_hold_jobs():
         info = _slurm(["scontrol", "show", "job", jid])
         if not info:
             continue
-        kv = dict(re.findall(r"(\w+)=(\S+)", info))
-        if not kv.get("StdOut", "").startswith(POOL_LOG_DIR + os.sep):
+        # Field by field, anchored at the start of a token: a job NAME containing
+        # "StdOut=…" must not make a foreign job look like a hold job.
+        out_m = re.search(r"^\s*StdOut=(\S+)", info, flags=re.M)
+        exc_m = re.search(r"(?:^|\s)ExcNodeList=(\S+)", info, flags=re.M)
+        if not out_m or not out_m.group(1).startswith(POOL_LOG_DIR + os.sep):
             continue
-        exc = kv.get("ExcNodeList", "")
+        exc = exc_m.group(1) if exc_m else ""
         jobs[jid] = "" if exc in ("(null)", "") else exc
     return jobs
 
 
+EXCL_FILE = os.path.join(HIVE_DIR, "pool_excludes.json")   # {jobid: [nodes hive added]}
+NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+
+
+def valid_node_name(name):
+    return bool(NODE_NAME_RE.match(str(name or "")))
+
+
+def load_hive_excludes():
+    try:
+        with open(EXCL_FILE) as f:
+            data = json.load(f)
+        return {str(k): list(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def save_hive_excludes(data):
+    tmp = EXCL_FILE + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, EXCL_FILE)
+
+
 def sync_pending_excludes(nodes):
-    """Add `nodes` to the exclude list of every queued hold job that lacks them.
-    Only ever adds. Returns {jobid: [nodes added]}, or None if SLURM could not be asked."""
+    """Make every queued hold job exclude exactly: what its script and the user asked
+    for, plus `nodes` (the quarantine list now). What hive added earlier is tracked in
+    pool_excludes.json, so a node that left quarantine — or turned out to be slow, not
+    broken — comes OFF the list again; add-only lost such nodes for every hold job
+    that was waiting in the SLURM queue at the time.
+
+    Returns {jobid: (added, removed)} plus "_failed": True if SLURM refused an update;
+    None if SLURM could not be asked."""
     jobs = pending_hold_jobs()
     if jobs is None:
         return None
+    want = {n for n in nodes if valid_node_name(n)}
+    tracked = load_hive_excludes()
     done = {}
     for jid, exc in jobs.items():
         try:
-            have = set(expand_nodes(exc))
+            have = expand_nodes(exc)
         except ValueError:
+            done["_failed"] = True           # a list we cannot read: do not touch it
             continue
-        add = sorted(set(nodes) - have)
-        if not add:
+        ours = set(tracked.get(jid, []))
+        base = [n for n in have if n not in ours]          # the job's own exclusions
+        target = base + sorted(want - set(base))
+        if set(target) == set(have):
+            tracked[jid] = sorted(want - set(base))
             continue
-        merged = ",".join(([exc] if exc else []) + add)
-        if _slurm(["scontrol", "update", f"JobId={jid}", f"ExcNodeList={merged}"]) is not None:
-            done[jid] = add
+        if _slurm(["scontrol", "update", f"JobId={jid}",
+                   f"ExcNodeList={','.join(target)}"]) is None:
+            done["_failed"] = True
+            continue
+        tracked[jid] = sorted(want - set(base))
+        done[jid] = (sorted(set(target) - set(have)), sorted(set(have) - set(target)))
+    for jid in [j for j in tracked if j not in jobs]:       # started or gone
+        del tracked[jid]
+    try:
+        save_hive_excludes(tracked)
+    except OSError:
+        pass
     return done
 
 
 # ── Node lists (`hive pool add --exclude`, `hive submit --exclude`) ──────────
+EXPAND_NODES_MAX = 4096     # names one list may expand to
+
+
 def expand_nodes(spec):
     """Node names from a SLURM-style list: 'evc22,evc[1-3,07],gpu01' →
     ['evc22', 'evc1', 'evc2', 'evc3', 'evc07', 'gpu01']. Order kept, duplicates
-    dropped, zero padding preserved. Raises ValueError on unbalanced brackets."""
+    dropped, zero padding preserved. Entries may also be separated by spaces. Raises
+    ValueError on anything it cannot read, on a reversed range, and on a list of more
+    than EXPAND_NODES_MAX names (checked before expanding: `evc[1-999999999]`)."""
+    spec = re.sub(r"\s+", ",", str(spec or "").strip())
     out, seen = [], set()
     parts, depth, cur = [], 0, ""
     for ch in (spec or ""):
@@ -518,9 +594,15 @@ def expand_nodes(spec):
                 if not lo.isdigit() or (hi and not hi.isdigit()):
                     raise ValueError(f"cannot parse node range: {part}")
                 hi = hi or lo
+                if int(hi) < int(lo):
+                    raise ValueError(f"reversed node range: {part}")
+                if len(out) + len(names) + int(hi) - int(lo) + 1 > EXPAND_NODES_MAX:
+                    raise ValueError(f"node list too long (over {EXPAND_NODES_MAX} names): {spec[:40]}")
                 for n in range(int(lo), int(hi) + 1):
                     names.append(f"{pre}{str(n).zfill(len(lo))}{post}")
         for n in names:
+            if not valid_node_name(n):
+                raise ValueError(f"not a node name: '{n}'")
             if n not in seen:
                 seen.add(n)
                 out.append(n)
@@ -576,6 +658,17 @@ SLOW_OK_MIN_EST_SECS = 3600    # est. runtime from which a slow start stops matt
 def slow_nodes(data=None):
     data = data if data is not None else load()
     return {n for n, r in data.get("nodes", {}).items() if r.get("state") == "slow"}
+
+
+def may_become_slow(rec):
+    """Only a node that hive itself put aside for being slow may be reclassified from
+    one probe. Anything else — an agent's report, CUDA errors, a GPU that did not
+    answer — is a real fault: it keeps its minimum hold and needs HEALTH_OK_STREAK
+    healthy probes, however long the context took to appear on one lucky try."""
+    if rec.get("state") == "slow":
+        return True
+    return rec.get("state") == "quarantined" and rec.get("source") in ("verify", "auto") \
+        and CUDA_SLOW_DETAIL in str(rec.get("reason") or "")
 
 
 def mark_slow(data, node, secs):

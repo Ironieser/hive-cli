@@ -10,10 +10,14 @@ Contents: [Commands](#commands) · [`hive submit`](#hive-submit) · [`.hive` fil
 
 ```bash
 hive submit "CMD" [flags] | hive submit job.hive     # queue a task → "Submitted task #N"
+hive submit -q …                                      # prints only the id (array id for --array)
 hive wait ID [--pending-timeout SEC] [--log-lines N | --full-log | --no-log]
+hive wait ID ID … | --array A [--pending-timeout SEC] # several: one line each, no logs
 hive list [--owner NAME|all] [--state S] [--limit N] [--days N] [--all]
 hive logs ID [-n N | --full] [-f]
-hive cancel ID                                        # pending or running
+hive cancel ID | --array A                            # pending or running
+hive hold ID… | --array A      ·  hive unhold …       # keep pending tasks out of dispatch
+hive priority N ID… | --array A                       # reprioritise pending tasks
 hive stats [NAME]                                     # min/median/P90/max run time by name
 hive prune [--older-than 7d] [--keep N] [--dry-run]  # trim finished tasks from the queue
 hive nodes                                            # pool table (auto-starts the poller)
@@ -25,8 +29,20 @@ hive queue daemon start|stop|restart|status|logs      # scheduler
 hive daemon start|stop|restart|status|logs            # node poller
 ```
 
-Exit codes of `hive wait`: `0` done · `1` failed · `75` never dispatched (`--pending-timeout`)
-· `130` cancelled.
+Exit codes of `hive wait ID` (one task): **the command's own exit code** — `0` done, anything
+else failed — with these reserved values:
+
+| Code | Meaning |
+|---|---|
+| `124` | killed by `--timeout` |
+| `125` | never ran: a task it was submitted `--after` did not end done |
+| `1` | also: declared dead (heartbeat lost, recorded as -1) |
+| `2` | no such task |
+| `75` | still pending when `--pending-timeout` expired |
+| `130` | cancelled |
+
+`hive wait ID ID …` / `--array` (several tasks): `0` all done · `1` at least one failed or was
+cancelled · `2` an id that never existed · `75` pending timeout. Test for `!= 0`, not `== 1`.
 
 ## `hive submit`
 
@@ -46,10 +62,11 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--gpus` | 1 | GPUs the task may see. A hold job may own more; hive narrows `CUDA_VISIBLE_DEVICES` to the first N so frameworks don't auto-`DataParallel` over cards you didn't ask for. `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`). |
 | `--timeout` | — | hard limit on **run** time (`2h`, `90m`). Over it the task is killed and ends `failed`, exit code 124, `fail_reason: timeout`; not retried. Unlike `--est-runtime`, which only steers placement |
 | `--notify` | `$HIVE_NOTIFY` | shell command run when the task finishes (done / failed / cancelled / timeout) or is requeued after a node loss. See [Notification hook](#notification-hook) |
-| `--after` | — | run only after these tasks ended `done`. If one failed or was cancelled this task fails without running: exit code 125, `fail_reason: dependency_failed`, and so do the tasks `--after` it. Until then `waiting_for_dependency` |
+| `--quiet` / `-q` | — | print only the new id on stdout (notes go to stderr): `ID=$(hive submit -q …)` |
+| `--after` | — | `ID,ID` or `aN` (= every member of array N). Run only after these tasks ended `done`. If one failed or was cancelled this task fails without running: exit code 125, `fail_reason: dependency_failed`, and so do the tasks `--after` it. Until then `waiting_for_dependency` |
 | `--after-any` | — | run after these tasks ended, whatever the outcome (cleanup, reports) |
 | `--array` | — | one task per index: `0-9`, `1,3,5`, `0-20:5`; append `%N` to run at most N at once (`0-9%4`). Same command for all, index in `$HIVE_ARRAY_INDEX`. See [Arrays](#arrays) |
-| `--max-running` | `$HIVE_MAX_RUNNING` | hold this task while its owner already has N running (`owner_limit`). Needs an owner |
+| `--max-running` | `$HIVE_MAX_RUNNING` | cap on the **owner**: while any pending or running task of the owner carries a cap, at most that many (the lowest, if they differ) of the owner's tasks run at once — also the ones submitted without the flag (`owner_limit`). Needs an owner |
 | `--allow-slow` / `--no-slow` | by estimate | whether the task may run on a **SLOW** node (works, but CUDA needs minutes to initialise — measured 146 s vs 4 s — then runs at its normal rate). Default: allowed when `--est-runtime` ≥ 1 h. Slow nodes are only used after every faster node |
 | `--exclude` / `-x` | — | nodes the task must not run on (`evc22,evc[40-43]`); it waits (`node_excluded`) rather than use them. Broken nodes don't need this — hive quarantines them itself |
 | `--workdir` / `-w` | cwd | working directory on the node |
@@ -111,19 +128,23 @@ hive submit --name sweep --array 0-9%4 'python train.py --seed $HIVE_ARRAY_INDEX
 #   Submitted array #120: 10 tasks #120–#129
 hive wait --array 120        # one line per task as it ends; exit 1 if any did not end done
 hive cancel --array 120      # every pending/running member
-hive submit --name report --after 120,121,122 "python report.py"
+hive submit --name report --after a120 "python report.py"     # after the WHOLE array
 ```
 
 An array is N ordinary tasks that share `array_id` (the id of the first). They show as
 `sweep[3]` in `hive list`, keep one name for `hive stats` / `auto`, and each has its own
 log. Inside the command: `HIVE_TASK_ID`, `HIVE_TASK_NAME`, `HIVE_TASK_OWNER`,
-`HIVE_ARRAY_ID`, `HIVE_ARRAY_INDEX`. `--after` takes task ids, not an array id.
+`HIVE_ARRAY_ID`, `HIVE_ARRAY_INDEX`. `--after 120` waits for task 120 only — member `[0]`; the
+whole array is `--after a120`.
 
 ### Notification hook
 
 The hook runs **on the scheduler's host** (see `hive queue daemon status`), not where you
 submitted and not on the compute node; cwd is `$HOME`, limit 60 s, output in
-`~/.hive/logs/notify.log`. A failing hook never changes the task's outcome.
+`~/.hive/logs/notify.log`. A failing hook never changes the task's outcome. Its environment
+is minimal — `PATH`, `HOME`, `USER`, `HIVE_DIR`, `HIVE_OWNER` (the task's) and the
+`HIVE_TASK_*` below — not your shell's: pass what it needs inside the command. At most 8
+hooks run at once; `--notify ''` switches `$HIVE_NOTIFY` off for one task.
 
 | Variable | Value |
 |---|---|
@@ -131,7 +152,7 @@ submitted and not on the compute node; cwd is `$HOME`, limit 60 s, output in
 | `HIVE_TASK_ID` / `NAME` / `OWNER` | as submitted |
 | `HIVE_TASK_STATE` | `done`, `failed`, `cancelled`; `pending` on `requeue` |
 | `HIVE_TASK_EXIT_CODE` | exit code; 124 = timeout, 125 = dependency failed (never ran), -1 = declared dead |
-| `HIVE_TASK_FAIL_REASON` | `timeout` or empty |
+| `HIVE_TASK_FAIL_REASON` | `timeout`, `dependency_failed` or empty |
 | `HIVE_TASK_NODE` / `DURATION_SECS` / `LOG` / `WORKDIR` / `REQUEUE_COUNT` | — |
 | `HIVE_TASK_GPU_PEAK_MB` / `GPU_AVG_UTIL` | measured GPU usage (empty if nothing was sampled) |
 
@@ -232,7 +253,8 @@ the target hold job's GPU; `fail` → node quarantined. A task that fails within
 a CUDA-init signature in its log is a strike; two strikes → quarantine + the task is
 re-run elsewhere; a successful task clears strikes. Quarantined nodes are re-probed every
 10 min through a hold job with no running task and released after 2 consecutive healthy
-probes (minimum 1 h hold). A node without any hold job can't be probed and stays listed.
+probes (minimum 1 h hold). A node without any hold job is checked by the health monitor
+instead (reboot detection, canary job — see troubleshooting.md).
 Ordinary crashes, OOMs and slow failures never count.
 
 ## Pool management

@@ -243,16 +243,22 @@ def _pid_alive(pid):
         return True   # can't read state → assume alive (conservative)
 
 
+_task_children = set()     # srun PIDs of the tasks THIS process dispatched
+
+
 def _reap_children():
-    """Reap any exited srun children so they don't linger as <defunct> zombies (which
-    would otherwise mask finished tasks via os.kill — see _pid_alive). Non-blocking."""
-    try:
-        while True:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-            if pid == 0:
-                break
-    except ChildProcessError:
-        pass
+    """Reap exited task sruns so they don't linger as <defunct> zombies (which would
+    otherwise mask finished tasks via os.kill — see _pid_alive). Non-blocking, and only
+    for the children dispatch_task started: `waitpid(-1)` also took the exit status of
+    the probe / scontrol / sbatch children the background threads were waiting for,
+    which then read as success."""
+    for pid in list(_task_children):
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            done = pid                 # not ours any more (already reaped)
+        if done:
+            _task_children.discard(pid)
 
 
 def db_gpu_mem(info):
@@ -429,9 +435,6 @@ def sync_excludes_async(quarantined):
     want = frozenset(quarantined)
     if want == _excl_synced or (_excl_thread and _excl_thread.is_alive()):
         return
-    if _excl_synced is not None and want <= _excl_synced:
-        _excl_synced = want                     # the list only shrank: nothing to add
-        return
 
     def run():
         global _excl_synced
@@ -440,11 +443,13 @@ def sync_excludes_async(quarantined):
         except Exception as e:
             logging.warning("Could not update queued hold jobs' exclude lists: %s", e)
             return
-        if done is None:
-            return
+        if done is None or done.pop("_failed", None):
+            return                              # SLURM said no somewhere: retry next cycle
         _excl_synced = want
-        for jid, nodes in done.items():
-            logging.info("Queued hold job %s now excludes %s", jid, ", ".join(nodes))
+        for jid, (added, removed) in done.items():
+            logging.info("Queued hold job %s: exclude list %s", jid, "; ".join(
+                x for x in ("+" + ",".join(added) if added else "",
+                            "-" + ",".join(removed) if removed else "") if x))
 
     _excl_thread = threading.Thread(target=run, name="sync-excludes", daemon=True)
     _excl_thread.start()
@@ -555,7 +560,34 @@ def usage_fields(task):
 
 
 NOTIFY_TIMEOUT_SECS = 60
+NOTIFY_MAX_PARALLEL = 8      # hooks running at once; the rest wait their turn
+NOTIFY_QUEUE_MAX    = 2000   # …and beyond this many waiting, they are dropped (logged)
 NOTIFY_LOG = os.path.join(LOG_DIR, "notify.log")
+NOTIFY_ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ",
+                   "HIVE_DIR", "TMPDIR")
+_notify_running = []         # Popen of hooks in flight
+_notify_waiting = []         # (cmd, env, header) not started yet
+
+
+def drain_notify():
+    """Start waiting hooks while fewer than NOTIFY_MAX_PARALLEL are running. Called
+    every cycle. One `--array 0-999 --after <failed task> --notify …` used to put
+    2000 processes on the scheduler's host in a single cycle."""
+    _notify_running[:] = [p for p in _notify_running if p.poll() is None]
+    while _notify_waiting and len(_notify_running) < NOTIFY_MAX_PARALLEL:
+        cmd, env, header = _notify_waiting.pop(0)
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(NOTIFY_LOG, "a") as lf:
+                lf.write(header)
+                lf.flush()
+                # -k: a hook that ignores SIGTERM is killed 5 s after the limit.
+                _notify_running.append(subprocess.Popen(
+                    ["timeout", "-k", "5", str(NOTIFY_TIMEOUT_SECS), "bash", "-c", cmd],
+                    stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, env=env,
+                    cwd=os.path.expanduser("~"), start_new_session=True))
+        except OSError as e:
+            logging.warning("notify hook could not be started: %s", e)
 
 
 def notify(task, event):
@@ -566,7 +598,11 @@ def notify(task, event):
     cmd = (task.get("notify") or "").strip()
     if not cmd:
         return
-    env = dict(os.environ)
+    # Not the scheduler's environment: that is the environment of whichever agent
+    # happened to start it, with that agent's HIVE_OWNER, HIVE_NOTIFY and secrets.
+    env = {k: os.environ[k] for k in NOTIFY_ENV_KEEP if k in os.environ}
+    if task.get("owner"):
+        env["HIVE_OWNER"] = str(task["owner"])
     fields = {"ID": task.get("id"), "NAME": task.get("name"), "OWNER": task.get("owner"),
               "STATE": task.get("state"), "EXIT_CODE": task.get("exit_code"),
               "NODE": task.get("node") or task.get("last_node"),
@@ -576,17 +612,14 @@ def notify(task, event):
               "GPU_PEAK_MB": task.get("gpu_peak_mb"), "GPU_AVG_UTIL": task.get("gpu_avg_util")}
     for k, v in fields.items():
         env[f"HIVE_TASK_{k}"] = "" if v is None else str(v)
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        with open(NOTIFY_LOG, "a") as lf:
-            lf.write(f"[{now_iso()}] task {task.get('id')} {event} "
-                     f"state={task.get('state')}: {cmd}\n")
-            lf.flush()
-            subprocess.Popen(["timeout", str(NOTIFY_TIMEOUT_SECS), "bash", "-c", cmd],
-                             stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, env=env,
-                             cwd=os.path.expanduser("~"), start_new_session=True)
-    except OSError as e:
-        logging.warning("Task %s: notify hook could not be started: %s", task.get("id"), e)
+    header = (f"[{now_iso()}] task {task.get('id')} {event} "
+              f"state={task.get('state')}: {cmd}\n")
+    if len(_notify_waiting) >= NOTIFY_QUEUE_MAX:
+        logging.warning("Task %s: notify hook dropped, %d already waiting",
+                        task.get("id"), len(_notify_waiting))
+        return
+    _notify_waiting.append((cmd, env, header))
+    drain_notify()
 
 
 def request_repoll(reason):
@@ -721,6 +754,14 @@ def live_probe(slurm_jobid, cuda_deadline=None, skip_cuda=False, timeout=None):
     cuda, cuda_detail = hh.parse_cuda_probe(cuda_part.splitlines())
     return {"ok": True, "util": util, "mem_used": used, "mem_total": total,
             "cuda": cuda, "cuda_detail": cuda_detail}
+
+
+def drop_node(candidates, node, i):
+    """Remove every hold job of `node` from `candidates` and return the index that
+    still points at the entry `i` pointed at (or at what followed it)."""
+    before = sum(1 for c in candidates[:i] if c[1].get("node") == node)
+    candidates[:] = [c for c in candidates if c[1].get("node") != node]
+    return i - before
 
 
 def preferred_partitions():
@@ -934,7 +975,11 @@ def dispatch_task(task, slurm_jobid, node_name):
         # itself, not this wrapper — it used to skip the footer and the exit file, so
         # the task was requeued as a crash orphan and finally "declared dead" (-1)
         # instead of failing with its own exit code.
-        f"(\n{cmd}\n) >> {lf} 2>&1\n"
+        # …and in a bash of its own, passed as ONE quoted argument: a syntax error in
+        # the command (an unbalanced quote or parenthesis) is then that bash's error
+        # and exit code, and not a parse error of this wrapper, which used to end without
+        # footer or exit file and left the task to be "declared dead" minutes later.
+        f"bash -c {q(cmd)} >> {lf} 2>&1\n"
         f"_EC=$?\n"
         # ── Footer (double-quotes so $(date) and $_EC are expanded by bash) ──
         f'echo "" >> {lf}\n'
@@ -957,6 +1002,7 @@ def dispatch_task(task, slurm_jobid, node_name):
         start_new_session=True,
     )
     log_fd.close()   # parent closes its copy; srun inherits it
+    _task_children.add(proc.pid)
     return proc.pid
 
 
@@ -1053,15 +1099,27 @@ def run_one_cycle():
     probed in parallel with the lock released, and pass 2 — a full pass again, on the
     queue as it is by then — dispatches with the answers. A task whose node is rejected
     in pass 2 waits for the next cycle rather than triggering more probes."""
-    wanted = _cycle({}, final=False)
+    wanted = _guarded_cycle({}, final=False)
     if wanted:
-        _cycle(probe_nodes(wanted), final=True)
+        _guarded_cycle(probe_nodes(wanted), final=True)
     else:
-        _cycle({}, final=True)
+        _guarded_cycle({}, final=True)
+
+
+def _guarded_cycle(probe_cache, final):
+    global _in_cycle
+    _in_cycle = True
+    try:
+        return _cycle(probe_cache, final)
+    finally:
+        _in_cycle = False
+        if _stop_requested:
+            shutdown(signal.SIGTERM)
 
 
 def _cycle(probe_cache, final):
     global _starve_streak, _starve_threshold
+    drain_notify()
     wanted = {}        # pass 1: hold jobs to probe before pass 2 — {jid: skip_cuda}
     _reap_children()   # clear exited srun zombies so liveness checks stay truthful
     jobs_db, db_updated = load_node_db()
@@ -1096,7 +1154,8 @@ def _cycle(probe_cache, final):
             limit = task.get("timeout_secs")
             ran = _task_age(task, "started", "dispatched")
             if limit and ran is not None and ran > float(limit) \
-                    and not status.startswith("done:") and not task.get("cancel_requested"):
+                    and not status.startswith("done:") and not task.get("cancel_requested") \
+                    and not _has_exit_file(task["id"]):      # it may have ended just now
                 pid = task.get("srun_pid")
                 if pid and _pid_alive(pid):
                     try:
@@ -1191,7 +1250,10 @@ def _cycle(probe_cache, final):
                 dur = task.get("duration_secs")
                 if ec == 0 and node_name:
                     health_changed |= hh.clear_strikes(health, node_name)
-                elif (node_name and dur is not None and dur < hh.FAST_FAIL_SECS):
+                elif (node_name and dur is not None and dur < hh.FAST_FAIL_SECS + 2 * int(
+                        health.get("nodes", {}).get(node_name, {}).get("slow_init_secs") or 0)):
+                    # (on a slow node "fast" starts after its CUDA init, which alone
+                    # takes minutes — otherwise nothing that dies there is ever counted)
                     sig = hh.classify_log_tail(task.get("log", ""))
                     if sig:
                         # Fast death with a CUDA-init signature: a strike against the
@@ -1328,6 +1390,12 @@ def _cycle(probe_cache, final):
         def apply_check(node_name, jid, verdict, detail):
             nonlocal health_changed
             secs = hh.cuda_secs(detail) if verdict == "ok" else None
+            slow_ok = hh.may_become_slow(health["nodes"].get(node_name, {}))
+            if secs is not None and secs > hh.CUDA_INIT_DEADLINE and not slow_ok:
+                # Created a context, slowly, on a node that is out for another reason:
+                # that is one healthy-ish probe at most, never a shortcut to `slow`.
+                verdict, detail = "unknown", f"slow init {secs}s on a node quarantined for a fault"
+                secs = None
             if secs is not None and secs > hh.CUDA_INIT_DEADLINE:
                 # The context was created, but slowly: usable for long tasks only.
                 health_changed = True
@@ -1370,6 +1438,12 @@ def _cycle(probe_cache, final):
                 # reboot detection + canary job, see hh.check_without_hold_job.
                 outcome = hh.check_without_hold_job(health, node_name, rec.get("partition"), now)
                 health_changed = True
+                if outcome == "slow":
+                    quarantined.discard(node_name)
+                    slow.add(node_name)
+                    logging.warning("Node %s is SLOW, not broken (canary): %s", node_name,
+                                    health["nodes"][node_name].get("last_result"))
+                    ev.record("slow", node=node_name, source="canary")
                 last = health["nodes"][node_name].get("last_result")
                 if outcome or (last or "").startswith("canary"):
                     logging.info("Health check %s (no hold job): %s%s", node_name, last,
@@ -1379,8 +1453,9 @@ def _cycle(probe_cache, final):
                     ev.record("release", node=node_name, source="auto",
                               detail=health["nodes"][node_name].get("release_reason"))
                 continue
-            if jobs_db[jid].get("partition"):
+            if jobs_db[jid].get("partition") and rec.get("partition") != jobs_db[jid]["partition"]:
                 rec["partition"] = jobs_db[jid]["partition"]   # where a canary would go
+                health_changed = True
             if HEALTH_ASYNC:
                 start_health_probe(node_name, jid)   # verdict applied on a later cycle
             else:
@@ -1391,6 +1466,9 @@ def _cycle(probe_cache, final):
         # probe + a GPU-clean / free-mem gate, so we never dispatch onto a dirty
         # or actually-occupied GPU (feedback C1/C2). A reason is recorded on each
         # task that can't be placed this cycle.
+        for state in (_probe_backoff, _reject_logged):
+            for gone in [j for j in state if j not in jobs_db]:
+                del state[gone]
         candidates = get_candidates(jobs_db, running_jobids, freed_jobids, quarantined)
         # Fast nodes first, preferred partitions first ("prefer_partitions" in
         # pool_config.json); the sort is stable, so trusted-idle-first is kept within.
@@ -1418,12 +1496,39 @@ def _cycle(probe_cache, final):
         pruned = pruned_final_states(
             {d for t in pending for d in (t.get("depends_on") or ()) if str(d) not in tasks})
 
-        for task in pending:
-            # ── Gates that need no node (docs/feature_plan.md phase 3) ────────────
-            # `pending` is in dispatch order and a dependant is always submitted after
-            # what it depends on, so a failure cascades down a chain within one cycle.
-            dep, dep_id = dependency_status(task, tasks, pruned)
-            if dep == "failed":
+        # The cap is the OWNER's: the lowest --max-running any of their pending or
+        # running tasks carries applies to all of them. Per task, an owner went over
+        # the cap with every task submitted without it, and a capped task starved
+        # behind the uncapped ones.
+        owner_cap = {}
+        for t in tasks.values():
+            if t["state"] in ("pending", "running") and t.get("owner") and t.get("max_running"):
+                try:
+                    cap = int(t["max_running"])
+                except (TypeError, ValueError):
+                    continue
+                if cap >= 1:
+                    owner_cap[t["owner"]] = min(cap, owner_cap.get(t["owner"], cap))
+
+        # Hooks owed for tasks the CLI finished itself (a pending task cancelled).
+        for t in tasks.values():
+            if t.get("notify_pending"):
+                notify(t, t.pop("notify_pending"))
+                changed = True
+
+        # Dependency failures first, to a fixpoint: `pending` is in priority order, so
+        # a dependant can come BEFORE what it depends on, and one pass would move a
+        # failure down a chain by one link per cycle.
+        failed_now = True
+        while failed_now:
+            failed_now = False
+            for task in pending:
+                if task["state"] != "pending":
+                    continue
+                dep, dep_id = dependency_status(task, tasks, pruned)
+                if dep != "failed":
+                    continue
+                failed_now = True
                 task["state"]       = "failed"
                 task["exit_code"]   = DEPENDENCY_FAILED_EXIT
                 task["fail_reason"] = "dependency_failed"
@@ -1443,7 +1548,11 @@ def _cycle(probe_cache, final):
                           state="failed", exit_code=DEPENDENCY_FAILED_EXIT,
                           reason="dependency_failed", dependency=dep_id)
                 notify(task, "finish")
-                continue
+        pending = [t for t in pending if t["state"] == "pending"]
+
+        for task in pending:
+            # ── Gates that need no node (docs/feature_plan.md phase 3) ────────────
+            dep, dep_id = dependency_status(task, tasks, pruned)
             held = None
             if task.get("held"):
                 held = "held"                       # `hive hold`; until `hive unhold`
@@ -1452,8 +1561,8 @@ def _cycle(probe_cache, final):
             elif task.get("array_max_running") and task.get("array_id") is not None \
                     and run_by_array.get(task["array_id"], 0) >= int(task["array_max_running"]):
                 held = "array_limit"
-            elif task.get("max_running") and task.get("owner") \
-                    and run_by_owner.get(task["owner"], 0) >= int(task["max_running"]):
+            elif task.get("owner") in owner_cap \
+                    and run_by_owner.get(task["owner"], 0) >= owner_cap[task["owner"]]:
                 held = "owner_limit"
             if held:
                 if task.get("pending_reason") != held:
@@ -1556,8 +1665,7 @@ def _cycle(probe_cache, final):
                             quarantined.add(node_name)
                             # this probe WAS the first health check
                             health["nodes"][node_name]["last_check"] = time.time()
-                            candidates[:] = [c for c in candidates
-                                             if c[1].get("node") != node_name]
+                            i = drop_node(candidates, node_name, i)
                             logging.warning("Node %s QUARANTINED: GPU did not answer on "
                                             "verify (%s). Its hold jobs keep using "
                                             "allocation — `hive pool release <jobid>` "
@@ -1590,6 +1698,7 @@ def _cycle(probe_cache, final):
                         # involved, so this alone quarantines the node (hive health).
                         reason = node_reject = "cuda_unavailable_on_verify"
                         candidates.pop(i)      # node-level
+                        i = drop_node(candidates, node_name, i)   # its other hold jobs too
                         log_reject(jid, node_name, reason, p.get("cuda_detail") or "")
                         if node_name not in quarantined:
                             hh.quarantine(health, node_name,
@@ -1603,6 +1712,10 @@ def _cycle(probe_cache, final):
                                       reason=p.get("cuda_detail"))
                         continue
                     note_probe_result(jid, True)
+                    # A clean answer forgives the strikes earlier verify probes left:
+                    # they are meant to catch two misses in a row, not two in a month.
+                    if not is_slow and hh.clear_strikes(health, node_name):
+                        health_changed = True
                     # Verified clean: keep the live reading so the next task doesn't
                     # pay for another srun probe on the same node this cycle.
                     info = dict(info, _live=(used, total))
@@ -1689,8 +1802,7 @@ def _cycle(probe_cache, final):
 
         if health_changed:
             hh.save(health)
-        if quarantined:
-            sync_excludes_async(quarantined)
+        sync_excludes_async(quarantined)      # also when it shrank: nodes come back
 
         # ── (3) Starvation watchdog ──────────────────────────────────────────
         # Only tasks that wanted a node count: one held by a dependency or a
@@ -1713,11 +1825,42 @@ def _cycle(probe_cache, final):
     return wanted
 
 
+HEARTBEAT_EVERY = 15
+
+
+def heartbeat_forever():
+    """The heartbeat says the PROCESS is alive, so it must not depend on how long a
+    cycle takes: written once per cycle it went stale whenever a cycle ran over 90 s,
+    and another host then saw "no scheduler" and started a second one."""
+    while True:
+        write_heartbeat()
+        time.sleep(HEARTBEAT_EVERY)
+
+
+def another_scheduler():
+    """(pid, host) of a scheduler that is alive and is not this process, else None."""
+    try:
+        with open(SCHED_PID) as f:
+            lines = f.read().split("\n")
+        pid, host = int(lines[0].strip()), (lines[1].strip() if len(lines) > 1 else "")
+    except (OSError, ValueError, IndexError):
+        return None
+    if pid == os.getpid() and (not host or host == socket.gethostname()):
+        return None
+    if not host or host == socket.gethostname():
+        return (pid, host) if _pid_alive(pid) else None
+    try:
+        fresh = time.time() - os.path.getmtime(SCHED_HB) < 3 * HEARTBEAT_EVERY + 30
+    except OSError:
+        fresh = False
+    return (pid, host) if fresh else None
+
+
 def scheduler_loop():
     logging.info("hive-sched started (PID %d, host %s)", os.getpid(), socket.gethostname())
+    threading.Thread(target=heartbeat_forever, name="heartbeat", daemon=True).start()
     while True:
         try:
-            write_heartbeat()
             run_one_cycle()
         except Exception as e:
             logging.error("Cycle error: %s", e, exc_info=True)
@@ -1727,7 +1870,24 @@ def scheduler_loop():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+_in_cycle = False        # inside a pass: state is modified but not yet saved
+_stop_requested = False
+
+
 def handle_signal(signum, frame):
+    """Stop — but never in the middle of a pass. By then finish events are written and
+    notify hooks started while queue.json and node_health.json are only saved at the
+    end of the pass: exiting there made the next scheduler finish the same tasks again
+    (double events, double hooks) and forget a canary it had already submitted."""
+    global _stop_requested
+    if _in_cycle:
+        _stop_requested = True
+        logging.info("hive-sched: signal %d, stopping after the current pass", signum)
+        return
+    shutdown(signum)
+
+
+def shutdown(signum=0):
     logging.info("hive-sched stopping (signal %d)", signum)
     try:
         os.remove(SCHED_PID)
@@ -1751,6 +1911,16 @@ if __name__ == "__main__":
         format='%(asctime)s %(levelname)s %(message)s',
         datefmt='%Y-%m-%dT%H:%M:%S',
     )
+
+    # One scheduler per cluster. `hive queue daemon start` checks before spawning, but
+    # this is the last line of defence against whatever else starts us. The starter
+    # has already written OUR pid into sched.pid, which another_scheduler() allows.
+    other = another_scheduler()
+    if other:
+        logging.warning("hive-sched (PID %d on %s) not starting: a scheduler is already "
+                        "running (PID %s on %s)", os.getpid(), socket.gethostname(),
+                        other[0], other[1] or "this host")
+        sys.exit(0)
 
     # Write PID + hostname so status checks work across nodes
     with open(SCHED_PID, 'w') as f:

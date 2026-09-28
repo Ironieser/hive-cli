@@ -8,6 +8,7 @@ daemons. Usage:  python3 tests/test_hive.py [<repo_root>]
 import datetime
 import json
 import os
+import re
 import sys
 import time
 from importlib.machinery import SourceFileLoader
@@ -24,6 +25,11 @@ dbp = SourceFileLoader("dbp", os.path.join(LIB, "hive-dbpost")).load_module()
 
 for d in (hs.HIVE_DIR, hs.HEARTBEAT_DIR, hs.LOG_DIR):
     os.makedirs(d, exist_ok=True)
+# Nothing here may start a real daemon: `hive list` / `hive wait` start the scheduler
+# when it looks dead, and real SLURM is next on PATH after the mocks. The fake heartbeat
+# from run.sh goes stale after 90 s, so the starter itself is disarmed.
+_daemon_calls = []
+hq.cmd_daemon = lambda a: _daemon_calls.append(getattr(a, "subcmd", None))
 hs.HEALTH_ASYNC = False   # health probes inline, so one cycle = one verdict; the
                           # background path has its own test
 
@@ -1024,22 +1030,269 @@ reset_health(); reset_sched_state()
 _upd = os.path.join(hs.HIVE_DIR, "mock_scontrol_update.log")
 open(os.path.join(hs.HIVE_DIR, "mock_pending"), "w").write("1")
 chk("only jobs logging to pool-logs/ count as hold jobs", hh.pending_hold_jobs() == {"5001": "evc[1-3]", "5002": ""})
+def _no_excl_state():
+    try: os.remove(hh.EXCL_FILE)
+    except FileNotFoundError: pass
+_no_excl_state()
 chk("missing nodes are added, present ones are not repeated",
-    hh.sync_pending_excludes({"evc2", "evc48"}) == {"5001": ["evc48"], "5002": ["evc2", "evc48"]})
+    hh.sync_pending_excludes({"evc2", "evc48"}) == {"5001": (["evc48"], []), "5002": (["evc2", "evc48"], [])})
 _u = open(_upd).read()
-chk("the job's own exclude list is kept", "JobId=5001 ExcNodeList=evc[1-3],evc48" in _u
+chk("the job's own exclude list is kept", "JobId=5001 ExcNodeList=evc1,evc2,evc3,evc48" in _u
     and "JobId=5002 ExcNodeList=evc2,evc48" in _u and "5003" not in _u)
-os.remove(_upd)
+chk("what hive added is remembered per job",
+    hh.load_hive_excludes() == {"5001": ["evc48"], "5002": ["evc2", "evc48"]})
+chk("names that are not node names never reach SLURM",
+    hh.sync_pending_excludes({"evc48", "evc50 --partition=debug", "ty po"}) is not None
+    and "debug" not in open(_upd).read() and "ty po" not in open(_upd).read())
+os.remove(_upd); _no_excl_state()
 hs._excl_synced = None
 d = hh.load(); hh.quarantine(d, "evc48", "wedged", "verify"); d["nodes"]["evc48"]["last_check"] = time.time(); hh.save(d)
 wdb({}); wq({})
 hs.run_one_cycle(); hs._excl_thread.join(5)
-chk("the scheduler pushes the quarantine list in the background", "ExcNodeList=evc[1-3],evc48" in open(_upd).read())
+chk("the scheduler pushes the quarantine list in the background", "ExcNodeList=evc1,evc2,evc3,evc48" in open(_upd).read())
 os.remove(_upd); hs.run_one_cycle()
 (hs._excl_thread and hs._excl_thread.join(5))
 chk("...once, not every cycle", not os.path.exists(_upd))
 os.remove(os.path.join(hs.HIVE_DIR, "mock_pending"))
 reset_health(); reset_sched_state()
+
+print("== red team, round 1: regressions for what it found ==")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close()
+import subprocess as _sp2, argparse as _apR, io as _ioR, contextlib as _clR
+def _rc(fn, *a, **k):
+    out = _ioR.StringIO()
+    try:
+        with _clR.redirect_stdout(out), _clR.redirect_stderr(out):
+            fn(*a, **k)
+        return None, out.getvalue()
+    except SystemExit as e:
+        return e.code, out.getvalue()
+def _nsR(**kw):
+    base = dict(cmd_or_file="true", workdir=None, priority=None, name=None, owner=None, need_mb=None,
+                gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
+                after_any=None, array=None, max_running=None, allow_slow=None, quiet=False)
+    base.update(kw); return _apR.Namespace(**base)
+def _new():
+    return max(rq().values(), key=lambda t: t["id"])
+def _bad(fn, *a):
+    try: fn(*a); return False
+    except ValueError: return True
+
+# durations: the whole string has to parse
+chk("1.5h is 1.5 hours (was read as 5h)", hq.parse_duration("1.5h") == 5400 and hq.parse_duration("0.5h") == 1800)
+chk("2h30m / 90 / 1-12:00:00 still parse",
+    hq.parse_duration("2h30m") == 9000 and hq.parse_duration("90") == 90 and hq.parse_duration("1-12:00:00") == 129600)
+chk("garbage is refused, not half-read",
+    all(hq.parse_duration(x) is None for x in ("100ms", "2h30", "-5m", "1h30", "h", "5x")))
+wq({})
+chk("--timeout that does not parse is an error", _rc(hq.cmd_submit, _nsR(timeout="100ms"))[0] == 2)
+
+# --need-mb auto never exceeds the card
+for i, pk in enumerate((76000, 77000, 78000)):
+    ev.record("finish", task=800 + i, name="huge", state="done", run_secs=100, gpu_peak_mb=pk)
+wdb({"700": node("n", 72000)})                                  # an 81920 MiB card
+_n, _ = hq.history_need_mb("huge")
+chk("--need-mb auto is capped below the largest card", 77000 <= _n <= 81920 - hq.NEED_MB_IDLE_USED)
+
+# wait on several: ids that never existed, and removed tasks
+wq({"290": dict(task(290, name="okk", state="done"), exit_code=0, duration_secs=5)})
+ev.record("finish", task=291, name="gone_bad", state="failed", exit_code=7, run_secs=5)
+_c, _o = _rc(hq.cmd_wait_many, _apR.Namespace(interval=0.2, pending_timeout=0), [290, 9998])
+chk("an id that never existed: exit 2, said so", _c == 2 and "not found" in _o)
+_c, _o = _rc(hq.cmd_wait_many, _apR.Namespace(interval=0.2, pending_timeout=0), [290, 291])
+chk("a failed task that was removed still counts as failed", _c == 1 and "ended failed" in _o)
+many = {str(i): dict(task(i, name="m", state="failed"), exit_code=1, duration_secs=1) for i in range(300, 500)}
+wq(many)
+_c, _o = _rc(hq.cmd_wait_many, _apR.Namespace(interval=0.2, pending_timeout=0), list(range(300, 500)))
+chk("200 failed tasks: summary lists 10 ids, not 200", _o.splitlines()[-1].count("#") == 10 and "+190" in _o)
+wq({"510": dict(task(510, name="stuck"), pending_reason="insufficient_walltime"),
+    "511": dict(task(511, name="stuck"), pending_reason="insufficient_walltime")})
+_c, _o = _rc(hq.cmd_wait_many, _apR.Namespace(interval=0.2, pending_timeout=0.6), [510, 511])
+chk("a wait on tasks that cannot start says why", _c == 75 and "2 × insufficient_walltime" in _o)
+
+# submit output / --quiet / --after aN / flag conflicts
+json.dump({"version": 1, "next_id": 520, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_c, _o = _rc(hq.cmd_submit, _nsR(name="sw", array="0-2", owner="o"))
+chk("array submit prints exactly one #id (the documented capture)", re.findall(r"#(\d+)", _o) == ["520"])
+_c, _o = _rc(hq.cmd_submit, _nsR(name="rep", after="a520"))
+t = _new()
+chk("--after a520 waits for every member of the array", t["depends_on"] == [520, 521, 522]
+    and re.findall(r"#(\d+)", _o) == [str(t["id"])])
+_c, _o = _rc(hq.cmd_submit, _nsR(name="one", after="520"))
+chk("--after <array id> alone says it is ONE task", "--after a520" in _o and _new()["depends_on"] == [520])
+_b = _ioR.StringIO()
+with _clR.redirect_stdout(_b), _clR.redirect_stderr(_ioR.StringIO()):
+    hq.cmd_submit(_nsR(name="q", quiet=True, est_runtime="auto"))
+chk("--quiet prints the id and nothing else", _b.getvalue().strip() == str(_new()["id"]))
+chk("--after with --after-any is refused", _rc(hq.cmd_submit, _nsR(after="520", after_any="521"))[0] == 2)
+os.environ["HIVE_NOTIFY"] = "echo default-hook"
+_rc(hq.cmd_submit, _nsR(name="nohook", notify=""))
+chk("--notify '' switches the default hook off", _new()["notify"] == "")
+os.environ.pop("HIVE_NOTIFY")
+open(os.path.join(hs.HIVE_DIR, "d.hive"), "w").write(
+    "  #HIVE name=ind\n#HIVE timeout=90m  # 1.5 hours max\n#HIVE notify=echo a # b\n#HIVE allow_slow=maybe\necho x\n")
+_pf = hq.parse_hive_file(os.path.join(hs.HIVE_DIR, "d.hive"))
+chk("directive: indented is read, trailing remark is dropped, notify keeps its #",
+    _pf.get("name") == "ind" and _pf.get("timeout") == "90m" and _pf.get("notify") == "echo a # b"
+    and _pf["cmd"] == "echo x")
+chk("#HIVE allow_slow=maybe is an error, not a silent no",
+    _rc(hq.cmd_submit, _nsR(cmd_or_file=os.path.join(hs.HIVE_DIR, "d.hive")))[0] == 2)
+chk("hive wait --array by a member id", [t["id"] for t in hq.resolve_array(json.load(open(hs.QUEUE_FILE)), 521)] == [520, 521, 522])
+
+# limits are checked before expanding
+_t0 = time.time()
+chk("--array 0-999999999 is refused at once", _bad(hq.parse_array, "0-999999999") and time.time() - _t0 < 0.5)
+_t0 = time.time()
+chk("evc[1-999999999] is refused at once", _bad(hh.expand_nodes, "evc[1-999999999]") and time.time() - _t0 < 0.5)
+chk("reversed range and non-names are errors", _bad(hh.expand_nodes, "evc[5-1]") and _bad(hh.expand_nodes, "evc1;rm"))
+chk("spaces separate node names too", hh.expand_nodes("evc1 evc2") == ["evc1", "evc2"])
+
+# the owner's cap is the owner's
+json.dump({"version": 1, "next_id": 540, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="free1", owner="ag", cmd_or_file="sleep 1.5"))
+_rc(hq.cmd_submit, _nsR(name="capped", owner="ag", max_running=1, cmd_or_file="sleep 1.5"))
+_rc(hq.cmd_submit, _nsR(name="free2", owner="ag", cmd_or_file="sleep 1.5"))
+wdb({str(700 + i): node(f"n{i}", 72000) for i in range(3)})
+hs.run_one_cycle()
+chk("one capped task caps the whole owner", [rq()[k]["state"] for k in ("540", "541", "542")] == ["running", "pending", "pending"])
+for k in (540, 541, 542): _rc(hq.cmd_cancel, _apR.Namespace(id=k, array=None))
+hs.run_one_cycle()
+
+# cascade in one cycle although the dependants have the HIGHER priority
+json.dump({"version": 1, "next_id": 550, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="A", cmd_or_file="exit 3"))
+_rc(hq.cmd_submit, _nsR(name="B", after="550", priority=5))
+_rc(hq.cmd_submit, _nsR(name="C", after="551", priority=10))
+_rc(hq.cmd_submit, _nsR(name="D", after="552", priority=20))
+wdb({"700": node("n0", 72000)})
+hs.run_one_cycle(); time.sleep(0.6); hs.run_one_cycle()
+chk("failure reaches the end of the chain in ONE cycle",
+    [rq()[k].get("fail_reason") for k in ("551", "552", "553")] == ["dependency_failed"] * 3)
+
+# cancel always goes through the scheduler when there is one; hooks fire
+clear_notified()
+wq({"560": dict(task(560, name="runs", state="running", jid="700", node="n0", st=loc(-30)), notify=_hook, srun_pid=None),
+    "561": dict(task(561, name="waits"), notify=_hook)})
+open(os.path.join(hs.HEARTBEAT_DIR, "560"), "w").write("x")
+t = rq(); t["560"]["started_ts"] = time.time() - 30; wq(t)
+_rc(hq.cmd_cancel, _apR.Namespace(id=560, array=None)); _rc(hq.cmd_cancel, _apR.Namespace(id=561, array=None))
+chk("running: cancel is a request to the scheduler", rq()["560"]["state"] == "running" and rq()["560"].get("cancel_requested"))
+hs.run_one_cycle()
+_n = sorted(notified())
+chk("both cancels fire the hook (running and pending)",
+    len(_n) == 2 and _n[0].startswith("560 finish cancelled") and _n[1].startswith("561 finish cancelled"))
+chk("the running one has its run time recorded", isinstance(rq()["560"].get("duration_secs"), int))
+clear_notified()
+
+# notify: bounded, scrubbed environment
+os.environ["SECRET_OF_AGENT_A"] = "s3cret"; os.environ["HIVE_OWNER"] = "agentA"
+_ef = os.path.join(hs.HIVE_DIR, "hookenv.txt")
+hs.notify(dict(task(570, name="e", state="done"), owner="agentB",
+               notify=f'echo "[$SECRET_OF_AGENT_A][$HIVE_OWNER][$HIVE_TASK_ID]" > {_ef}'), "finish")
+for _ in range(30):
+    if os.path.exists(_ef) and open(_ef).read().strip(): break
+    time.sleep(0.1)
+chk("the hook gets the task's owner, not the scheduler's environment", open(_ef).read().strip() == "[][agentB][570]")
+os.environ.pop("SECRET_OF_AGENT_A"); os.environ.pop("HIVE_OWNER")
+hs._notify_running.clear(); hs._notify_waiting.clear()
+for i in range(40):
+    hs.notify(dict(task(600 + i, name="f", state="failed"), notify="sleep 2"), "finish")
+chk("at most NOTIFY_MAX_PARALLEL hooks run at once; the rest wait",
+    len(hs._notify_running) == hs.NOTIFY_MAX_PARALLEL and len(hs._notify_waiting) == 40 - hs.NOTIFY_MAX_PARALLEL)
+for p_ in hs._notify_running: p_.kill()
+hs._notify_running.clear(); hs._notify_waiting.clear()
+
+# a command with a syntax error fails like any other command
+wdb({"700": node("n0", 72000)})
+wq({"580": dict(task(580, name="syn"), cmd="echo 'unbalanced quote"),
+    "581": dict(task(581, name="par", sub=loc(1)), cmd="echo open (")})
+wdb({"700": node("n0", 72000), "701": node("n1", 72000)})
+hs.run_one_cycle(); time.sleep(0.8); hs.run_one_cycle()
+chk("syntax error in the command -> failed with bash's exit code, footer written",
+    all(rq()[k]["state"] == "failed" and rq()[k]["exit_code"] in (1, 2) for k in ("580", "581"))
+    and "finished at" in open(rq()["580"]["log"]).read())
+
+# probe that cannot write a temp file: no verdict, no strike
+_pr = _sp2.run(["bash", "-c", "TMPDIR=/nonexistent-x; " + hh.full_probe_shell().replace("/tmp /dev/shm", "/nonexistent-y")],
+               capture_output=True, text=True, env=dict(os.environ, CUDA_VISIBLE_DEVICES="0"))
+chk("no writable temp dir -> unknown, not gpu_unresponsive",
+    "GPU_PROBE nowrite" in _pr.stdout and hh.parse_full_probe(_pr.stdout)[0] == "unknown"
+    and hh.parse_gpu_query(_pr.stdout.splitlines())[2] is None)
+chk("no predictable temp name is left in the probe", "hive_gpuq.$$" not in hh.full_probe_shell()
+    and "hive_cudap.$$" not in hh.full_probe_shell())
+
+# quarantined for a real fault: one slow-but-ok probe is not a way out
+reset_health(); reset_sched_state()
+d = hh.load(); hh.quarantine(d, "realbad", "agent says CUDA init dies", "agent", reporter="t")
+d["nodes"]["realbad"]["last_check"] = 0; hh.save(d)
+_hp = hs.health_probe; hs.health_probe = lambda jid: ("ok", "secs=146")
+wdb({"700": node("realbad", 72000)}); wq({}); hs.run_one_cycle()
+chk("an agent-reported node stays quarantined after a slow-ok probe",
+    hh.load()["nodes"]["realbad"]["state"] == "quarantined")
+hs.health_probe = _hp
+
+# index bug: quarantining a node must not make the loop skip the next one
+reset_health(); reset_sched_state()
+two = node("X", 72000); two["gpu"] = two["gpu"] * 2
+wdb({"701": node("X", 72000), "702": two, "703": dict(node("Y", 72000), gpu=two["gpu"])})
+d = hh.load(); hh.strike(d, "X", "earlier", "verify"); hh.save(d)      # X has one strike
+_lp = hs.live_probe
+hs.live_probe = lambda jid, **kw: ({"ok": False, "fault": "gpu_unresponsive"} if jid == "702"
+    else {"ok": True, "util": 0, "mem_used": 10, "mem_total": 81920, "cuda": "ok", "cuda_detail": ""})
+wq({"590": dict(task(590, name="two"), cmd="true", gpus=2)})
+hs.run_one_cycle(); hs.run_one_cycle(); time.sleep(0.3)
+chk("node X quarantined on its 2nd strike; the task lands on Y", hh.load()["nodes"]["X"]["state"] == "quarantined"
+    and rq()["590"].get("node") == "Y")
+chk("drop_node keeps the index on the right entry",
+    hs.drop_node([("a", {"node": "X"}, 0), ("b", {"node": "Y"}, 0)], "X", 1) == 0)
+# a clean verify forgives old strikes
+reset_health(); reset_sched_state()
+d = hh.load(); hh.strike(d, "okn", "one slow answer", "verify"); hh.save(d)
+wdb({"700": node("okn", 72000)}); wq({"591": dict(task(591, name="c"), cmd="true")})
+hs.run_one_cycle(); time.sleep(0.3)
+chk("a clean verify probe clears earlier verify strikes", hh.load()["nodes"]["okn"]["strikes"] == 0)
+hs.live_probe = _lp
+
+# one scheduler per cluster
+open(hs.SCHED_PID, "w").write(f"4242\notherhost\n"); open(hs.SCHED_HB, "w").write("x")
+chk("a live scheduler on another host is seen", hs.another_scheduler() == (4242, "otherhost"))
+_old = time.time() - 600; os.utime(hs.SCHED_HB, (_old, _old))
+chk("...a stale one is not", hs.another_scheduler() is None)
+open(hs.SCHED_PID, "w").write(f"{os.getpid()}\n{hs.socket.gethostname()}\n")
+chk("our own pid file is not 'another scheduler'", hs.another_scheduler() is None)
+open(hs.SCHED_PID, "w").write("999999\notherhost\n"); open(hs.SCHED_HB, "w").write("x")
+
+# a stop request waits for the pass to end
+hs._stop_requested = False; hs._in_cycle = True
+_sd = []; _rs = hs.shutdown; hs.shutdown = lambda *a: _sd.append(a)
+hs.handle_signal(15, None)
+chk("SIGTERM inside a pass is deferred", hs._stop_requested is True and _sd == [])
+hs._in_cycle = False; hs.handle_signal(15, None)
+chk("SIGTERM between passes stops at once", len(_sd) == 1)
+hs._stop_requested = False; hs.shutdown = _rs
+
+# exclusions hive added are lifted when the node leaves quarantine
+open(os.path.join(hs.HIVE_DIR, "mock_pending"), "w").write("1")
+_no_excl = lambda: os.path.exists(hh.EXCL_FILE) and os.remove(hh.EXCL_FILE)
+_no_excl()
+hh.save_hive_excludes({"5001": ["evc2"]})            # hive had added evc2 to job 5001 (evc[1-3])
+_upd = os.path.join(hs.HIVE_DIR, "mock_scontrol_update.log")
+os.path.exists(_upd) and os.remove(_upd)
+_d = hh.sync_pending_excludes(set())                   # nothing quarantined any more
+chk("a node that left quarantine comes off the queued job's list",
+    _d.get("5001") == ([], ["evc2"]) and "JobId=5001 ExcNodeList=evc1,evc3" in open(_upd).read())
+os.remove(os.path.join(hs.HIVE_DIR, "mock_pending")); os.remove(_upd); _no_excl()
+
+# pool add: every form of the script's own exclude, and the config's
+hp2 = SourceFileLoader("hp2", os.path.join(LIB, "hive-pool")).load_module()
+_scr = os.path.join(hs.HIVE_DIR, "forms.slurm")
+open(_scr, "w").write('#!/bin/bash\n#SBATCH -p gpu -x evc7\n#SBATCH --partition=gpu --exclude="evc8,evc9"\n'
+                      '#SBATCH --exclude evc10   # remark\n##SBATCH --exclude=no1\n# #SBATCH -x no2\nsleep 1\n')
+chk("script excludes: several options per line, quotes, remarks",
+    hp2.script_excludes(_scr) == ["evc7", "evc8,evc9", "evc10"])
+chk("an exclude given as a JSON list is accepted",
+    hp2.build_exclude(_scr, None, [["evc50", "evc51"], None], False)[0] == "evc7,evc8,evc9,evc10,evc50,evc51")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
 
 print("== a dead scheduler is restarted by list / wait (feedback #18/#19) ==")
 _started = []
@@ -1057,7 +1310,7 @@ with _cl.redirect_stderr(_io.StringIO()):
     hq.is_sched_running = lambda: True
     chk("live scheduler -> nothing to do",
         hq.ensure_sched({"tasks": {"1": {"state": "pending"}}}, every=0) is False and _started == ["start"])
-hq.cmd_daemon, hq.is_sched_running = _real_daemon, _real_running
+hq.cmd_daemon, hq.is_sched_running = _real_daemon, _real_running   # (_real_daemon is the suite-wide stub)
 
 print("== phase 3: dependencies, arrays, concurrency caps ==")
 import argparse as _ap
@@ -1081,7 +1334,7 @@ chk("parse_id_list", hq.parse_id_list("12, 13 14,12") == [12, 13, 14] and _bad(h
 def _ns(**kw):
     base = dict(cmd_or_file="true", workdir=None, priority=None, name=None, owner=None, need_mb=None,
                 gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
-                after_any=None, array=None, max_running=None, allow_slow=None)
+                after_any=None, array=None, max_running=None, allow_slow=None, quiet=False)
     base.update(kw); return __import__("argparse").Namespace(**base)
 def _submit3(**kw):
     buf = _io.StringIO()

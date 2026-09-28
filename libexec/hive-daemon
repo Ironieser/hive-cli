@@ -141,14 +141,14 @@ probe_job() {
     # hive_health.py, which is the scheduler's copy of this. `GPU_PROBE granted=` is
     # the step's CUDA_VISIBLE_DEVICES: non-empty means SLURM gave this job a GPU.
     local probe_cmd
-    probe_cmd='MY_JOB=$SLURM_JOB_ID; echo "GPU_PROBE granted=${CUDA_VISIBLE_DEVICES:-}"; _o=$(mktemp 2>/dev/null || echo "/tmp/hive_gpuq.$$"); ( nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits >"$_o" 2>/dev/null; echo $? >"$_o.rc" ) </dev/null >/dev/null 2>&1 & _i=0; while [ ! -s "$_o.rc" ] && [ "$_i" -lt "${HIVE_GPU_QUERY_TICKS:-120}" ]; do sleep 0.5; _i=$((_i+1)); done; _H=; if [ -s "$_o.rc" ]; then cat "$_o"; else _H=1; echo "GPU_PROBE hung"; fi; rm -f "$_o" "$_o.rc"; echo "---PS---"; [ -n "$_H" ] || nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | sort -t, -k1,1 -u | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
+    probe_cmd='MY_JOB=$SLURM_JOB_ID; echo "GPU_PROBE granted=${CUDA_VISIBLE_DEVICES:-}"; _o=; for _d in "${TMPDIR:-}" /tmp /dev/shm; do [ -n "$_d" ] && [ -d "$_d" ] || continue; _t=$(mktemp -p "$_d" hive_probe.XXXXXXXX 2>/dev/null) || continue; if echo x >"$_t" 2>/dev/null && echo x >"$_t.rc" 2>/dev/null; then : >"$_t"; rm -f "$_t.rc"; _o=$_t; break; fi; rm -f "$_t" "$_t.rc"; done; [ -n "$_o" ] || { echo "GPU_PROBE nowrite"; exit 0; }; ( nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits >"$_o" 2>/dev/null; echo $? >"$_o.rc" ) </dev/null >/dev/null 2>&1 & _i=0; while [ ! -s "$_o.rc" ] && [ "$_i" -lt "${HIVE_GPU_QUERY_TICKS:-120}" ]; do sleep 0.5; _i=$((_i+1)); done; _H=; if [ -s "$_o.rc" ]; then cat "$_o"; else _H=1; echo "GPU_PROBE hung"; fi; rm -f "$_o" "$_o.rc"; echo "---PS---"; [ -n "$_H" ] || nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | sort -t, -k1,1 -u | while IFS=, read apid amem; do apid="${apid// /}"; amem="${amem// /}"; [[ -z "$apid" || ! "$apid" =~ ^[0-9]+$ ]] && continue; grep -q "/job_${MY_JOB}/" /proc/${apid}/cgroup 2>/dev/null || continue; etime=$(ps -p "$apid" -o etime --no-header 2>/dev/null | tr -d " "); args=$(ps -p "$apid" -o args --no-header 2>/dev/null); echo "$apid 0.0 0.0 ${etime:-0:00} $args"; done'
 
     # Run probe; retry once on transient failure (empty / non-zero / no ---PS---
     # marker). Distinguishes probe failure from a genuinely idle GPU (feedback OPT-A).
     local raw rc
     raw=$(timeout 150 srun --jobid="$jobid" --overlap -n1 --mem=0 \
         bash -c "$probe_cmd" 2>/dev/null); rc=$?
-    if [[ "$raw" != *"GPU_PROBE hung"* ]] \
+    if [[ "$raw" != *"GPU_PROBE hung"* && "$raw" != *"GPU_PROBE nowrite"* ]] \
             && [[ $rc -ne 0 || -z "$raw" || "$raw" != *"---PS---"* ]]; then
         sleep 1
         raw=$(timeout 150 srun --jobid="$jobid" --overlap -n1 --mem=0 \
@@ -157,7 +157,10 @@ probe_job() {
     # probe_detail says WHY a probe failed: gpu_unresponsive / no_gpu_devices are the
     # node's fault (the scheduler strikes it on verify), srun_failed is the step's.
     local probe_failed=0 probe_detail="" gpu_granted=""
-    if [[ "$raw" == *"GPU_PROBE hung"* ]]; then
+    if [[ "$raw" == *"GPU_PROBE nowrite"* ]]; then
+        # No writable temp dir on the node: the probe could not run. Not a verdict.
+        probe_failed=1; probe_detail="srun_failed"
+    elif [[ "$raw" == *"GPU_PROBE hung"* ]]; then
         probe_failed=1; probe_detail="gpu_unresponsive"
     elif [[ $rc -ne 0 || -z "$raw" || "$raw" != *"---PS---"* ]]; then
         probe_failed=1; probe_detail="srun_failed"

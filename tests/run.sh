@@ -16,7 +16,13 @@ PY="${HIVE_PYTHON:-}"
 [[ -z "$PY" ]] && PY="$(command -v python3 || true)"
 [[ -z "$PY" ]] && { echo "python3 not found (set HIVE_PYTHON)"; exit 2; }
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
+# The mock srun runs the dispatch wrapper locally, so its heartbeat and sampler loops
+# are local processes. A wrapper that did not end normally (a task the test cancelled
+# or timed out) leaves them looping forever on a deleted directory — 119 of them had
+# piled up on the login node. Every one carries $TMP in its command line.
+cleanup() { pkill -f "$TMP/" 2>/dev/null; sleep 0.3; pkill -9 -f "$TMP/" 2>/dev/null; rm -rf "$TMP"; }
+trap cleanup EXIT
 mkdir -p "$TMP/bin" "$TMP/hive/heartbeat" "$TMP/hive/logs"
 
 # ── mock SLURM ────────────────────────────────────────────────────────────────

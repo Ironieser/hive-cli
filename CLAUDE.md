@@ -172,7 +172,21 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   a full pass again, on the queue as reloaded, and dispatches from `probe_cache`. Pass 2
   never probes: a task whose node is rejected there shows `verifying_node` and is tried
   next cycle. Everything in `_cycle` must therefore be safe to run twice in a row.
+- **One scheduler per cluster, and it says so itself.** The heartbeat is written by its
+  own thread every 15 s, never per cycle: it must mean "the process is alive", because
+  `hive list` / `hive wait` start a scheduler when it looks dead (`ensure_sched`).
+  `hive-sched` also refuses to start next to a live one (`another_scheduler`).
+- **The scheduler stops between passes, not inside one** (`handle_signal` defers while
+  `_in_cycle`). Events and notify hooks fire during a pass, the queue and the health
+  list are saved at its end; `hive queue daemon stop` waits for the process to go.
+- **A running task is cancelled by the scheduler, also on the same host** — that is
+  where run time, GPU usage and the notify hook are recorded. The CLI kills srun itself
+  only when no scheduler is running.
+- **Red-team findings are regression tests** (`tests/test_hive.py`, "red team" section).
+  The mock srun runs wrappers locally: `tests/run.sh` kills what they leave behind.
 - **A task's finish time is its exit file's mtime**, not the cycle that noticed it.
+- **`--max-running` caps the owner, not the task**: the lowest cap among the owner's
+  pending and running tasks applies to all of them.
 - **Dependencies and concurrency caps are gates that need no node.** They are checked
   before the candidate loop (`waiting_for_dependency`, `array_limit`, `owner_limit`),
   never consume a candidate, and do not count towards the starvation watchdog. A
