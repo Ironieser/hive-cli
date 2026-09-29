@@ -441,6 +441,12 @@ open(_lp, "w").write("x\n" * 50 + "torch.AcceleratorError: CUDA error: CUDA-capa
 chk("log tail classifier finds the CUDA-init signature", hh.classify_log_tail(_lp) is not None)
 open(_lp, "w").write("Traceback\nKeyError: 'foo'\n")
 chk("...and ignores an ordinary crash", hh.classify_log_tail(_lp) is None)
+open(_lp, "w").write("(EngineCore_DP0) AssertionError\nRuntimeError: Engine core initialization failed. "
+                     "See root cause above. Failed core proc(s): {}\n")
+chk("vLLM's generic 'Engine core initialization failed' is not a node fault",
+    hh.classify_log_tail(_lp) is None)
+open(_lp, "w").write("RuntimeError: CUDA unknown error\nRuntimeError: Engine core initialization failed.\n")
+chk("...unless a real CUDA error stands next to it", hh.classify_log_tail(_lp) is not None)
 
 # (1) agent report -> quarantined -> scheduler never picks its hold jobs
 data = hh.load(); hh.quarantine(data, "badnode", "agent says CUDA init dies", "agent", reporter="t"); hh.save(data)

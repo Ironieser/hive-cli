@@ -69,7 +69,13 @@ CUDA_FAULT_PATTERNS = [
     r"CUDA driver initialization failed",
     r"Setting the available devices to be zero",
     r"no CUDA-capable device is detected",
-    r"Engine core initialization failed",
+    # NOT "Engine core initialization failed": vLLM prints that for ANY failure while
+    # the engine starts — an AssertionError in its CUDA-graph capture, a model that does
+    # not fit, a bad argument. On 2026-09-28 seven tasks of one campaign failed that
+    # way on healthy nodes, each a strike; two in a row would have quarantined evc102
+    # with both its hold jobs. When the node really is at fault the log carries one of
+    # the CUDA errors above as well, and verify-before-dispatch creates a CUDA context
+    # on the node before any task gets there.
 ]
 _CUDA_FAULT_RE = re.compile("|".join(f"(?:{p})" for p in CUDA_FAULT_PATTERNS))
 
