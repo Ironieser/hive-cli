@@ -116,7 +116,7 @@ Asked for on 2026-09-28: "is there a way to request and schedule CPUs for CPU ta
 | E2b | CPU slots: hive binds each task to cores of its own (`taskset`) — SLURM gives every step of a job the same cores | done |
 | E6 | red team round 1: 2 reviewers, 24 findings (3 high) — fixed: dispatch onto an expired CPU hold job, autoscale not counting hold jobs, GPU tasks held back by CPU counting, GPU task starved by CPU tasks, preemption without room, memory per CPU, display. Not fixed: `--same-node` gangs of `--gpus 0` (refused at submit anyway); slow nodes with only a CPU hold job are not re-checked (as before) | done |
 | E6b | red team round 2: 10 findings (2 high) — fixed: the step-aside rule held CPU tasks behind GPU tasks that could not run (one case a deadlock); `--gpus 0 --cpus N` with N = all CPUs never ran; GPU probes nobody needed; record changing kind between passes; partial binding reported as done; `cpu_only` needs SLURM and probe to agree; autoscale looks at TresPerNode/Gres too. Not fixed: tasks already running at upgrade hold no CPU slots (transient); tasks without `--cpus` on a GPU hold job are not bound | done |
-| E7 | live validation | see below |
+| E7 | live validation | done 2026-09-28, 8-CPU hold job on evc21: SLURM puts every step of a job on the same cores (two 3-CPU steps both on 14,16,18; with or without --overlap / --exact); with hive's binding ten 1-CPU tasks → eight at once on the hold job, each on a core of its own (9,11,13,14,15,16,18,28), two overflowed to an idle GPU hold job; `--cpus 3` → cores 9,11,13, nproc 3; `--cpus 16` → note at submit, `insufficient_cpus`; running GPU tasks survived the restart |
 
 ## C. Housekeeping
 
