@@ -48,7 +48,7 @@ A node enters quarantine when creating a CUDA context on it fails — the pre-di
 verify probe does this every time, and `hive health check` does it on demand — or after
 two tasks died there within 3 min with a CUDA-init signature (`CUDA-capable device(s)
 is/are busy or unavailable`, `cudaErrorDevicesUnavailable`, `CUDA unknown error`,
-`Engine core initialization failed`, …). Reasons this happens: another user's job holds
+`no CUDA-capable device is detected`, …). Reasons this happens: another user's job holds
 the card outside your cgroup, a wedged driver, a hold job that got no visible device.
 
 While quarantined the node receives no tasks. Every 10 min the scheduler creates a CUDA
@@ -71,3 +71,7 @@ Anything that looks like a hive bug or a missing feature: `hive feedback "…"` 
 or `hive feedback submit --title … --severity high --tags scheduler --task 123 --file
 notes.md`. It auto-attaches the hive version, queue/node snapshots and the tail of the
 named task logs, and lands in the maintainer's checkout for triage.
+
+vLLM's `Engine core initialization failed` alone is NOT a node fault: it is printed for
+every failure while the engine starts (an assertion in its CUDA-graph capture, a model
+that does not fit the card, a wrong argument). Read the traceback above it in the log.
