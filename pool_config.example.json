@@ -25,6 +25,10 @@
     "highgpu": {
       "script": "~/1_gpu.slurm",
       "description": "High-end GPU partition"
+    },
+    "cpu": {
+      "script": "~/1_cpu_hold.slurm",
+      "description": "No GPU (no --gres): for `hive submit --gpus 0` tasks, as many at once as it has CPUs"
     }
   }
 }

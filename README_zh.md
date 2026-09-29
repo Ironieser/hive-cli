@@ -175,6 +175,7 @@ hive submit --nodes 4 'python ddp.py --rank $HIVE_GANG_RANK'   # 4 个节点，�
 hive submit --nodes 2 --same-node 'python ddp.py …'            # 2 个 hold job，可以在同一节点上
 hive submit --timeout 2h --notify 'curl -d "$HIVE_TASK_NAME $HIVE_TASK_STATE" URL' "python x.py"
 hive submit --gpus 2 --cpus 4 --mem 32000 "python x.py"        # GPU 数、CPU 数、内存 (MiB)
+hive submit --gpus 0 --cpus 8 "python preprocess.py"           # CPU 任务：跑在无 GPU 的 hold job 上，按 CPU 数记账
 hive submit --begin 08:00 --warn-before 10m "python x.py"      # 8 点后才启动；节点到期前 10 分钟发 SIGUSR1
 hive submit --priority 9 --preempt "python urgent.py"          # 可以挤掉 --preemptible 的任务
 hive submit --preemptible --est-runtime 12h "python long.py"   # 同意被挤掉并重新排队

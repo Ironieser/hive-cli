@@ -114,6 +114,8 @@ node_monitor.json    # DB written by daemon/poll (+ hive-dbpost), read by nodes/
       # jobs named cursor_ssh_proxy / hive_canary (health monitor) are never listed
       "gpu_idle_since": null,                            # busy→idle grace timer
       "carried_forward": true,                           # (optional) last-good reused after a probe miss
+      "cpus": 4, "mem_mb": 131072,                       # what SLURM gave the hold job (squeue %C, %m); null = unknown → not limited
+      "cpu_only": false,                                 # the job asked for no GPU (squeue %b): takes --gpus 0 tasks only, never probed for one
       "time_left_secs": 79200,                           # remaining hold-job walltime (squeue %L); -1=unlimited, null=unknown
       "polled_at": "ISO8601"
     }

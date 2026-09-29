@@ -2672,14 +2672,36 @@ class _P:
     pid = 424242
     def __init__(self, argv, **kw): _argv.append(argv)
 hs.subprocess.Popen = _P
-hs.dispatch_task(dict(ctask(2090), cpu_hold_job=True), "900", "c0")
-hs.dispatch_task(dict(ctask(2091), cpu_hold_job=True, cpus=3), "900", "c0")
-hs.dispatch_task(dict(ctask(2092), cpu_hold_job=False), "700", "g0")
+hs.dispatch_task(dict(ctask(2090), cpu_slots=[0]), "900", "c0")
+hs.dispatch_task(dict(ctask(2091), cpu_slots=[1, 2, 3], cpus=3), "900", "c0")
+hs.dispatch_task(dict(ctask(2092), cpus=2), "700", "g0")
 hs.subprocess.Popen = _popen
 hs._task_children.discard(424242)
-chk("on a hold job without a GPU a task is limited to the CPUs it is counted as",
-    "--cpus-per-task=1" in _argv[0] and "--cpus-per-task=3" in _argv[1]
-    and not any(a.startswith("--cpus") for a in _argv[2]))
+chk("a task with CPU slots is bound by the wrapper, its step is not narrowed by SLURM",
+    not any(a.startswith("--cpus") for a in _argv[0] + _argv[1])
+    and "for _i in 1 2 3;" in _argv[1][-1] and "taskset -cp" in _argv[0][-1])
+chk("one without (hold job of unknown size) keeps --cpus-per-task", "--cpus-per-task=2" in _argv[2])
+chk("pick_cpu_slots: the first free ones, or None",
+    hs.pick_cpu_slots(8, {0, 2}, 3) == [1, 3, 4] and hs.pick_cpu_slots(4, {0, 1, 2}, 2) is None)
+
+# the binding itself, run for real: two tasks, two different cores
+import subprocess as _sp
+_cores = sorted(os.sched_getaffinity(0))
+if len(_cores) >= 2 and _sp.run("command -v taskset", shell=True, capture_output=True).returncode == 0:
+    reset_sched_state()
+    wdb({"900": cpunode("c0", cpus=len(_cores))})
+    wq({"2095": dict(ctask(2095), cmd="grep Cpus_allowed_list /proc/self/status; echo n=$(nproc) h=$HIVE_CPUS"),
+        "2096": dict(ctask(2096, cpus=1), cmd="grep Cpus_allowed_list /proc/self/status; echo n=$(nproc) h=$HIVE_CPUS")})
+    hs.run_one_cycle(); time.sleep(1.5); hs.run_one_cycle()
+    _logs = [open(rq()[k]["log"]).read() for k in ("2095", "2096")]
+    _got = [re.search(r"Cpus_allowed_list:\s*(\S+)", l) for l in _logs]
+    chk("two tasks on one hold job are bound to two different cores",
+        all(_got) and [g.group(1) for g in _got] == [str(_cores[0]), str(_cores[1])])
+    chk("...each sees one CPU, and says so in its log",
+        all("n=1 h=1" in l and "bound to cores" in l for l in _logs))
+    chk("...holding different CPU slots", [rq()[k]["cpu_slots"] for k in ("2095", "2096")] == [[0], [1]])
+else:
+    print("  [skip] CPU binding test: fewer than 2 cores or no taskset here")
 hs.live_probe = _lp_real
 
 fresh("6000|RUNNING|6-00:00:00|n0|gres/gpu:1\n6001|RUNNING|6-00:00:00|n1|N/A\n6002|PENDING|7-00:00:00||gres/gpu:h100:1\n")

@@ -1013,15 +1013,31 @@ def is_cpu_hold_job(info):
 
 
 def cpu_mem_in_use(tasks):
-    """({jid: CPUs}, {jid: MB}) held by the running tasks."""
-    cpus, mem = {}, {}
+    """({jid: CPUs}, {jid: MB}, {jid: CPU slots}) held by the running tasks.
+
+    Counting is not enough: SLURM gives every step of a job the SAME cores, whether it
+    overlaps or not (measured: two 3-CPU steps both on cores 14,16,18 of an 8-CPU hold
+    job), so eight one-CPU tasks would have shared one core. A task therefore also holds
+    CPU SLOTS — positions in the hold job's list of cores — and the wrapper binds it to
+    them. A task without `cpu_slots` is not bound and is only counted."""
+    cpus, mem, slots = {}, {}, {}
     for t in tasks.values():
         if t.get("state") != "running" or not t.get("slurm_jobid"):
             continue
         jid = t["slurm_jobid"]
         cpus[jid] = cpus.get(jid, 0) + task_cpus(t)
         mem[jid] = mem.get(jid, 0) + task_mem(t)
-    return cpus, mem
+        try:
+            slots.setdefault(jid, set()).update(int(c) for c in (t.get("cpu_slots") or ()))
+        except (TypeError, ValueError):
+            pass
+    return cpus, mem, slots
+
+
+def pick_cpu_slots(have, taken, want):
+    """The first `want` of the hold job's `have` CPU slots that no task holds, or None."""
+    free = [c for c in range(have) if c not in taken]
+    return free[:want] if len(free) >= want else None
 
 
 def drop_node(candidates, node, i):
@@ -1224,6 +1240,31 @@ def dispatch_task(task, slurm_jobid, node_name):
             f'echo "=== gpus: requested 0 — all GPUs hidden ===" >> {lf}\n'
         )
 
+    # ── CPU binding ───────────────────────────────────────────────────────────
+    # The task's CPU slots are positions in the list of cores the step may use (the
+    # hold job's). SLURM does not keep the steps of a job apart, so this does.
+    cpu_line = ""
+    if task.get("cpu_slots"):
+        picks = " ".join(str(int(c)) for c in task["cpu_slots"])
+        cpu_line = (
+            "_HIVE_ALL=$(taskset -cp $$ 2>/dev/null | sed 's/.*: *//')\n"
+            "_HIVE_L=()\n"
+            'for _p in ${_HIVE_ALL//,/ }; do case "$_p" in\n'
+            '  *-*) for ((_c=${_p%-*}; _c<=${_p#*-}; _c++)); do _HIVE_L+=("$_c"); done;;\n'
+            '  *) _HIVE_L+=("$_p");; esac; done\n'
+            '_HIVE_B=""\n'
+            f'for _i in {picks}; do [ -n "${{_HIVE_L[$_i]:-}}" ] && '
+            '_HIVE_B="${_HIVE_B:+$_HIVE_B,}${_HIVE_L[$_i]}"; done\n'
+            'if [ -n "$_HIVE_B" ] && taskset -cp "$_HIVE_B" $$ >/dev/null 2>&1; then\n'
+            f'  echo "=== cpus: {len(task["cpu_slots"])}, bound to cores [$_HIVE_B] '
+            f'(hold job has [$_HIVE_ALL]) ===" >> {lf}\n'
+            'else\n'
+            f'  echo "=== cpus: {len(task["cpu_slots"])} wanted, but the task could not be bound '
+            f'to cores (hold job has [$_HIVE_ALL]); it shares them ===" >> {lf}\n'
+            'fi\n'
+            f'export HIVE_CPUS={len(task["cpu_slots"])}\n'
+        )
+
     # What the command can know about itself. HIVE_ARRAY_INDEX is how one command
     # line becomes a sweep: `python train.py --seed $HIVE_ARRAY_INDEX`.
     env_line = (f"export HIVE_TASK_ID={q(str(task_id))} "
@@ -1307,7 +1348,7 @@ def dispatch_task(task, slurm_jobid, node_name):
         f"  echo 1 > {xf}\n"
         f"  exit 1\n"
         f"fi\n"
-        + gpu_line + env_line +
+        + gpu_line + cpu_line + env_line +
         # ── Heartbeat process (disowned to suppress bash "Terminated" noise) ───
         f"( trap '' USR1; while true; do date -Iseconds > {hb}; sleep 30; done ) &\n"
         f"_HB_PID=$!\n"
@@ -1340,12 +1381,10 @@ def dispatch_task(task, slurm_jobid, node_name):
     # so it can never be given more than the hold job has. Without them, as before:
     # all of the hold job's CPUs, shared, and no memory limit of its own.
     step = ["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1"]
-    if task.get("cpus"):
+    # A task with CPU slots is bound to its cores by the wrapper, and its step is given
+    # all of the hold job's: `--cpus-per-task=N` would give every task the same N cores.
+    if task.get("cpus") and not task.get("cpu_slots"):
         step.append(f"--cpus-per-task={int(task['cpus'])}")
-    elif task.get("cpu_hold_job"):
-        # On a hold job without a GPU the tasks are counted by their CPUs, so one that
-        # did not say how many gets the one it is counted as.
-        step.append(f"--cpus-per-task={DEFAULT_TASK_CPUS}")
     step.append(f"--mem={int(task['mem_mb'])}M" if task.get("mem_mb") else "--mem=0")
     proc = subprocess.Popen(
         step + ["bash", "-c", wrapper],
@@ -1935,7 +1974,7 @@ def _cycle(probe_cache, final):
         # patched up along the way: with several tasks on one hold job, one of them
         # finishing must not make the hold job look free.
         used_slots, full_jids = slots_in_use(tasks)
-        used_cpus, used_mem = cpu_mem_in_use(tasks)
+        used_cpus, used_mem, used_cpu_slots = cpu_mem_in_use(tasks)
         running_jobids = set(used_slots) | full_jids | {
             t["slurm_jobid"] for t in tasks.values()
             if t["state"] == "running" and t.get("slurm_jobid")}
@@ -2242,6 +2281,16 @@ def _cycle(probe_cache, final):
                         reason = "waiting_for_cpu"
                         i += 1
                         continue
+                # Which cores: for a task that said how many it wants, and for every
+                # task on a hold job without a GPU. One that did not say, on a GPU hold
+                # job, shares all of that hold job's cores, as it always has.
+                cpu_slots = None
+                if have_cpus is not None and (task.get("cpus") or cpu_only):
+                    cpu_slots = pick_cpu_slots(have_cpus, used_cpu_slots.get(jid, ()), want_cpus)
+                    if cpu_slots is None:
+                        reason = "waiting_for_cpu"
+                        i += 1
+                        continue
                 if have_mem is not None and want_mem:
                     if want_mem > have_mem:
                         reason = "insufficient_ram"
@@ -2431,6 +2480,7 @@ def _cycle(probe_cache, final):
                 taken.update(slots)
                 used_cpus[jid] = used_cpus.get(jid, 0) + want_cpus
                 used_mem[jid] = used_mem.get(jid, 0) + want_mem
+                used_cpu_slots.setdefault(jid, set()).update(cpu_slots or ())
                 popped = None
                 if want_gpus <= 0:
                     # A hold job that says how many CPUs it has stays: it takes the
@@ -2446,7 +2496,7 @@ def _cycle(probe_cache, final):
                     candidates[i] = (jid, info, needs_verify and "_live" not in info)
                 return {"jid": jid, "node": info.get("node", "?"), "slots": slots, "used": used,
                         "node_left": node_left, "is_slow": is_slow, "popped": popped,
-                        "cpus": want_cpus, "mem": want_mem, "cpu_only": cpu_only}, None
+                        "cpus": want_cpus, "mem": want_mem, "cpu_slots": cpu_slots}, None
             return None, reason
 
         def release(choice):
@@ -2454,6 +2504,7 @@ def _cycle(probe_cache, final):
             used_slots.get(choice["jid"], set()).difference_update(choice["slots"])
             used_cpus[choice["jid"]] = max(0, used_cpus.get(choice["jid"], 0) - choice["cpus"])
             used_mem[choice["jid"]] = max(0, used_mem.get(choice["jid"], 0) - choice["mem"])
+            used_cpu_slots.get(choice["jid"], set()).difference_update(choice["cpu_slots"] or ())
             if choice["popped"]:
                 at, entry = choice["popped"]
                 candidates.insert(min(at, len(candidates)), entry)
@@ -2477,7 +2528,7 @@ def _cycle(probe_cache, final):
             task["dispatched_at"] = now_iso()
             task["started_ts"]   = task["dispatched_ts"] = now_ts()
             task["gpu_slots"]    = slots
-            task["cpu_hold_job"] = bool(choice.get("cpu_only"))
+            task["cpu_slots"]    = choice.get("cpu_slots")
             task["node_time_left_secs"] = node_left
             task["node_slow_init_secs"] = (health["nodes"].get(node_name, {})
                                            .get("slow_init_secs") if choice["is_slow"] else None)
@@ -2491,6 +2542,7 @@ def _cycle(probe_cache, final):
                 task["slurm_jobid"] = task["node"] = task["srun_pid"] = None
                 task["started_at"] = task["started_ts"] = task["dispatched_ts"] = None
                 task.pop("gpu_slots", None)
+                task.pop("cpu_slots", None)
                 task["pending_reason"] = "dispatch_error"
                 save_queue(queue, lfd)
                 return False

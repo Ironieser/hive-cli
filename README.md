@@ -192,6 +192,7 @@ hive submit --nodes 4 'python ddp.py --rank $HIVE_GANG_RANK'   # 4 nodes, starte
 hive submit --nodes 2 --same-node 'python ddp.py …'            # 2 hold jobs, may be on one node
 hive submit --timeout 2h --notify 'curl -d "$HIVE_TASK_NAME $HIVE_TASK_STATE" URL' "python x.py"
 hive submit --gpus 2 --cpus 4 --mem 32000 "python x.py"        # cards, CPUs, memory (MiB)
+hive submit --gpus 0 --cpus 8 "python preprocess.py"           # CPU task: on a hold job without a GPU, by CPUs
 hive submit --begin 08:00 --warn-before 10m "python x.py"      # not before 8; SIGUSR1 10 min before the node expires
 hive submit --priority 9 --preempt "python urgent.py"          # may stop a --preemptible task
 hive submit --preemptible --est-runtime 12h "python long.py"   # agrees to be stopped and requeued

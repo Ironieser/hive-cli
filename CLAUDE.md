@@ -256,6 +256,21 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
 - **`--nodelist` / `--partition` are task-level gates** (`allowed_here`, reason
   `waiting_for_node`), checked before the probe and in `fits_hold_job`, so a preemptor
   never stops a victim on a node it may not use.
+- **CPUs and memory are counted, per hold job, from the tasks.** The pollers record what
+  SLURM gave a hold job (`cpus`, `mem_mb`, `cpu_only` — squeue `%C`/`%m`/`%b`); a task
+  takes `task_cpus()` (its `--cpus`, else 1) and `--mem`. `waiting_for_cpu`/`_ram` and
+  `insufficient_cpus`/`_ram` are task-level (`i += 1`). A record without `cpus` (older
+  poller) is never limited. A hold job without a GPU (`is_cpu_hold_job`) is a candidate
+  for `--gpus 0` tasks only, is NEVER GPU-probed (the CUDA probe would fail there and
+  quarantine the node) and is offered on a quarantined node too; a `--gpus 0` task on a
+  GPU hold job leaves one CPU per free card, so it is never why a free GPU cannot be
+  used, and its outcome neither strikes a node nor clears strikes.
+- **hive binds tasks to cores; SLURM does not keep steps apart.** Measured: two steps of
+  one job, overlapping or not, `--exact` or not, get the SAME cores. So a task that said
+  `--cpus`, and every task on a CPU hold job, holds `cpu_slots` (positions in the hold
+  job's core list, recomputed from the running tasks like GPU slots), its step is
+  launched WITHOUT `--cpus-per-task`, and the wrapper `taskset`s itself to those cores.
+  `--cpus-per-task` is only used when the hold job's size is unknown.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

@@ -57,7 +57,8 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--nodes N` | multi-node task: N members start together, one node each, with `$HIVE_GANG_RANK/SIZE/HOSTS`; one fails → all stop. `--same-node`: members may share a node (several 1-GPU hold jobs on it) |
 | `--preemptible` / `--preempt` | a long low-priority task agrees to be stopped and requeued / an urgent one (give it `--priority` > 0) may stop such a task |
 | `--begin 2h\|08:00` | not before that time |
-| `--cpus N` `--mem MB` | CPU / memory limit of the task (hold jobs have few CPUs; tasks sharing one fight over them) |
+| `--cpus N` `--mem MB` | CPUs (default 1; bound to cores of its own) and memory the task takes from its hold job; it waits (`waiting_for_cpu`) while they are taken |
+| `--gpus 0` | a CPU task: runs on a hold job without a GPU if the pool has one (many at once, by CPUs), else beside the tasks of a GPU hold job |
 | `--warn-before 10m` | SIGUSR1 to every process of the command that long before its node expires; your program must handle it (to checkpoint) |
 | `--exclude NODES` / `--nodelist NODES` / `--partition P` | not on these nodes / only on these nodes / only in this partition |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
@@ -94,7 +95,7 @@ The NODE column of `hive list` says why. The common ones:
 | `pool_empty` | the pool has no hold job. If `hive pool autoscale` says it is on, it submits hold jobs within 10 min of your submit (they then wait in the SLURM queue); need more, or sooner → `hive pool add highgpu` |
 | `held` | somebody ran `hive hold` on it → `hive unhold ID` |
 | `no_dispatchable_node` | every hold job is busy → `hive nodes`; wait or `hive pool add` |
-| `waiting_for_mem` / `insufficient_gpus` / `insufficient_walltime` | your task's requirement isn't met by any node → lower it or `hive pool add …` |
+| `waiting_for_mem` / `insufficient_gpus` / `insufficient_cpus` / `insufficient_ram` / `insufficient_walltime` | your task's requirement isn't met by any node → lower it or `hive pool add …` |
 | `gpu_dirty` / `node_busy_on_verify` | a card looked free but isn't (co-tenant / zombie) → wait |
 | `gpu_unresponsive` / `cuda_unavailable_on_verify` / `node_quarantined` | the node's GPU is broken; hive quarantines it → `hive health`, then `hive pool add` for a replacement |
 | `infra_failure_redispatch` | node reclaimed mid-run; re-running elsewhere (progress lost unless checkpointed) |

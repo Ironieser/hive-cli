@@ -102,6 +102,20 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 |---|---|---|
 | D1 | Run only on named nodes / a partition (`--nodelist`, `--partition`) — the half of "choose or exclude nodes" that had been left out | done |
 
+## E. CPU tasks
+
+Asked for on 2026-09-28: "is there a way to request and schedule CPUs for CPU tasks".
+
+| | What | State |
+|---|---|---|
+| E1 | pollers record `cpus`, `mem_mb`, `cpu_only` of every hold job | done |
+| E2 | tasks counted by `--cpus` (1 unless said) and `--mem` against their hold job | done |
+| E3 | hold jobs without a GPU take `--gpus 0` tasks, several at once, no GPU probe | done |
+| E4 | `--gpus 0` tasks prefer them; on a GPU hold job they leave a CPU per free card | done |
+| E5 | CPU preset (`pool_config.example.json`), `hive nodes` shows `taken/total CPU` | done |
+| E2b | CPU slots: hive binds each task to cores of its own (`taskset`) — SLURM gives every step of a job the same cores | done |
+| E6 | red team, live validation | see below |
+
 ## C. Housekeeping
 
 | # | Item | Status |
