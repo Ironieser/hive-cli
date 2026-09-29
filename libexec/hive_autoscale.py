@@ -164,7 +164,7 @@ def observe():
     """The hold jobs as SLURM sees them now: [{jid, state, node, left}], or None if
     SLURM could not be asked. Only jobs whose stdout is under pool-logs/."""
     out = hh._slurm(["squeue", "-h", "-u", os.environ.get("USER", ""), "-t", "R,PD",
-                     "-o", "%i|%T|%L|%N|%b"])
+                     "-o", "%i|%T|%L|%N"])
     if out is None:
         return None
     jobs = []
@@ -172,14 +172,17 @@ def observe():
         parts = line.strip().split("|")
         if len(parts) < 4 or not parts[0].isdigit():
             continue
-        if len(parts) > 4 and parts[4].strip() and "gpu" not in parts[4]:
-            continue                             # a hold job without a GPU: not what
-                                                 # min_nodes / max_nodes count
         info = hh._slurm(["scontrol", "show", "job", parts[0]])
         if info is None:
             return None                          # cannot tell what it is: do not guess
         m = re.search(r"^\s*StdOut=(\S+)", info, flags=re.M)
         if not m or not m.group(1).startswith(hh.POOL_LOG_DIR + os.sep):
+            continue
+        # A hold job without a GPU is not what min_nodes / max_nodes are about — but
+        # only on SLURM's word: a TRES line that names CPUs and no GPU (it names the GPU
+        # however it was asked for, --gres or --gpus). Anything else counts.
+        tres = re.search(r"^\s*(?:Alloc|Req)?TRES=(\S+)", info, flags=re.M)
+        if tres and "cpu=" in tres.group(1) and "gres/gpu" not in tres.group(1):
             continue
         jobs.append({"jid": parts[0], "state": parts[1].upper(), "node": parts[3],
                      "left": _left_secs(parts[2])})

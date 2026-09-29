@@ -99,18 +99,36 @@ slurm_time_to_secs() {
 }
 
 # ── probe a single job (runs in background subshell) ─────────────────────────
-# squeue %m ("128G", "4000M", "16384") → MB, or null. What the hold job was GIVEN:
-# the scheduler counts the tasks' --cpus / --mem against it. KEEP IN SYNC with hive-daemon.
+# "128G" / "4000M" / "1.50G" / "16384" → MB, or null (also for anything absurd: it is
+# written into the node DB as it is). KEEP IN SYNC with hive-daemon.
 slurm_mem_to_mb() {
-    local m="${1// /}" n u
-    [[ "$m" =~ ^([0-9]+)(\.[0-9]+)?([KMGT]?)[a-z]*$ ]] || { printf 'null'; return; }
-    n="${BASH_REMATCH[1]}"; u="${BASH_REMATCH[3]}"
-    case "$u" in
-        K) printf '%s' "$(( 10#$n / 1024 ))" ;;
-        G) printf '%s' "$(( 10#$n * 1024 ))" ;;
-        T) printf '%s' "$(( 10#$n * 1024 * 1024 ))" ;;
-        *) printf '%s' "$(( 10#$n ))" ;;
-    esac
+    local m="${1// /}"
+    [[ "$m" =~ ^[0-9]{1,9}(\.[0-9]{1,6})?[KMGT]?$ ]] || { printf 'null'; return; }
+    awk -v m="$m" 'BEGIN { u = substr(m, length(m)); n = m + 0
+        f = (u == "K") ? 1/1024 : (u == "G") ? 1024 : (u == "T") ? 1048576 : 1
+        v = int(n * f); if (v > 0 && v < 1e12) printf "%d", v; else printf "null" }'
+}
+
+# What SLURM ALLOCATED to each running job, "cpu=4,mem=128G,node=1,billing=4,gres/gpu=1"
+# (squeue -O tres-alloc), into JOB_CPUS / JOB_MEM / JOB_CPUONLY. The allocation, not the
+# request: `%m` is per CPU for a --mem-per-cpu job and `%b` is empty for one that asked
+# for its GPU with --gpus, which made a GPU hold job look like one without. Whatever
+# cannot be read stays null — "not known", which is never a limit and never "no GPU".
+read_tres() {
+    local line jid tres part p
+    while IFS= read -r line; do
+        read -r jid tres <<< "$line"
+        [[ "$jid" =~ ^[0-9]+$ && "$tres" == *cpu=* ]] || continue
+        JOB_CPUONLY["$jid"]=true
+        IFS=',' read -ra part <<< "$tres"
+        for p in "${part[@]}"; do
+            case "$p" in
+                cpu=*)       [[ "${p#cpu=}" =~ ^[0-9]{1,6}$ ]] && JOB_CPUS["$jid"]="${p#cpu=}" ;;
+                mem=*)       JOB_MEM["$jid"]="$(slurm_mem_to_mb "${p#mem=}")" ;;
+                gres/gpu*)   JOB_CPUONLY["$jid"]=false ;;
+            esac
+        done
+    done < <(squeue -u "$USER" -t R --noheader -O "JobID:20,tres-alloc:400" 2>/dev/null)
 }
 
 probe_job() {
@@ -302,7 +320,7 @@ main() {
     # column, so the grep never matched and `hive poll` wrote one more job than the
     # daemon did. KEEP IN SYNC with hive-daemon.
     local squeue_out
-    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%C|%m|%b|%j" 2>/dev/null \
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%j" 2>/dev/null \
         | grep -vE '\|(cursor_ssh_proxy|hive_canary)$' \
         | sed 's/|[^|]*$//')   # strip job name column after filtering
 
@@ -320,6 +338,7 @@ main() {
     # Launch parallel probes
     local job_ids=()
     declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT JOB_CPUS JOB_MEM JOB_CPUONLY
+    read_tres
 
     # Read squeue into an array first, and give each background probe </dev/null:
     # a backgrounded srun inherits the while-read loop's stdin and can swallow the
@@ -330,7 +349,7 @@ main() {
     done <<< "$squeue_out"
 
     for line in "${squeue_lines[@]}"; do
-        IFS='|' read -r jobid node partition elapsed timeleft cpus mem gres <<< "$line"
+        IFS='|' read -r jobid node partition elapsed timeleft _rest <<< "$line"   # _rest: a job name with a | in it
         jobid="${jobid// /}"; node="${node// /}"
         partition="${partition// /}"; elapsed="${elapsed// /}"; timeleft="${timeleft// /}"
         [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
@@ -339,19 +358,9 @@ main() {
         JOB_PART["$jobid"]="$partition"
         JOB_ELAPSED["$jobid"]="$elapsed"
         JOB_TIMELEFT["$jobid"]="$(slurm_time_to_secs "$timeleft")"
-        # CPUs and memory of the hold job (squeue %C, %m): what `--cpus` / `--mem` of
-        # the tasks placed on it are counted against. null = not known, never a limit.
-        cpus="${cpus// /}"; [[ "$cpus" =~ ^[0-9]+$ ]] || cpus=null
-        JOB_CPUS["$jobid"]="$cpus"
-        JOB_MEM["$jobid"]="$(slurm_mem_to_mb "$mem")"
-        # squeue %b is what the job asked for ("gres/gpu:1", "N/A"): a hold job without
-        # a GPU is known as one whatever its probe says. Empty (older SLURM) = unknown.
-        if [[ -z "${gres// /}" ]]; then JOB_CPUONLY["$jobid"]=null
-        elif [[ "$gres" == *gpu* ]]; then JOB_CPUONLY["$jobid"]=false
-        else JOB_CPUONLY["$jobid"]=true; fi
         log "Probing job $jobid on $node ($partition) elapsed=$elapsed left=${timeleft:-?} ..."
         probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" \
-            "${JOB_CPUS[$jobid]}" "${JOB_MEM[$jobid]}" "${JOB_CPUONLY[$jobid]}" </dev/null &
+            "${JOB_CPUS[$jobid]:-null}" "${JOB_MEM[$jobid]:-null}" "${JOB_CPUONLY[$jobid]:-null}" </dev/null &
     done
 
     # Wait up to 30s for all probes

@@ -54,6 +54,7 @@ NODE_DB_STALE_SECS = 1800   # node DB older than this → force a re-poll instea
 ORPHAN_GRACE_SECS  = 90     # running task w/ no srun+heartbeat+exit older than this → crash orphan
 MAX_ATTEMPTS       = 3      # requeue cap for crash orphans (prevents infinite redispatch)
 STARVATION_CYCLES  = 3      # consecutive starved cycles before forcing a poller re-poll
+ALIVE_PROBE_TIMEOUT = 45   # "can a step start here": a hold job without a GPU
 LIVE_PROBE_TIMEOUT = 150    # verify-before-dispatch probe: GPU query (deadline 60 s) + CUDA
                             # probe, each ~25 s on a slow-but-healthy node, + step teardown
 VERIFY_EVERY_DISPATCH = True  # live-probe (memory + CUDA context) before EVERY dispatch, not
@@ -609,7 +610,7 @@ def fits_hold_job(task, info, db_updated):
     return True
 
 
-def pick_victim(task, tasks, quarantined, slow, jobs_db=None, db_updated=None):
+def pick_victim(task, tasks, quarantined, slow, jobs_db=None, db_updated=None, used=None):
     """The running task `task` may take the place of (checklist B6), or None. Both
     sides opt in: `task` was submitted --preempt, the victim --preemptible. The victim
     has a strictly lower priority, holds at least as many cards as `task` wants, is not
@@ -620,12 +621,26 @@ def pick_victim(task, tasks, quarantined, slow, jobs_db=None, db_updated=None):
     want = task_gpus(task)
     excluded = set(task.get("exclude_nodes") or ())
     best = None
+    used_cpus, used_mem = used if used else cpu_mem_in_use(tasks)[:2]
+
+    def room_after(v):
+        """Would stopping `v` leave `task` the CPUs and the memory it takes? A victim
+        must never be stopped for a task that then waits for a CPU."""
+        info = (jobs_db or {}).get(v.get("slurm_jobid")) or {}
+        jid = v.get("slurm_jobid")
+        have_c, have_m = _known(info, "cpus"), _known(info, "mem_mb")
+        if have_c is not None and have_c - used_cpus.get(jid, 0) + task_cpus(v) < task_cpus(task):
+            return False
+        return not (have_m is not None and task_mem(task)
+                    and have_m - used_mem.get(jid, 0) + task_mem(v) < task_mem(task))
+
     for v in tasks.values():
         if v["state"] != "running" or not v.get("preemptible") or v.get("cancel_requested") \
                 or v.get("gang_size") or v.get("priority", 0) >= task.get("priority", 0) \
                 or int(v.get("preempt_count") or 0) >= MAX_PREEMPTIONS \
                 or len(v.get("gpu_slots") or []) < want \
                 or not _pid_alive(v.get("srun_pid")) \
+                or not room_after(v) \
                 or (jobs_db is not None
                     and not fits_hold_job(task, jobs_db.get(v.get("slurm_jobid")), db_updated)) \
                 or v.get("node") in excluded or v.get("node") in quarantined \
@@ -986,10 +1001,17 @@ DEFAULT_TASK_CPUS = 1
 
 
 def task_cpus(task):
+    """CPUs the task is counted as: its `--cpus`; without, 1 for a task without a GPU
+    and NOTHING for one with — a GPU task that never said `--cpus` shares all of its
+    hold job's cores, as it always has, and must not be held back by a count it did not
+    ask for (a 2-card hold job with 1 CPU used to run two tasks, and still does)."""
     try:
-        return max(1, int(task.get("cpus") or DEFAULT_TASK_CPUS))
+        said = int(task.get("cpus") or 0)
     except (TypeError, ValueError):
-        return DEFAULT_TASK_CPUS
+        said = 0
+    if said > 0:
+        return said
+    return DEFAULT_TASK_CPUS if task_gpus(task) <= 0 else 0
 
 
 def task_mem(task):
@@ -1006,10 +1028,21 @@ def _known(info, key):
 
 def is_cpu_hold_job(info):
     """A hold job without a GPU: takes `--gpus 0` tasks only, and is never probed for
-    one. `cpu_only` is what SLURM says the job asked for; records without it (older
+    one. Evidence wins: a record that lists a card is a GPU hold job whatever else it
+    says. Then `cpu_only`, which is what SLURM allocated; records without it (older
     poller) go by the status the probe gave."""
+    if info.get("gpu"):
+        return False
     only = info.get("cpu_only")
     return only if isinstance(only, bool) else info.get("status") == "cpu"
+
+
+def alive_probe(slurm_jobid):
+    """Can a step be started in this hold job at all? The verify-before-dispatch of a
+    hold job without a GPU: no nvidia-smi, no CUDA, never a fault of the node."""
+    rc, _raw = _run_probe(["srun", f"--jobid={slurm_jobid}", "--overlap", "-n1", "--mem=0",
+                           "bash", "-c", "true"], ALIVE_PROBE_TIMEOUT)
+    return {"ok": rc == 0, "cpu_only": True}
 
 
 def cpu_mem_in_use(tasks):
@@ -1109,11 +1142,11 @@ def get_candidates(jobs_db, used_jobids, freed, quarantined=frozenset(), partial
             continue
         st = info.get("status")
         if is_cpu_hold_job(info):
-            # No GPU: nothing to verify, and a node that is quarantined for its GPU
-            # still computes. Offered when its last probe ran (`cpu`, also carried
-            # forward) — one that could not be reached would not run a task either.
-            if st == "cpu":
-                cands.append((jid, info, False))
+            # A node that is quarantined for its GPU still computes. Always verified
+            # (alive_probe): the record may be of a hold job that has expired since,
+            # and a task sent there is a task lost.
+            if st in ("cpu", "probe_failed", "unknown"):
+                cands.append((jid, info, True))
             continue
         if info.get("node") in quarantined:
             continue
@@ -1527,7 +1560,8 @@ PROBE_PARALLEL_MAX = 8      # verify probes run at once, outside queue.lock
 
 
 def probe_nodes(wanted):
-    """{jid: live_probe result} for `wanted` ({jid: skip_cuda}), probed in parallel.
+    """{jid: live_probe result} for `wanted` ({jid: skip_cuda, or "cpu" for a hold job
+    without a GPU: alive_probe}), probed in parallel.
     Called WITHOUT queue.lock: a probe takes 8 s on a healthy node and up to
     LIVE_PROBE_TIMEOUT on a bad one, and `hive submit` / `cancel` / `list` used to
     wait behind every one of them."""
@@ -1535,7 +1569,8 @@ def probe_nodes(wanted):
 
     def run(jid, skip_cuda):
         try:
-            results[jid] = live_probe(jid, skip_cuda=skip_cuda)
+            results[jid] = alive_probe(jid) if skip_cuda == "cpu" \
+                else live_probe(jid, skip_cuda=skip_cuda)
         except Exception as e:
             logging.warning("Probe of hold job %s failed: %s", jid, e)
             results[jid] = {"ok": False}
@@ -2196,6 +2231,10 @@ def _cycle(probe_cache, final):
             want_gpus = task_gpus(task)
             want_cpus, want_mem = task_cpus(task), task_mem(task)
             excluded = set(task.get("exclude_nodes") or ())
+
+            def mine_left():
+                # hold jobs without a GPU are not part of the pool for a GPU task
+                return [c for c in candidates if want_gpus <= 0 or not is_cpu_hold_job(c[1])]
             # Say what is actually wrong instead of the generic reason: the pool has no
             # hold job at all, its nodes are quarantined, or every candidate was
             # rejected earlier this cycle (the first task used to get the real reason
@@ -2205,9 +2244,9 @@ def _cycle(probe_cache, final):
             elif (task.get("only_nodes") or task.get("partition")) \
                     and not any(allowed_here(task, i_) for i_ in jobs_db.values()):
                 reason = "waiting_for_node"      # the pool has no hold job where it may run
-            elif not candidates and node_reject:
+            elif not mine_left() and node_reject:
                 reason = node_reject
-            elif not candidates and n_quarantined_jobs:
+            elif not mine_left() and n_quarantined_jobs:
                 reason = "node_quarantined"
             else:
                 reason = "no_dispatchable_node"
@@ -2276,7 +2315,21 @@ def _cycle(probe_cache, final):
                         continue
                     free_cpus = have_cpus - used_cpus.get(jid, 0)
                     if want_gpus <= 0 and not cpu_only:
-                        free_cpus -= DEFAULT_TASK_CPUS * max(0, len(readings) - len(taken))
+                        # …but never the hold job's last CPU for that: on a 1-CPU hold
+                        # job such a task has always run, and still does.
+                        free_cards = max(0, len(readings) - len(taken))
+                        free_cpus -= min(DEFAULT_TASK_CPUS * free_cards, max(0, have_cpus - 1))
+                        # A GPU task that waits for CPUs here goes first: tasks without
+                        # a GPU kept taking the CPUs as they came free, and a
+                        # `--gpus 1 --cpus 4` of higher priority never got its four.
+                        if free_cards and any(
+                                g["state"] == "pending" and g is not task and task_gpus(g) > 0
+                                and g.get("cpus") and not g.get("held")
+                                and g.get("priority", 0) >= task.get("priority", 0)
+                                and fits_hold_job(g, info, db_updated) for g in pending):
+                            reason = "waiting_for_cpu"
+                            i += 1
+                            continue
                     if want_cpus > free_cpus:
                         reason = "waiting_for_cpu"
                         i += 1
@@ -2362,10 +2415,7 @@ def _cycle(probe_cache, final):
                     i += 1
                     continue
 
-                if cpu_only and not final:
-                    # Nothing to probe, and pass 1 dispatches nothing: pass 2 follows.
-                    return None, "verifying_node"
-                if (needs_verify or VERIFY_EVERY_DISPATCH) and not cpu_only:
+                if needs_verify or VERIFY_EVERY_DISPATCH:
                     node_name = info.get("node", "?")
                     held = probe_backoff_reason(jid)
                     if held:
@@ -2385,9 +2435,22 @@ def _cycle(probe_cache, final):
                         i += 1                         # another task asked for this node
                         continue
                     else:
-                        wanted[jid] = is_slow
+                        wanted[jid] = "cpu" if cpu_only else is_slow
                         reason = "verifying_node"
                         break
+                    if cpu_only:
+                        # alive_probe: a step can be started there, or it cannot. No
+                        # GPU was asked, so nothing here is held against the node.
+                        if not p.get("ok"):
+                            note_probe_result(jid, False)
+                            reason = node_reject = "probe_unverifiable"
+                            candidates.pop(i)
+                            log_reject(jid, node_name, reason, "no step could be started "
+                                       "in this hold job (expired?)")
+                            continue
+                        note_probe_result(jid, True)
+                        p = {"ok": True, "gpus": [(0, 0, 0)], "util": 0, "mem_used": 0,
+                             "mem_total": 0, "cuda": "unknown"}
                     if p.get("fault"):
                         # srun ran, SLURM granted a GPU, and the GPU did not answer.
                         # No user code involved, but one slow nvidia-smi on a loaded
@@ -2446,7 +2509,7 @@ def _cycle(probe_cache, final):
                     # A clean answer forgives the VERIFY strikes earlier probes left —
                     # two misses must be in a row — and only those: strikes from tasks
                     # that died at CUDA init are cleared by a task that succeeds.
-                    if hh.clear_verify_strikes(health, node_name):
+                    if not cpu_only and hh.clear_verify_strikes(health, node_name):
                         health_changed = True
                     # Verified clean: keep the live reading so the next task doesn't
                     # pay for another srun probe on the same node this cycle.

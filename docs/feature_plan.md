@@ -114,7 +114,8 @@ Asked for on 2026-09-28: "is there a way to request and schedule CPUs for CPU ta
 | E4 | `--gpus 0` tasks prefer them; on a GPU hold job they leave a CPU per free card | done |
 | E5 | CPU preset (`pool_config.example.json`), `hive nodes` shows `taken/total CPU` | done |
 | E2b | CPU slots: hive binds each task to cores of its own (`taskset`) — SLURM gives every step of a job the same cores | done |
-| E6 | red team, live validation | see below |
+| E6 | red team round 1: 2 reviewers, 24 findings (3 high) — fixed: dispatch onto an expired CPU hold job, autoscale not counting hold jobs, GPU tasks held back by CPU counting, GPU task starved by CPU tasks, preemption without room, memory per CPU, display. Not fixed: `--same-node` gangs of `--gpus 0` (refused at submit anyway); slow nodes with only a CPU hold job are not re-checked (as before) | done |
+| E7 | live validation | see below |
 
 ## C. Housekeeping
 

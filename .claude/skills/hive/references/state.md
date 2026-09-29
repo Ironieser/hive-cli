@@ -56,8 +56,8 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `status`: `idle | busy | warning | probe_failed | cpu` (`CLAIM` and `QUAR` in
   `hive nodes` are display-only overlays from `queue.json` / `node_health.json`).
 - `gpu`: `[{index, util, mem_used, mem_total}]` for every GPU the hold job owns.
-- `cpus`, `mem_mb`: what SLURM gave the hold job (`squeue %C`, `%m`); `null` = not known,
-  then nothing is counted against it. `cpu_only`: the job asked for no GPU (`%b`).
+- `cpus`, `mem_mb`: what SLURM allocated to the hold job (`squeue -O tres-alloc`); `null` =
+  not known, then nothing is counted against it. `cpu_only`: allocated no GPU.
 - `time_left_secs`: remaining walltime measured at the DB's `updated` (`-1` unlimited,
   `null` unknown); subtract the DB age for a live value.
 - `carried_forward: true`: last-good reading reused after a transient probe miss.

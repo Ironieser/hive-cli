@@ -238,7 +238,8 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   SLURM unreachable, state file unreadable or UNWRITABLE, any setting not exactly
   valid (`"enabled"` must be JSON `true`, `until` is required) → submit nothing. The
   state is written before submitting and kept in memory too. `max_nodes` counts every
-  hold job, usable or not. `hive pool autoscale` must go through the same functions.
+  hold job, usable or not — except one that SLURM says has CPUs and no GPU (`TRES=` of
+  `scontrol show job`; no such line = it counts). `hive pool autoscale` must go through the same functions.
   `"active_within"` ties it to use (`last_submit()`; owner `hive-selftest` does not
   count): an unreadable record means "no use", never "use".
 - **`--warn-before` signals the command's process group.** The command runs under
@@ -257,14 +258,21 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   `waiting_for_node`), checked before the probe and in `fits_hold_job`, so a preemptor
   never stops a victim on a node it may not use.
 - **CPUs and memory are counted, per hold job, from the tasks.** The pollers record what
-  SLURM gave a hold job (`cpus`, `mem_mb`, `cpu_only` — squeue `%C`/`%m`/`%b`); a task
-  takes `task_cpus()` (its `--cpus`, else 1) and `--mem`. `waiting_for_cpu`/`_ram` and
-  `insufficient_cpus`/`_ram` are task-level (`i += 1`). A record without `cpus` (older
-  poller) is never limited. A hold job without a GPU (`is_cpu_hold_job`) is a candidate
-  for `--gpus 0` tasks only, is NEVER GPU-probed (the CUDA probe would fail there and
-  quarantine the node) and is offered on a quarantined node too; a `--gpus 0` task on a
-  GPU hold job leaves one CPU per free card, so it is never why a free GPU cannot be
-  used, and its outcome neither strikes a node nor clears strikes.
+  SLURM ALLOCATED to a hold job (`cpus`, `mem_mb`, `cpu_only`, from `squeue -O
+  tres-alloc` — not `%m`, which is per CPU for `--mem-per-cpu`, nor `%b`, which is empty
+  for a GPU asked with `--gpus`); unreadable = `null` = never a limit and never "no
+  GPU". A task takes `task_cpus()`: its `--cpus`; without, 1 if it has no GPU and
+  NOTHING if it has one — a GPU task that never said `--cpus` must not be held back by
+  CPUs. `waiting_for_cpu`/`_ram` and `insufficient_cpus`/`_ram` are task-level.
+- **A hold job without a GPU** (`is_cpu_hold_job`; a record that lists a card never is
+  one) takes `--gpus 0` tasks only, is NEVER GPU-probed (the CUDA probe would fail there
+  and quarantine the node) and is offered on a quarantined node too — but it is verified
+  like any other, by `alive_probe` ("can a step start here"): its record may be of a
+  hold job that has expired, and a task sent there was requeued until it was failed.
+  A `--gpus 0` task on a GPU hold job leaves a CPU per free card, steps aside for a
+  pending GPU task that waits for CPUs there, and its outcome neither strikes a node
+  nor clears strikes. `pick_victim` checks that the victim frees the CPUs and memory
+  the preemptor takes.
 - **hive binds tasks to cores; SLURM does not keep steps apart.** Measured: two steps of
   one job, overlapping or not, `--exact` or not, get the SAME cores. So a task that said
   `--cpus`, and every task on a CPU hold job, holds `cpu_slots` (positions in the hold

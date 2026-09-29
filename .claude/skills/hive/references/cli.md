@@ -76,7 +76,7 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--preemptible` | no | the task may be stopped and **requeued** (it starts afresh; at most 5 times) when a `--preempt` task of strictly higher priority finds no node. Pending reason afterwards: `preempted` |
 | `--preempt` | no | when no node is free, stop ONE running `--preemptible` task of **strictly lower priority** whose node this task can use — so give it a `--priority` above 0. The freed node is kept for it. Shows `preempting` until it has the node. `--no-preempt` / `--no-preemptible` override a `.hive` file |
 | `--begin` | — | earliest start: a delay (`2h`), a date and time (`2026-10-01T08:00`) or a time of day (`08:00`, tomorrow if past). A bare number or a time in the past is an error. `waiting_for_begin` until then |
-| `--cpus` / `--mem` | 1 / none | CPUs and memory (MiB) the task takes from its hold job, and the limits of its step. The tasks on a hold job never take more than it has (`hive nodes` shows a CPU hold job's `taken/total CPU`): a task waits (`waiting_for_cpu`, `waiting_for_ram`) while they are taken and is told at submit when no hold job is that large (`insufficient_cpus`, `insufficient_ram`). A task is bound to cores of its own (`taskset`; its log says which, `nproc` and `$HIVE_CPUS` give the number) — SLURM itself puts every task of a hold job on the same cores. Without `--cpus` a task counts as 1 CPU; on a GPU hold job it is then not bound (it shares all the hold job's CPUs, as before), on a CPU hold job it is bound to one. A task over its `--mem` is killed by SLURM |
+| `--cpus` / `--mem` | 1 / none | CPUs and memory (MiB) the task takes from its hold job, and the limits of its step. The tasks on a hold job never take more than it has (`hive nodes` shows a CPU hold job's `taken/total CPU`): a task waits (`waiting_for_cpu`, `waiting_for_ram`) while they are taken and is told at submit when no hold job is that large (`insufficient_cpus`, `insufficient_ram`). A task is bound to cores of its own (`taskset`; its log says which, `nproc` and `$HIVE_CPUS` give the number) — SLURM itself puts every task of a hold job on the same cores. Without `--cpus` a task with a GPU takes no CPUs of its own (it shares all of its hold job's, as before) and a `--gpus 0` task takes 1. A task over its `--mem` is killed by SLURM |
 | `--warn-before` | — | send `SIGUSR1` this long before the node's walltime ends — once per run, to **every process of the command** (it may arrive twice). The program that should checkpoint must handle it: a process without a handler is ended by SIGUSR1. Shell scripts around it are taken care of. Not sent in a command's first 60 s; the task is not placed on a node that expires sooner than that. The notify hook gets `HIVE_TASK_EVENT=expiring` |
 | `--nodelist` | — | run ONLY on these nodes (`evc104,evc[102-103]`). The task waits (`waiting_for_node`) while none of them has a free hold job — also if the pool has no hold job there at all, which submit tells you |
 | `--partition` | — | run only on hold jobs of this SLURM partition (`hive nodes`, column PART) |
@@ -192,6 +192,10 @@ like on two nodes. For one process with several cards, the hold job itself must 
   preset in `pool_config.json`: `hive pool add cpu`. Its job name must not be
   `cursor_ssh_proxy` (such jobs are not part of the pool). Autoscale neither counts
   nor submits them.
+- Before a task is sent to a CPU hold job hive checks that a step can be started there
+  (the hold job may have expired since the last poll).
+- On a GPU hold job a `--gpus 0` task steps aside (`waiting_for_cpu`) while a GPU task of
+  the same or higher priority waits for CPUs there.
 - A task that wants a GPU never goes to a CPU hold job; a CPU task neither clears nor
   adds to a node's GPU strikes. A CPU hold job is used even on a node quarantined for
   its GPU.

@@ -2567,10 +2567,13 @@ def _lp_spy(jid, **kw):
     _probed.append(jid); return _lp_real(jid, **kw)
 hs.live_probe = _lp_spy
 
-chk("task_cpus: 1 unless the task says so", (hs.task_cpus({}), hs.task_cpus({"cpus": 6}), hs.task_cpus({"cpus": "x"})) == (1, 6, 1))
+chk("task_cpus: what it said; else 1 without a GPU and nothing with one",
+    (hs.task_cpus({"gpus": 0}), hs.task_cpus({"cpus": 6}), hs.task_cpus({"cpus": "x", "gpus": 0}),
+     hs.task_cpus({}), hs.task_cpus({"gpus": 2})) == (1, 6, 1, 0, 0))
 chk("is_cpu_hold_job: what SLURM says beats the probe's status",
     hs.is_cpu_hold_job({"cpu_only": True, "status": "probe_failed"})
     and not hs.is_cpu_hold_job({"cpu_only": False, "status": "cpu"})
+    and not hs.is_cpu_hold_job({"cpu_only": True, "status": "idle", "gpu": gpus(1)})
     and hs.is_cpu_hold_job({"status": "cpu"}) and not hs.is_cpu_hold_job({"status": "idle"}))
 
 wdb({"900": cpunode("c0", cpus=4)})
@@ -2638,11 +2641,19 @@ time.sleep(3.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle()
 
 reset_sched_state(); reset_health()
 hh_ = hh.load(); hh.quarantine(hh_, "c0", "CUDA probe failed", "verify"); hh.save(hh_)
-wdb({"900": cpunode("c0", cpus=2), "901": cpunode("c1", cpus=2, st="probe_failed")})
-wq({"2060": dict(ctask(2060), cmd="true", exclude_nodes=["c1"]), "2061": dict(ctask(2061), cmd="true", only_nodes=["c1"])})
+_dead = os.path.join(hs.HIVE_DIR, "mock_srun_dead")
+open(_dead, "w").write("901\n")
+wdb({"900": cpunode("c0", cpus=2), "901": cpunode("c1", cpus=2, st="probe_failed"),
+     "902": cpunode("c2", cpus=2, st="probe_failed")})
+wq({"2060": dict(ctask(2060), cmd="true", only_nodes=["c0"]), "2061": dict(ctask(2061), cmd="true", only_nodes=["c1"]),
+    "2062": dict(ctask(2062), cmd="true", only_nodes=["c2"])})
 hs.run_one_cycle()
 chk("a node quarantined for its GPU still computes", states(2060) == ["running"])
-chk("a hold job whose probe could not run is not offered", states(2061) != ["running"])
+chk("a hold job the poller could not reach is asked whether a step can start: no -> not used",
+    rq()["2061"]["state"] == "pending" and not rq()["2061"].get("attempts")
+    and "900" not in hs._probe_backoff and "901" in hs._probe_backoff)
+chk("...yes -> used, instead of waiting for the next poll", states(2062) == ["running"])
+os.remove(_dead)
 chk("...and the quarantine stands", hh.load()["nodes"]["c0"]["state"] == "quarantined")
 time.sleep(1); hs.run_one_cycle()
 reset_health()
@@ -2704,10 +2715,103 @@ else:
     print("  [skip] CPU binding test: fewer than 2 cores or no taskset here")
 hs.live_probe = _lp_real
 
-fresh("6000|RUNNING|6-00:00:00|n0|gres/gpu:1\n6001|RUNNING|6-00:00:00|n1|N/A\n6002|PENDING|7-00:00:00||gres/gpu:h100:1\n")
-chk("autoscale does not count a hold job without a GPU",
-    sorted(j["jid"] for j in hauto.observe()) == ["6000", "6002"])
+fresh("6000|RUNNING|6-00:00:00|n0\n6900|RUNNING|6-00:00:00|n1\n6800|PENDING|7-00:00:00|\n")
+chk("autoscale does not count a hold job SLURM allocated CPUs and no GPU; it counts one with "
+    "a GPU, and one SLURM says nothing about", sorted(j["jid"] for j in hauto.observe()) == ["6000", "6800"])
 fresh()
+
+print("== CPU tasks: red team ==")
+# (1) a hold job that has expired since the last poll: the task must not be sent there
+reset_sched_state(); reset_health()
+open(_dead, "w").write("900\n")
+wdb({"900": dict(cpunode("c0", cpus=4), polled_at=utc(-4 * 3600))})
+wq({"2100": ctask(2100)})
+for _ in range(3):
+    hs.run_one_cycle()
+chk("a task is not dispatched onto a hold job in which no step can be started",
+    states(2100) == ["probe_unverifiable"] and not rq()["2100"].get("attempts")
+    and not rq()["2100"].get("requeue_count"))
+os.remove(_dead); reset_sched_state()
+hs.run_one_cycle()
+chk("...and is when one can", states(2100) == ["running"])
+time.sleep(3.5); hs.run_one_cycle()
+
+# (2) overflow: the second task goes on to the GPU hold job in the same cycle
+reset_sched_state()
+wdb({"900": cpunode("c0", cpus=1), "700": gnode("g0")})
+wq({"2110": ctask(2110), "2111": ctask(2111)})
+hs.run_one_cycle()
+chk("CPU hold job full: the next task takes the GPU hold job in the same cycle",
+    [rq()[k].get("slurm_jobid") for k in ("2110", "2111")] == ["900", "700"])
+time.sleep(3.5); hs.run_one_cycle()
+
+# (3) GPU tasks that never said --cpus are not held back by CPUs
+reset_sched_state()
+os.environ["MOCK_LIVE_GPU"] = "0, 10, 81920\\n0, 10, 81920"; os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+wdb({"700": gnode("g0", cpus=1, n=2)})
+wq({"2120": dict(ctask(2120, g=1), cmd="sleep 3"), "2121": dict(ctask(2121, g=1), cmd="sleep 3")})
+hs.run_one_cycle()
+chk("2 cards, 1 CPU: both cards are used, as before", states(2120, 2121) == ["running"] * 2)
+os.environ.pop("MOCK_LIVE_GPU"); os.environ.pop("CUDA_VISIBLE_DEVICES")
+time.sleep(3.5); hs.run_one_cycle()
+reset_sched_state()
+wdb({"700": gnode("g0", cpus=1)})
+wq({"2125": ctask(2125)})
+hs.run_one_cycle()
+chk("1 card, 1 CPU: a task without a GPU still runs there, as before", states(2125) == ["running"])
+time.sleep(3.5); hs.run_one_cycle()
+
+# (4) a GPU task that waits for CPUs goes before tasks without a GPU
+reset_sched_state()
+wdb({"700": gnode("g0", cpus=4)})
+wq({"2130": ctask(2130), "2131": ctask(2131)})
+hs.run_one_cycle()
+q_ = rq()
+q_["2132"] = dict(ctask(2132, g=1, cpus=4), cmd="sleep 2", priority=10)
+for i in range(2133, 2137):
+    q_[str(i)] = ctask(i)
+wq(q_)
+hs.run_one_cycle()
+chk("CPUs taken: the GPU task waits for them, and no task without a GPU takes more",
+    states(2132) == ["waiting_for_cpu"] and all(rq()[str(i)]["state"] == "pending" for i in range(2133, 2137)))
+time.sleep(3.5); hs.run_one_cycle()
+chk("...it starts when they are free", states(2132) == ["running"] and len(rq()["2132"]["cpu_slots"]) == 4)
+time.sleep(2.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle()
+
+# (5) preemption must leave the preemptor its CPUs
+_db = {"700": gnode("g0", cpus=4, n=2)}
+def _rt(i, **kw):
+    return dict(task(i, state="running", jid="700", node="g0"), srun_pid=os.getpid(), gpu_slots=kw.pop("slots"), **kw)
+_ts = {"1": _rt(1, slots=[0], preemptible=True, cpus=1), "2": _rt(2, slots=[1], cpus=1)}
+chk("no victim when stopping it would not free the CPUs the preemptor takes",
+    hs.pick_victim(dict(task(3), priority=9, preempt=True, gpus=1, cpus=4), _ts, set(), set(), _db, utc()) is None)
+chk("...a victim when it would",
+    (hs.pick_victim(dict(task(3), priority=9, preempt=True, gpus=1, cpus=3), _ts, set(), set(), _db, utc()) or {}).get("id") == 1)
+
+# (6) the reason a GPU task is given does not change because a CPU hold job exists
+reset_sched_state(); reset_health()
+hh_ = hh.load(); hh.quarantine(hh_, "bad", "CUDA probe failed", "verify"); hh.save(hh_)
+wdb({"700": gnode("bad"), "900": cpunode("c0")})
+wq({"2140": dict(ctask(2140, g=1), cmd="true")})
+hs.run_one_cycle()
+chk("only GPU node quarantined + a CPU hold job: node_quarantined", states(2140) == ["node_quarantined"])
+reset_health()
+
+# (7) a record that lists a card is a GPU hold job, whatever cpu_only says
+reset_sched_state()
+wdb({"700": dict(gnode("g0"), cpu_only=True)})
+wq({"2150": dict(ctask(2150, g=1), cmd="true")})
+hs.run_one_cycle()
+chk("cpu_only with a card listed: the card is used", states(2150) == ["running"])
+time.sleep(1); hs.run_one_cycle()
+
+# (8) the submit note
+json.dump({"updated": utc(), "jobs": {"700": gnode("g0", cpus=4), "900": cpunode("c0", cpus=32, mem=None)}},
+          open(hs.NODE_DB, "w"))
+chk("pool_sizes: what a task could use", hq.pool_sizes(1) == [(4, 64000)] and hq.pool_sizes(0) == [(4, 64000), (32, None)])
+_o = dict(gnode("g1")); _o.pop("cpus")
+json.dump({"updated": utc(), "jobs": {"700": gnode("g0", cpus=4), "701": _o}}, open(hs.NODE_DB, "w"))
+chk("...nothing is said when a hold job does not say how large it is", hq.pool_sizes(1) is None)
 
 print(f"\nPYTHON SUITE: {P['pass']} passed, {P['fail']} failed")
 sys.exit(1 if P["fail"] else 0)
