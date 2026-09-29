@@ -260,6 +260,11 @@ probe_job() {
         status="idle"
     fi
 
+    # "No GPU" takes SLURM and the probe to agree: on a cluster whose TRES does not name
+    # GPUs every hold job would read as one without. A probe that did not run says nothing.
+    if (( probe_failed )); then cpu_only=null
+    elif [[ -n "$gpu_granted" || "$max_gpu_total" -gt 0 ]]; then cpu_only=false; fi
+
     cat > "$outfile" <<EOF
 "${jobid}": {
   "node": "$(json_escape "$node")",
@@ -379,7 +384,7 @@ do_poll() {
   "time_left_secs": ${JOB_TIMELEFT[$jid]:-null},
   "cpus": ${JOB_CPUS[$jid]:-null},
   "mem_mb": ${JOB_MEM[$jid]:-null},
-  "cpu_only": ${JOB_CPUONLY[$jid]:-null},
+  "cpu_only": null,
   "polled_at": "${polled_at}"
 }
 FBEOF

@@ -111,10 +111,11 @@ Asked for on 2026-09-28: "is there a way to request and schedule CPUs for CPU ta
 | E1 | pollers record `cpus`, `mem_mb`, `cpu_only` of every hold job | done |
 | E2 | tasks counted by `--cpus` (1 unless said) and `--mem` against their hold job | done |
 | E3 | hold jobs without a GPU take `--gpus 0` tasks, several at once, no GPU probe | done |
-| E4 | `--gpus 0` tasks prefer them; on a GPU hold job they leave a CPU per free card | done |
+| E4 | `--gpus 0` tasks prefer them; on a GPU hold job they step aside for a GPU task refused for CPUs | done |
 | E5 | CPU preset (`pool_config.example.json`), `hive nodes` shows `taken/total CPU` | done |
 | E2b | CPU slots: hive binds each task to cores of its own (`taskset`) — SLURM gives every step of a job the same cores | done |
 | E6 | red team round 1: 2 reviewers, 24 findings (3 high) — fixed: dispatch onto an expired CPU hold job, autoscale not counting hold jobs, GPU tasks held back by CPU counting, GPU task starved by CPU tasks, preemption without room, memory per CPU, display. Not fixed: `--same-node` gangs of `--gpus 0` (refused at submit anyway); slow nodes with only a CPU hold job are not re-checked (as before) | done |
+| E6b | red team round 2: 10 findings (2 high) — fixed: the step-aside rule held CPU tasks behind GPU tasks that could not run (one case a deadlock); `--gpus 0 --cpus N` with N = all CPUs never ran; GPU probes nobody needed; record changing kind between passes; partial binding reported as done; `cpu_only` needs SLURM and probe to agree; autoscale looks at TresPerNode/Gres too. Not fixed: tasks already running at upgrade hold no CPU slots (transient); tasks without `--cpus` on a GPU hold job are not bound | done |
 | E7 | live validation | see below |
 
 ## C. Housekeeping

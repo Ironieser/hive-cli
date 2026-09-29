@@ -1279,23 +1279,26 @@ def dispatch_task(task, slurm_jobid, node_name):
     cpu_line = ""
     if task.get("cpu_slots"):
         picks = " ".join(str(int(c)) for c in task["cpu_slots"])
+        n_cpu = len(task["cpu_slots"])
         cpu_line = (
             "_HIVE_ALL=$(taskset -cp $$ 2>/dev/null | sed 's/.*: *//')\n"
             "_HIVE_L=()\n"
             'for _p in ${_HIVE_ALL//,/ }; do case "$_p" in\n'
             '  *-*) for ((_c=${_p%-*}; _c<=${_p#*-}; _c++)); do _HIVE_L+=("$_c"); done;;\n'
             '  *) _HIVE_L+=("$_p");; esac; done\n'
-            '_HIVE_B=""\n'
+            '_HIVE_B=""; _HIVE_K=0\n'
             f'for _i in {picks}; do [ -n "${{_HIVE_L[$_i]:-}}" ] && '
-            '_HIVE_B="${_HIVE_B:+$_HIVE_B,}${_HIVE_L[$_i]}"; done\n'
+            '{ _HIVE_B="${_HIVE_B:+$_HIVE_B,}${_HIVE_L[$_i]}"; _HIVE_K=$((_HIVE_K+1)); }; done\n'
             'if [ -n "$_HIVE_B" ] && taskset -cp "$_HIVE_B" $$ >/dev/null 2>&1; then\n'
-            f'  echo "=== cpus: {len(task["cpu_slots"])}, bound to cores [$_HIVE_B] '
-            f'(hold job has [$_HIVE_ALL]) ===" >> {lf}\n'
+            f'  if [ "$_HIVE_K" -eq {n_cpu} ]; then _HIVE_W=""; else '
+            f'_HIVE_W=" — WARNING: only $_HIVE_K of {n_cpu}, the step has fewer cores than the hold job was given"; fi\n'
+            f'  echo "=== cpus: {n_cpu}, bound to cores [$_HIVE_B] '
+            f'(hold job has [$_HIVE_ALL])$_HIVE_W ===" >> {lf}\n'
+            '  export HIVE_CPUS=$_HIVE_K\n'
             'else\n'
-            f'  echo "=== cpus: {len(task["cpu_slots"])} wanted, but the task could not be bound '
+            f'  echo "=== cpus: {n_cpu} wanted, but the task could not be bound '
             f'to cores (hold job has [$_HIVE_ALL]); it shares them ===" >> {lf}\n'
             'fi\n'
-            f'export HIVE_CPUS={len(task["cpu_slots"])}\n'
         )
 
     # What the command can know about itself. HIVE_ARRAY_INDEX is how one command
@@ -1795,7 +1798,7 @@ def _cycle(probe_cache, final):
                     task["pending_reason"]     = "preempted"
                     task["slurm_jobid"] = task["node"] = task["srun_pid"] = None
                     task["started_at"] = task["started_ts"] = task["dispatched_ts"] = None
-                    task.pop("gpu_slots", None)
+                    task.pop("gpu_slots", None); task.pop("cpu_slots", None)
                     append_log_note(task, [
                         "",
                         f"=== hive: task #{task['id']} was PREEMPTED at {now_iso()} by a task of "
@@ -1892,7 +1895,7 @@ def _cycle(probe_cache, final):
                                 task["last_node"]      = node_name
                                 task["state"]          = "pending"
                                 task["pending_reason"] = "node_quarantined_redispatch"
-                                task.pop("gpu_slots", None)
+                                task.pop("gpu_slots", None); task.pop("cpu_slots", None)
                                 task.pop("warned_ts", None)
                                 task["slurm_jobid"]    = None
                                 task["node"]           = None
@@ -1922,7 +1925,7 @@ def _cycle(probe_cache, final):
                     task["attempts"]      = task.get("attempts", 0) + 1
                     task["state"]         = "pending"
                     task["pending_reason"] = "redispatched_after_crash"
-                    task.pop("gpu_slots", None)
+                    task.pop("gpu_slots", None); task.pop("cpu_slots", None)
                     task.pop("warned_ts", None)
                     task["slurm_jobid"]   = None
                     task["node"]          = None
@@ -1953,7 +1956,7 @@ def _cycle(probe_cache, final):
                     task["last_node"]          = prev_node
                     task["state"]              = "pending"
                     task["pending_reason"]     = "infra_failure_redispatch"
-                    task.pop("gpu_slots", None)
+                    task.pop("gpu_slots", None); task.pop("cpu_slots", None)
                     task.pop("warned_ts", None)
                     task["slurm_jobid"]        = None
                     task["node"]               = None
@@ -2010,6 +2013,8 @@ def _cycle(probe_cache, final):
         # finishing must not make the hold job look free.
         used_slots, full_jids = slots_in_use(tasks)
         used_cpus, used_mem, used_cpu_slots = cpu_mem_in_use(tasks)
+        cpu_waiters = set()      # hold jobs a GPU task was refused for their CPUs, this pass
+        asked_cpus = {}          # pass 1: CPUs of the tasks that wait for a hold job's probe
         running_jobids = set(used_slots) | full_jids | {
             t["slurm_jobid"] for t in tasks.values()
             if t["state"] == "running" and t.get("slurm_jobid")}
@@ -2304,8 +2309,8 @@ def _cycle(probe_cache, final):
 
                 # CPU and memory gates (task-level). What the hold job has is known
                 # from the poller; what is taken, from the running tasks plus what this
-                # pass has placed. A task without a GPU leaves one CPU for every card
-                # that is still free: it must never be why a free GPU cannot be used.
+                # pass has placed. (A GPU task that did not say --cpus takes none and is
+                # never held here, so no CPU has to be kept back for a free card.)
                 have_cpus, have_mem = _known(info, "cpus"), _known(info, "mem_mb")
                 free_cpus = None
                 if have_cpus is not None:
@@ -2314,24 +2319,20 @@ def _cycle(probe_cache, final):
                         i += 1
                         continue
                     free_cpus = have_cpus - used_cpus.get(jid, 0)
-                    if want_gpus <= 0 and not cpu_only:
-                        # …but never the hold job's last CPU for that: on a 1-CPU hold
-                        # job such a task has always run, and still does.
-                        free_cards = max(0, len(readings) - len(taken))
-                        free_cpus -= min(DEFAULT_TASK_CPUS * free_cards, max(0, have_cpus - 1))
-                        # A GPU task that waits for CPUs here goes first: tasks without
-                        # a GPU kept taking the CPUs as they came free, and a
-                        # `--gpus 1 --cpus 4` of higher priority never got its four.
-                        if free_cards and any(
-                                g["state"] == "pending" and g is not task and task_gpus(g) > 0
-                                and g.get("cpus") and not g.get("held")
-                                and g.get("priority", 0) >= task.get("priority", 0)
-                                and fits_hold_job(g, info, db_updated) for g in pending):
-                            reason = "waiting_for_cpu"
-                            i += 1
-                            continue
+                    # A task without a GPU steps aside for a GPU task that was refused
+                    # THIS hold job for its CPUs earlier in this pass (`pending` is in
+                    # priority order): tasks without a GPU kept taking the CPUs as they
+                    # came free, and a `--gpus 1 --cpus 4` never got its four. Only for
+                    # that: not for a GPU task that is held, not due or waiting for a
+                    # dependency — one such rule made a task wait for its own dependant.
+                    if want_gpus <= 0 and jid in cpu_waiters:
+                        reason = "waiting_for_cpu"
+                        i += 1
+                        continue
                     if want_cpus > free_cpus:
                         reason = "waiting_for_cpu"
+                        if want_gpus > 0:
+                            cpu_waiters.add(jid)
                         i += 1
                         continue
                 # Which cores: for a task that said how many it wants, and for every
@@ -2432,12 +2433,28 @@ def _cycle(probe_cache, final):
                         i += 1
                         continue
                     elif jid in wanted:
-                        i += 1                         # another task asked for this node
+                        # Another task asked for this node. One without a GPU has room
+                        # for several: a task that still fits waits for the same probe
+                        # instead of asking for one of the next hold job (four CPU tasks
+                        # used to cost three GPU probes nobody needed).
+                        if cpu_only and free_cpus is not None \
+                                and asked_cpus.get(jid, 0) + want_cpus <= free_cpus:
+                            asked_cpus[jid] = asked_cpus.get(jid, 0) + want_cpus
+                            reason = "verifying_node"
+                            break
+                        i += 1
                         continue
                     else:
                         wanted[jid] = "cpu" if cpu_only else is_slow
+                        asked_cpus[jid] = asked_cpus.get(jid, 0) + want_cpus
                         reason = "verifying_node"
                         break
+                    if bool(p.get("cpu_only")) != bool(cpu_only):
+                        # The record changed kind between the passes (the poller
+                        # wrote): this answer is to another question.
+                        reason = "verifying_node"
+                        i += 1
+                        continue
                     if cpu_only:
                         # alive_probe: a step can be started there, or it cannot. No
                         # GPU was asked, so nothing here is held against the node.
@@ -2604,8 +2621,7 @@ def _cycle(probe_cache, final):
                 task["state"] = "pending"
                 task["slurm_jobid"] = task["node"] = task["srun_pid"] = None
                 task["started_at"] = task["started_ts"] = task["dispatched_ts"] = None
-                task.pop("gpu_slots", None)
-                task.pop("cpu_slots", None)
+                task.pop("gpu_slots", None); task.pop("cpu_slots", None)
                 task["pending_reason"] = "dispatch_error"
                 save_queue(queue, lfd)
                 return False

@@ -269,16 +269,20 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   and quarantine the node) and is offered on a quarantined node too — but it is verified
   like any other, by `alive_probe` ("can a step start here"): its record may be of a
   hold job that has expired, and a task sent there was requeued until it was failed.
-  A `--gpus 0` task on a GPU hold job leaves a CPU per free card, steps aside for a
-  pending GPU task that waits for CPUs there, and its outcome neither strikes a node
-  nor clears strikes. `pick_victim` checks that the victim frees the CPUs and memory
+  A `--gpus 0` task on a GPU hold job steps aside for a GPU task that was REFUSED that
+  hold job for its CPUs earlier in the pass (`cpu_waiters`) — never for one that is merely
+  pending (held, not due, waiting for a dependency: that was a deadlock) — and its
+  outcome neither strikes a node nor clears strikes. No CPU is kept back for free cards:
+  a GPU task without `--cpus` takes none. `pick_victim` checks that the victim frees the CPUs and memory
   the preemptor takes.
 - **hive binds tasks to cores; SLURM does not keep steps apart.** Measured: two steps of
   one job, overlapping or not, `--exact` or not, get the SAME cores. So a task that said
   `--cpus`, and every task on a CPU hold job, holds `cpu_slots` (positions in the hold
   job's core list, recomputed from the running tasks like GPU slots), its step is
   launched WITHOUT `--cpus-per-task`, and the wrapper `taskset`s itself to those cores.
-  `--cpus-per-task` is only used when the hold job's size is unknown.
+  `--cpus-per-task` is only used when the hold job's size is unknown. `cpu_only: true`
+  takes SLURM and the probe to agree (not every cluster names GPUs in its TRES), and
+  `hive-dbpost` keeps the known allocation when a poll could not read it.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

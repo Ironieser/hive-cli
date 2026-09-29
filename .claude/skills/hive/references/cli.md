@@ -183,8 +183,8 @@ like on two nodes. For one process with several cards, the hold job itself must 
 (preprocessing, scoring, packing results).
 
 - **Where it runs.** On a hold job without a GPU if the pool has one — `hive nodes` shows
-  it as `CPU` with `taken/total CPU` — else beside the tasks of a GPU hold job, where it
-  leaves one CPU for every card that is still free.
+  it as `CPU` with `taken/total CPU` — else beside the tasks of a GPU hold job (one that still
+  has a free card), sharing its cores with GPU tasks that did not say `--cpus`.
 - **How many at once.** A CPU hold job runs as many tasks as it has CPUs for: each takes
   its `--cpus` (1 unless it says so) and is bound to that many cores of its own. A 32-CPU hold job runs 32
   one-CPU tasks, or 4 with `--cpus 8`; the rest wait (`waiting_for_cpu`).
@@ -194,8 +194,10 @@ like on two nodes. For one process with several cards, the hold job itself must 
   nor submits them.
 - Before a task is sent to a CPU hold job hive checks that a step can be started there
   (the hold job may have expired since the last poll).
-- On a GPU hold job a `--gpus 0` task steps aside (`waiting_for_cpu`) while a GPU task of
-  the same or higher priority waits for CPUs there.
+- On a GPU hold job a `--gpus 0` task steps aside (`waiting_for_cpu`) while a GPU task
+  ahead of it in the queue waits for CPUs there.
+- `--cpus` on a GPU hold job gives the task cores of its own among the tasks that said
+  `--cpus`; tasks that did not are not bound and may use those cores too.
 - A task that wants a GPU never goes to a CPU hold job; a CPU task neither clears nor
   adds to a node's GPU strikes. A CPU hold job is used even on a node quarantined for
   its GPU.

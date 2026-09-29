@@ -179,10 +179,11 @@ def observe():
         if not m or not m.group(1).startswith(hh.POOL_LOG_DIR + os.sep):
             continue
         # A hold job without a GPU is not what min_nodes / max_nodes are about — but
-        # only on SLURM's word: a TRES line that names CPUs and no GPU (it names the GPU
-        # however it was asked for, --gres or --gpus). Anything else counts.
+        # only on SLURM's word: CPUs are named and a GPU nowhere (TRES, TresPerNode /
+        # TresPerJob, Gres — not every cluster has GPUs in its TRES). Anything else counts.
         tres = re.search(r"^\s*(?:Alloc|Req)?TRES=(\S+)", info, flags=re.M)
-        if tres and "cpu=" in tres.group(1) and "gres/gpu" not in tres.group(1):
+        names_gpu = re.search(r"\b(?:\w*TRES|TresPer\w+|Gres)=\S*gpu", info, flags=re.I)
+        if tres and "cpu=" in tres.group(1) and not names_gpu:
             continue
         jobs.append({"jid": parts[0], "state": parts[1].upper(), "node": parts[3],
                      "left": _left_secs(parts[2])})

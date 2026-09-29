@@ -74,6 +74,13 @@ def main():
         old_job = old_jobs.get(jid, {})
         status  = job.get("status")
 
+        # What SLURM allocated does not change while a job runs: a poll that could not
+        # read it (null) keeps what is known, or the limits are off until the next one.
+        for key in ("cpus", "mem_mb", "cpu_only"):
+            if job.get(key) is None and old_job.get(key) is not None:
+                job[key] = old_job[key]
+                changed = True
+
         # ── (1) Carry-forward on probe failure ───────────────────────────────
         if status == "probe_failed":
             old_status = old_job.get("status")

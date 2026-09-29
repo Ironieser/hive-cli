@@ -2634,9 +2634,10 @@ wdb({"700": gnode("g0", cpus=4)})
 wq(dict({str(i): ctask(i) for i in range(2050, 2054)}, **{"2054": dict(ctask(2054, g=1), cmd="sleep 3")}))
 for _ in range(4):
     hs.run_one_cycle()
-chk("without one, --gpus 0 tasks ride on a GPU hold job — leaving a CPU for its free card",
-    states(2050, 2051, 2052) == ["running"] * 3 and rq()["2053"]["state"] == "pending")
-chk("...so the GPU task still gets the card", states(2054) == ["running"] and rq()["2054"]["gpu_slots"] == [0])
+chk("without one, --gpus 0 tasks run on a GPU hold job, up to its CPUs",
+    states(2050, 2051, 2052, 2053) == ["running"] * 4)
+chk("...and the GPU task, which asked for no CPUs, still gets the card",
+    states(2054) == ["running"] and rq()["2054"]["gpu_slots"] == [0])
 time.sleep(3.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle()
 
 reset_sched_state(); reset_health()
@@ -2715,9 +2716,10 @@ else:
     print("  [skip] CPU binding test: fewer than 2 cores or no taskset here")
 hs.live_probe = _lp_real
 
-fresh("6000|RUNNING|6-00:00:00|n0\n6900|RUNNING|6-00:00:00|n1\n6800|PENDING|7-00:00:00|\n")
-chk("autoscale does not count a hold job SLURM allocated CPUs and no GPU; it counts one with "
-    "a GPU, and one SLURM says nothing about", sorted(j["jid"] for j in hauto.observe()) == ["6000", "6800"])
+fresh("6000|RUNNING|6-00:00:00|n0\n6900|RUNNING|6-00:00:00|n1\n6800|PENDING|7-00:00:00|\n6700|RUNNING|6-00:00:00|n2\n")
+chk("autoscale does not count a hold job SLURM allocated CPUs and no GPU; it counts one with a GPU, "
+    "one whose GPU is only named in TresPerNode, and one SLURM says nothing about",
+    sorted(j["jid"] for j in hauto.observe()) == ["6000", "6700", "6800"])
 fresh()
 
 print("== CPU tasks: red team ==")
@@ -2812,6 +2814,84 @@ chk("pool_sizes: what a task could use", hq.pool_sizes(1) == [(4, 64000)] and hq
 _o = dict(gnode("g1")); _o.pop("cpus")
 json.dump({"updated": utc(), "jobs": {"700": gnode("g0", cpus=4), "701": _o}}, open(hs.NODE_DB, "w"))
 chk("...nothing is said when a hold job does not say how large it is", hq.pool_sizes(1) is None)
+
+print("== CPU tasks: red team, round 2 ==")
+# (1) stepping aside is for a GPU task that was refused the CPUs, and for nothing else
+reset_sched_state(); reset_health()
+wdb({"700": gnode("g0", cpus=8)})
+wq({"2200": dict(ctask(2200, g=1, cpus=2), begin_ts=time.time() + 86400, priority=5),
+    "2201": ctask(2201), "2202": ctask(2202),
+    "2203": dict(ctask(2203, g=1, cpus=2), depends_on=[2204], priority=5), "2204": ctask(2204)})
+hs.run_one_cycle()
+chk("a GPU task that is not due does not keep tasks without a GPU off idle CPUs",
+    states(2200, 2201, 2202) == ["waiting_for_begin", "running", "running"])
+chk("a task does not wait for the task that waits for it (deadlock)",
+    states(2203, 2204) == ["waiting_for_dependency", "running"])
+time.sleep(3.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle()
+
+# (2) all of a hold job's CPUs can be asked for
+reset_sched_state()
+wdb({"700": gnode("g0", cpus=4)})
+wq({"2210": ctask(2210, cpus=4)})
+hs.run_one_cycle()
+chk("--gpus 0 --cpus 4 runs on a 4-CPU hold job with a free card",
+    states(2210) == ["running"] and rq()["2210"]["cpu_slots"] == [0, 1, 2, 3])
+time.sleep(3.5); hs.run_one_cycle()
+
+# (3) tasks that fit the CPU hold job wait for ITS probe: no GPU probes nobody needs
+reset_sched_state()
+_asked = []
+_pn = hs.probe_nodes
+hs.probe_nodes = lambda w: (_asked.append(dict(w)), _pn(w))[1]
+wdb({"900": cpunode("c0", cpus=3), "700": gnode("g0"), "701": gnode("g1")})
+wq({str(i): ctask(i) for i in range(2220, 2224)})
+hs.run_one_cycle()
+chk("three tasks fit the CPU hold job, the fourth asks for a GPU hold job: two probes, not four",
+    _asked and _asked[0] == {"900": "cpu", "700": False}
+    and [rq()[str(i)]["slurm_jobid"] for i in range(2220, 2224)] == ["900"] * 3 + ["700"])
+hs.probe_nodes = _pn
+time.sleep(3.5); hs.run_one_cycle()
+
+# (4) the record changes kind between the passes
+reset_sched_state()
+wdb({"900": cpunode("c0", cpus=2)})
+wq({"2230": dict(ctask(2230), cmd="true")})
+def _swap(w):
+    r = _pn(w); wdb({"900": gnode("c0")}); return r
+hs.probe_nodes = _swap
+try:
+    hs.run_one_cycle(); _ok = True
+except Exception as e:
+    _ok = False; print("   ", type(e).__name__, e)
+hs.probe_nodes = _pn
+chk("a record that turns from CPU to GPU hold job between the passes: no error, task waits",
+    _ok and states(2230) == ["verifying_node"])
+hs.run_one_cycle()
+chk("...and runs on it the cycle after", states(2230) == ["running"])
+time.sleep(1); hs.run_one_cycle()
+
+# (5) a binding to fewer cores than asked is said, not passed off as done
+_cores = sorted(os.sched_getaffinity(0))
+if _sp.run("command -v taskset", shell=True, capture_output=True).returncode == 0:
+    _t = dict(ctask(2240, cpus=2), cmd="echo h=$HIVE_CPUS n=$(nproc)", cpu_slots=[0, len(_cores) + 5])
+    _pid = hs.dispatch_task(_t, "900", "c0"); time.sleep(1.5)
+    _l = open(_t["log"]).read()
+    chk("1 of 2 cores: a warning in the log, and HIVE_CPUS says 1",
+        "only 1 of 2" in _l and "h=1 n=1" in _l)
+
+# (6) requeue leaves no CPU slots on a pending task; dbpost keeps the allocation
+_new = {"updated": utc(), "jobs": {"700": dict(gnode("g0"), cpus=None, mem_mb=None, cpu_only=None)}}
+_oldd = {"updated": utc(-900), "jobs": {"700": gnode("g0", cpus=4, mem=64000)}}
+_nf, _of = os.path.join(hs.HIVE_DIR, "a_new.json"), os.path.join(hs.HIVE_DIR, "a_old.json")
+json.dump(_new, open(_nf, "w")); json.dump(_oldd, open(_of, "w"))
+_argv_was = sys.argv; sys.argv = ["hive-dbpost", _nf, _of]
+try:
+    dbp.main()
+finally:
+    sys.argv = _argv_was
+_j = json.load(open(_nf))["jobs"]["700"]
+chk("dbpost: a poll without the allocation keeps the known one",
+    (_j["cpus"], _j["mem_mb"], _j["cpu_only"]) == (4, 64000, False))
 
 print(f"\nPYTHON SUITE: {P['pass']} passed, {P['fail']} failed")
 sys.exit(1 if P["fail"] else 0)
