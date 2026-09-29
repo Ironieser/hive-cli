@@ -76,8 +76,8 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 | A1 | Dispatch latency: wake the scheduler on submit and on a task's exit instead of waiting out the 30 s cycle | done — sched.wake + exit files end the wait; at least 3 s between cycles |
 | A2 | `hive top`: SLOW state, several tasks on one hold job, array index | done |
 | A3 | `hive nodes`: GPU% / MEM over all cards of a hold job, not only card 0 | done — busiest card, memory summed, `xN` |
-| A4 | Canary jobs wait hours in a busy partition | not fixable in hive: the canary is already the smallest job SLURM accepts (1 CPU, 4 GB, 1 GPU, 15 min); in a busy partition it waits for priority like any job. Reboot detection does not depend on it |
-| A5 | "healthy probes → node released" never seen live | still open: needs a node to recover, or a test hold job to be reported and watched for over an hour; the V100 test hold jobs were still queued |
+| A4 | Canary jobs wait hours in a busy partition | not fixable in hive: the canary is already the smallest job SLURM accepts (1 CPU, 4 GB, 1 GPU, 15 min); in a busy partition it waits for priority like any job. Reboot detection does not depend on it. Seen live: the canary for evc43 waited about 9 hours, then ran and released the node |
+| A5 | "healthy probes → node released" never seen live | done — seen live 2026-09-28: evc43 was released at 17:32 after two healthy canary probes; evc48 went from quarantined back to SLOW at 15:29 after two slow-but-ok probes |
 | A6 | Steady-state speed of slow nodes has no healthy same-model reference | cannot be verified: every H100-PCIe node tried was slow or wedged, so there is no healthy reference |
 | A7 | `--timeout` counts the CUDA init time of a slow node | done |
 | A8 | Every array member is a full task record | not changed: members stay full task records (1000 members ≈ 15 MB of queue.json). Bounded by the 1000-member limit and by A9 |
