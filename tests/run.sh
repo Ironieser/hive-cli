@@ -49,8 +49,8 @@ if [[ -n "$jid" ]]; then
   case ",$jid," in *",700,"*|*",9001,"*) echo "$jid";; esac; exit 0; fi
 fmt=""; for a in "$@"; do [[ "$a" == "%i|"* ]] && fmt="$a"; done
 if [[ "$fmt" == *"%j" ]]; then
-  echo "700|nodeX|gpu|1:00:00|20:00:00|hold"
-  echo "801|login1|normal|1:00:00|15-00:00:00|cursor_ssh_proxy"   # must be filtered out
+  echo "700|nodeX|gpu|1:00:00|20:00:00|8|128G|gres/gpu:2|hold"
+  echo "801|login1|normal|1:00:00|15-00:00:00|2|8G|N/A|cursor_ssh_proxy"   # must be filtered out
 else echo "700|nodeX|gpu|1:00:00|20:00:00"; fi
 EOF
 cat > "$TMP/bin/srun" <<'EOF'
@@ -144,6 +144,8 @@ d = json.load(open(os.environ['HIVE_DIR'] + '/node_monitor.json'))
 j = d['jobs']['700']
 assert j['time_left_secs'] == 72000, j['time_left_secs']
 print("  [OK] time_left_secs=72000 parsed from squeue %L (20:00:00)")
+assert j.get('cpus') == 8 and j.get('mem_mb') == 131072 and j.get('cpu_only') is False, j
+print("  [OK] cpus=8, mem_mb=131072, cpu_only=false recorded from squeue %C / %m / %b")
 # Phase-1 multi-GPU: the poller enumerates ALL the job's GPUs (not just --id=0) and the
 # job status is busy if ANY GPU is busy. The mock node has GPU0 idle + GPU1 busy.
 gpu = j.get('gpu', [])

@@ -281,6 +281,17 @@ def pool_nodes():
         return None
 
 
+def pool_sizes():
+    """[(cpus, mem_mb)] of the hold jobs whose size the node DB knows, or None."""
+    try:
+        with open(os.path.join(HIVE_DIR, "node_monitor.json")) as f:
+            jobs = json.load(f).get("jobs", {})
+        return [(int(j.get("cpus") or 0), int(j.get("mem_mb") or 0))
+                for j in jobs.values() if isinstance(j, dict) and j.get("cpus")]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def parse_id_list(text):
     """Task ids from '12,13 14'. Raises ValueError on anything that is not an id."""
     ids = []
@@ -1063,6 +1074,15 @@ def _submit(args, out):
                 print(f"{C_YELLOW}note:{C_RESET} the pool has no hold job on {what} right now — the task "
                       f"waits (waiting_for_node) until it has one. `hive nodes` shows the pool.")
 
+    if cpus or mem_mb:
+        sizes = pool_sizes()
+        if sizes and not any(c >= (cpus or 0) and (not m or m >= (mem_mb or 0)) for c, m in sizes):
+            want = " and ".join(x for x in (f"{cpus} CPUs" if cpus else "",
+                                            f"{mem_mb} MiB" if mem_mb else "") if x)
+            print(f"{C_YELLOW}note:{C_RESET} no hold job in the pool has {want} (the largest: "
+                  f"{max(c for c, _m in sizes)} CPUs, {max(m for _c, m in sizes)} MiB) — the task "
+                  f"waits (insufficient_cpus / insufficient_ram) until one does.")
+
     # Runtime estimate (drives walltime-aware scheduling). Source priority:
     # CLI --est-runtime > #HIVE est_runtime=. Value 'auto' resolves from history.
     est_raw = None
@@ -1228,7 +1248,7 @@ def _submit(args, out):
     if begin_ts:
         print(f"  not before {datetime.fromtimestamp(begin_ts).strftime('%Y-%m-%d %H:%M:%S')}")
     if cpus or mem_mb:
-        print("  step limits: " + ", ".join(x for x in (f"{cpus} CPUs" if cpus else "",
+        print("  takes (and is limited to): " + ", ".join(x for x in (f"{cpus} CPUs" if cpus else "",
                                                            f"{mem_mb} MiB memory" if mem_mb else "") if x))
     if warn_before:
         print(f"  SIGUSR1 to the command {fmt_elapsed(warn_before)} before its node expires")

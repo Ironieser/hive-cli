@@ -349,6 +349,13 @@ def emit(jobid, j):
         mem_str = f"{mem_gb(mem_used)}/{mem_gb(mem_total)}"
         if len(gpus) > 1:
             mem_str += f" x{len(gpus)}"
+        # A hold job without a GPU has CPUs to show instead: taken / all, as the
+        # scheduler counts them (a task takes its --cpus, 1 unless it says so).
+        only = j.get("cpu_only")
+        cpu_job = only if isinstance(only, bool) else status == "cpu"
+        if cpu_job and not gpus:
+            taken = sum(max(1, num(t.get("cpus"), 1)) for t in jobid_tasks.get(jobid, []))
+            mem_str = f"{taken}/{num(j.get('cpus'), 0) or '?'} CPU"
 
         procs = [p for p in (j.get("processes") or []) if isinstance(p, dict)]
         task_cmd = ""
@@ -373,6 +380,8 @@ def emit(jobid, j):
             held   = min(n_gpu, sum(len(t["gpu_slots"]) if t.get("gpu_slots") is not None else n_gpu
                                     for t in jobid_tasks.get(jobid, [])))
             share  = f"(+{more} more, {held}/{n_gpu} GPUs) " if more > 0 else ""
+            if more > 0 and cpu_job and not gpus:
+                share = f"(+{more} more) "
             prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
             task_cmd = prefix + qcmd
             # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
@@ -380,7 +389,7 @@ def emit(jobid, j):
             # slot is taken regardless of GPU state — show it as CLAIMED instead of
             # IDLE, which read as "scheduler ignores idle nodes" and cost several
             # false-alarm debug sessions (feedback #4/#7/#17/#32).
-            if status in ("idle", "warning", "probe_failed", "unknown"):
+            if status in ("idle", "warning", "probe_failed", "unknown") and not cpu_job:
                 status = "claimed"
         # Quarantined node (CUDA init fails there): no dispatches until the scheduler's
         # periodic CUDA probe passes. Shown over idle-ish states; a still-running task

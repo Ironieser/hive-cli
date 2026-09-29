@@ -99,8 +99,23 @@ slurm_time_to_secs() {
 }
 
 # ── probe a single job (runs in background subshell) ─────────────────────────
+# squeue %m ("128G", "4000M", "16384") → MB, or null. What the hold job was GIVEN:
+# the scheduler counts the tasks' --cpus / --mem against it. KEEP IN SYNC with hive-daemon.
+slurm_mem_to_mb() {
+    local m="${1// /}" n u
+    [[ "$m" =~ ^([0-9]+)(\.[0-9]+)?([KMGT]?)[a-z]*$ ]] || { printf 'null'; return; }
+    n="${BASH_REMATCH[1]}"; u="${BASH_REMATCH[3]}"
+    case "$u" in
+        K) printf '%s' "$(( 10#$n / 1024 ))" ;;
+        G) printf '%s' "$(( 10#$n * 1024 ))" ;;
+        T) printf '%s' "$(( 10#$n * 1024 * 1024 ))" ;;
+        *) printf '%s' "$(( 10#$n ))" ;;
+    esac
+}
+
 probe_job() {
     local jobid="$1" node="$2" partition="$3" elapsed_raw="$4" time_left_secs="${5:-null}"
+    local cpus="${6:-null}" mem_mb="${7:-null}" cpu_only="${8:-null}"
     local outfile="${POLL_TMPDIR}/${jobid}.json"
     local polled_at
     polled_at=$(date -u '+%Y-%m-%dT%H:%M:%S')
@@ -255,6 +270,9 @@ probe_job() {
   "probe_detail": "${probe_detail}",
   "gpu_idle_since": null,
   "time_left_secs": ${time_left_secs},
+  "cpus": ${cpus},
+  "mem_mb": ${mem_mb},
+  "cpu_only": ${cpu_only},
   "polled_at": "${polled_at}"
 }
 EOF
@@ -284,7 +302,7 @@ main() {
     # column, so the grep never matched and `hive poll` wrote one more job than the
     # daemon did. KEEP IN SYNC with hive-daemon.
     local squeue_out
-    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%j" 2>/dev/null \
+    squeue_out=$(squeue -u "$USER" -t R --noheader -o "%i|%N|%P|%M|%L|%C|%m|%b|%j" 2>/dev/null \
         | grep -vE '\|(cursor_ssh_proxy|hive_canary)$' \
         | sed 's/|[^|]*$//')   # strip job name column after filtering
 
@@ -301,7 +319,7 @@ main() {
 
     # Launch parallel probes
     local job_ids=()
-    declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT
+    declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT JOB_CPUS JOB_MEM JOB_CPUONLY
 
     # Read squeue into an array first, and give each background probe </dev/null:
     # a backgrounded srun inherits the while-read loop's stdin and can swallow the
@@ -312,7 +330,7 @@ main() {
     done <<< "$squeue_out"
 
     for line in "${squeue_lines[@]}"; do
-        IFS='|' read -r jobid node partition elapsed timeleft <<< "$line"
+        IFS='|' read -r jobid node partition elapsed timeleft cpus mem gres <<< "$line"
         jobid="${jobid// /}"; node="${node// /}"
         partition="${partition// /}"; elapsed="${elapsed// /}"; timeleft="${timeleft// /}"
         [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
@@ -321,8 +339,19 @@ main() {
         JOB_PART["$jobid"]="$partition"
         JOB_ELAPSED["$jobid"]="$elapsed"
         JOB_TIMELEFT["$jobid"]="$(slurm_time_to_secs "$timeleft")"
+        # CPUs and memory of the hold job (squeue %C, %m): what `--cpus` / `--mem` of
+        # the tasks placed on it are counted against. null = not known, never a limit.
+        cpus="${cpus// /}"; [[ "$cpus" =~ ^[0-9]+$ ]] || cpus=null
+        JOB_CPUS["$jobid"]="$cpus"
+        JOB_MEM["$jobid"]="$(slurm_mem_to_mb "$mem")"
+        # squeue %b is what the job asked for ("gres/gpu:1", "N/A"): a hold job without
+        # a GPU is known as one whatever its probe says. Empty (older SLURM) = unknown.
+        if [[ -z "${gres// /}" ]]; then JOB_CPUONLY["$jobid"]=null
+        elif [[ "$gres" == *gpu* ]]; then JOB_CPUONLY["$jobid"]=false
+        else JOB_CPUONLY["$jobid"]=true; fi
         log "Probing job $jobid on $node ($partition) elapsed=$elapsed left=${timeleft:-?} ..."
-        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" </dev/null &
+        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" \
+            "${JOB_CPUS[$jobid]}" "${JOB_MEM[$jobid]}" "${JOB_CPUONLY[$jobid]}" </dev/null &
     done
 
     # Wait up to 30s for all probes
@@ -366,6 +395,9 @@ main() {
   "status": "probe_failed",
   "gpu_idle_since": null,
   "time_left_secs": ${JOB_TIMELEFT[$jid]:-null},
+  "cpus": ${JOB_CPUS[$jid]:-null},
+  "mem_mb": ${JOB_MEM[$jid]:-null},
+  "cpu_only": ${JOB_CPUONLY[$jid]:-null},
   "polled_at": "${fb_polled}"
 }
 FBEOF
