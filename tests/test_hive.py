@@ -2253,6 +2253,11 @@ chk("naming a node the pool does not have: accepted, with a note", _c is None an
 hs.run_one_cycle()
 chk("...and it waits (waiting_for_node) instead of failing", _new()["state"] == "pending"
     and rq()[str(_new()["id"])].get("pending_reason") == "waiting_for_node")
+_busy3 = {k: node(n, 72000, st="busy") for k, n in (("700", "a"), ("701", "b"), ("702", "c"))}
+wdb(_busy3); hs.run_one_cycle()
+chk("...also when every hold job is busy (it used to read no_dispatchable_node)",
+    rq()[str(_new()["id"])].get("pending_reason") == "waiting_for_node")
+wdb({"700": node("a", 72000), "701": dict(node("b", 72000), partition="highgpu"), "702": node("c", 72000)})
 chk("refused: a node both in --nodelist and --exclude",
     _rc(hq.cmd_submit, _nsR(nodelist="a,b", exclude="b"))[0] == 2)
 chk("refused: --nodes 3 with a --nodelist of two", _rc(hq.cmd_submit, _nsR(nodes=3, nodelist="a,b"))[0] == 2)

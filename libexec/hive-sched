@@ -2090,6 +2090,9 @@ def _cycle(probe_cache, final):
             # and every task behind it `no_dispatchable_node`).
             if not jobs_db:
                 reason = "pool_empty"
+            elif (task.get("only_nodes") or task.get("partition")) \
+                    and not any(allowed_here(task, i_) for i_ in jobs_db.values()):
+                reason = "waiting_for_node"      # the pool has no hold job where it may run
             elif not candidates and node_reject:
                 reason = node_reject
             elif not candidates and n_quarantined_jobs:
