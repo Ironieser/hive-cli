@@ -5,6 +5,7 @@
   "health_canary": true,
   "prefer_partitions": [],
   "fair_share": false,
+  "cpu_tasks_on_gpu": false,
   "auto_prune_days": 14,
   "log_keep_days": 0,
   "autoscale": {
@@ -25,6 +26,10 @@
     "highgpu": {
       "script": "~/1_gpu.slurm",
       "description": "High-end GPU partition"
+    },
+    "cpu": {
+      "script": "~/1_cpu_hold.slurm",
+      "description": "No GPU (no --gres): for `hive submit --gpus 0` tasks, as many at once as it has CPUs"
     }
   }
 }

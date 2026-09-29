@@ -281,6 +281,53 @@ def pool_nodes():
         return None
 
 
+def pool_jobs():
+    """The hold job records of the node DB, or None if it cannot be read."""
+    try:
+        with open(os.path.join(HIVE_DIR, "node_monitor.json")) as f:
+            return [j for j in json.load(f).get("jobs", {}).values() if isinstance(j, dict)]
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def is_cpu_hold_job(info):
+    """As in hive-sched: a hold job without a GPU. KEEP IN SYNC."""
+    if info.get("gpu"):
+        return False
+    only = info.get("cpu_only")
+    return only if isinstance(only, bool) else info.get("status") == "cpu"
+
+
+def cpu_tasks_on_gpu():
+    try:
+        with open(os.path.join(HIVE_DIR, "pool_config.json")) as f:
+            return json.load(f).get("cpu_tasks_on_gpu", False) is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def pool_sizes(gpus=1):
+    """[(cpus, mem_mb)] of the hold jobs a task with `gpus` could go to — or None when
+    that cannot be said: the node DB is unreadable, or one of them does not say how
+    large it is (the scheduler does not limit such a hold job)."""
+    try:
+        with open(os.path.join(HIVE_DIR, "node_monitor.json")) as f:
+            jobs = json.load(f).get("jobs", {})
+        sizes = []
+        for j in jobs.values():
+            if not isinstance(j, dict):
+                continue
+            if (gpus > 0) == is_cpu_hold_job(j) and not (gpus <= 0 and cpu_tasks_on_gpu()):
+                continue                    # not a hold job this task may use
+            c, m = j.get("cpus"), j.get("mem_mb")
+            if not isinstance(c, int) or isinstance(c, bool) or c <= 0:
+                return None
+            sizes.append((c, m if isinstance(m, int) and not isinstance(m, bool) and m > 0 else None))
+        return sizes
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def parse_id_list(text):
     """Task ids from '12,13 14'. Raises ValueError on anything that is not an id."""
     ids = []
@@ -1063,6 +1110,23 @@ def _submit(args, out):
                 print(f"{C_YELLOW}note:{C_RESET} the pool has no hold job on {what} right now — the task "
                       f"waits (waiting_for_node) until it has one. `hive nodes` shows the pool.")
 
+    if int(spec.get("gpus", DEFAULT_TASK_GPUS)) <= 0 and not cpu_tasks_on_gpu():
+        jobs = pool_jobs()
+        if jobs is not None and not any(is_cpu_hold_job(j) for j in jobs):
+            print(f"{C_YELLOW}note:{C_RESET} the pool has no hold job without a GPU — a --gpus 0 task "
+                  f"waits (no_cpu_hold_job) until it has one: `hive pool add <cpu preset or script>`. "
+                  f"It is not run on a GPU hold job.")
+    if cpus or mem_mb:
+        sizes = pool_sizes(int(spec.get("gpus", DEFAULT_TASK_GPUS)))
+        if sizes and not any(c >= (cpus or 0) and (m is None or m >= (mem_mb or 0)) for c, m in sizes):
+            want = " and ".join(x for x in (f"{cpus} CPUs" if cpus else "",
+                                            f"{mem_mb} MiB" if mem_mb else "") if x)
+            mems = [m for _c, m in sizes if m is not None]
+            print(f"{C_YELLOW}note:{C_RESET} no hold job it could use has {want} (the largest: "
+                  f"{max(c for c, _m in sizes)} CPUs"
+                  + (f", {max(mems)} MiB" if mems else "") + ") — the task "
+                  f"waits (insufficient_cpus / insufficient_ram) until one does.")
+
     # Runtime estimate (drives walltime-aware scheduling). Source priority:
     # CLI --est-runtime > #HIVE est_runtime=. Value 'auto' resolves from history.
     est_raw = None
@@ -1228,7 +1292,7 @@ def _submit(args, out):
     if begin_ts:
         print(f"  not before {datetime.fromtimestamp(begin_ts).strftime('%Y-%m-%d %H:%M:%S')}")
     if cpus or mem_mb:
-        print("  step limits: " + ", ".join(x for x in (f"{cpus} CPUs" if cpus else "",
+        print("  takes (and is limited to): " + ", ".join(x for x in (f"{cpus} CPUs" if cpus else "",
                                                            f"{mem_mb} MiB memory" if mem_mb else "") if x))
     if warn_before:
         print(f"  SIGUSR1 to the command {fmt_elapsed(warn_before)} before its node expires")

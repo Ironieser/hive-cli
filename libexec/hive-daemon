@@ -117,9 +117,42 @@ slurm_time_to_secs() {
     printf '%s' "$(( days*86400 + h*3600 + m*60 + s ))"
 }
 
+# "128G" / "4000M" / "1.50G" / "16384" → MB, or null (also for anything absurd: it is
+# written into the node DB as it is). KEEP IN SYNC with hive-poll.
+slurm_mem_to_mb() {
+    local m="${1// /}"
+    [[ "$m" =~ ^[0-9]{1,9}(\.[0-9]{1,6})?[KMGT]?$ ]] || { printf 'null'; return; }
+    awk -v m="$m" 'BEGIN { u = substr(m, length(m)); n = m + 0
+        f = (u == "K") ? 1/1024 : (u == "G") ? 1024 : (u == "T") ? 1048576 : 1
+        v = int(n * f); if (v > 0 && v < 1e12) printf "%d", v; else printf "null" }'
+}
+
+# What SLURM ALLOCATED to each running job, "cpu=4,mem=128G,node=1,billing=4,gres/gpu=1"
+# (squeue -O tres-alloc), into JOB_CPUS / JOB_MEM / JOB_CPUONLY. The allocation, not the
+# request: `%m` is per CPU for a --mem-per-cpu job and `%b` is empty for one that asked
+# for its GPU with --gpus, which made a GPU hold job look like one without. Whatever
+# cannot be read stays null — "not known", which is never a limit and never "no GPU".
+read_tres() {
+    local line jid tres part p
+    while IFS= read -r line; do
+        read -r jid tres <<< "$line"
+        [[ "$jid" =~ ^[0-9]+$ && "$tres" == *cpu=* ]] || continue
+        JOB_CPUONLY["$jid"]=true
+        IFS=',' read -ra part <<< "$tres"
+        for p in "${part[@]}"; do
+            case "$p" in
+                cpu=*)       [[ "${p#cpu=}" =~ ^[0-9]{1,6}$ ]] && JOB_CPUS["$jid"]="${p#cpu=}" ;;
+                mem=*)       JOB_MEM["$jid"]="$(slurm_mem_to_mb "${p#mem=}")" ;;
+                gres/gpu*)   JOB_CPUONLY["$jid"]=false ;;
+            esac
+        done
+    done < <(squeue -u "$USER" -t R --noheader -O "JobID:20,tres-alloc:400" 2>/dev/null)
+}
+
 # ── probe a single job ────────────────────────────────────────────────────────
 probe_job() {
     local jobid="$1" node="$2" partition="$3" elapsed_raw="$4" time_left_secs="${5:-null}"
+    local cpus="${6:-null}" mem_mb="${7:-null}" cpu_only="${8:-null}"
     local outfile="${POLL_TMPDIR}/${jobid}.json"
     local polled_at
     polled_at=$(date -u '+%Y-%m-%dT%H:%M:%S')
@@ -227,6 +260,11 @@ probe_job() {
         status="idle"
     fi
 
+    # "No GPU" takes SLURM and the probe to agree: on a cluster whose TRES does not name
+    # GPUs every hold job would read as one without. A probe that did not run says nothing.
+    if (( probe_failed )); then cpu_only=null
+    elif [[ -n "$gpu_granted" || "$max_gpu_total" -gt 0 ]]; then cpu_only=false; fi
+
     cat > "$outfile" <<EOF
 "${jobid}": {
   "node": "$(json_escape "$node")",
@@ -238,6 +276,9 @@ probe_job() {
   "probe_detail": "${probe_detail}",
   "gpu_idle_since": null,
   "time_left_secs": ${time_left_secs},
+  "cpus": ${cpus},
+  "mem_mb": ${mem_mb},
+  "cpu_only": ${cpu_only},
   "polled_at": "${polled_at}"
 }
 EOF
@@ -279,7 +320,8 @@ do_poll() {
     fi
 
     local job_ids=()
-    declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT
+    declare -A JOB_NODE JOB_PART JOB_ELAPSED JOB_TIMELEFT JOB_CPUS JOB_MEM JOB_CPUONLY
+    read_tres
 
     # 先把 squeue 结果全部读入数组，避免 while read 的 stdin 被后台 srun 消耗
     local -a squeue_lines=()
@@ -288,7 +330,7 @@ do_poll() {
     done <<< "$squeue_out"
 
     for line in "${squeue_lines[@]}"; do
-        IFS='|' read -r jobid node partition elapsed timeleft <<< "$line"
+        IFS='|' read -r jobid node partition elapsed timeleft _rest <<< "$line"   # _rest: a job name with a | in it
         jobid="${jobid// /}"; node="${node// /}"
         partition="${partition// /}"; elapsed="${elapsed// /}"; timeleft="${timeleft// /}"
         [[ -z "$jobid" || -z "$node" || "$node" == "N/A" ]] && continue
@@ -298,7 +340,8 @@ do_poll() {
         JOB_ELAPSED["$jobid"]="$elapsed"
         JOB_TIMELEFT["$jobid"]="$(slurm_time_to_secs "$timeleft")"
         log "Probing job $jobid on $node ($partition) elapsed=$elapsed left=${timeleft:-?} ..."
-        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" </dev/null &
+        probe_job "$jobid" "$node" "$partition" "$elapsed" "${JOB_TIMELEFT[$jobid]}" \
+            "${JOB_CPUS[$jobid]:-null}" "${JOB_MEM[$jobid]:-null}" "${JOB_CPUONLY[$jobid]:-null}" </dev/null &
     done
 
     # Wait up to 35s for all probes
@@ -339,6 +382,9 @@ do_poll() {
   "status": "probe_failed",
   "gpu_idle_since": null,
   "time_left_secs": ${JOB_TIMELEFT[$jid]:-null},
+  "cpus": ${JOB_CPUS[$jid]:-null},
+  "mem_mb": ${JOB_MEM[$jid]:-null},
+  "cpu_only": null,
   "polled_at": "${polled_at}"
 }
 FBEOF

@@ -349,6 +349,14 @@ def emit(jobid, j):
         mem_str = f"{mem_gb(mem_used)}/{mem_gb(mem_total)}"
         if len(gpus) > 1:
             mem_str += f" x{len(gpus)}"
+        # A hold job without a GPU has CPUs to show instead: taken / all, as the
+        # scheduler counts them (a task takes its --cpus, 1 unless it says so).
+        only = j.get("cpu_only")
+        cpu_job = not gpus and (only if isinstance(only, bool) else status == "cpu")
+        if cpu_job:
+            taken = sum(max(1, num(t.get("cpus"), 1)) for t in jobid_tasks.get(jobid, []))
+            total = num(j.get("cpus"), 0)
+            mem_str = f"{taken}/{total if 0 < total < 100000 else '?'} CPU"
 
         procs = [p for p in (j.get("processes") or []) if isinstance(p, dict)]
         task_cmd = ""
@@ -373,6 +381,8 @@ def emit(jobid, j):
             held   = min(n_gpu, sum(len(t["gpu_slots"]) if t.get("gpu_slots") is not None else n_gpu
                                     for t in jobid_tasks.get(jobid, [])))
             share  = f"(+{more} more, {held}/{n_gpu} GPUs) " if more > 0 else ""
+            if more > 0 and cpu_job:
+                share = f"(+{more} more) "
             prefix = share + f"#{tid}" + (f" [{owner}]" if owner else "") + (f" {name}: " if name else ": ")
             task_cmd = prefix + qcmd
             # A hive task is RUNNING on this hold job but the GPU reading is not (yet)
@@ -380,12 +390,16 @@ def emit(jobid, j):
             # slot is taken regardless of GPU state — show it as CLAIMED instead of
             # IDLE, which read as "scheduler ignores idle nodes" and cost several
             # false-alarm debug sessions (feedback #4/#7/#17/#32).
-            if status in ("idle", "warning", "probe_failed", "unknown"):
+            if status in ("idle", "warning", "probe_failed", "unknown") and not cpu_job:
                 status = "claimed"
+            elif cpu_job and status == "cpu":
+                status = "cpu_busy"      # display only: a CPU hold job with tasks on it
         # Quarantined node (CUDA init fails there): no dispatches until the scheduler's
         # periodic CUDA probe passes. Shown over idle-ish states; a still-running task
         # keeps BUSY/CLAIM so the operator can see it.
-        if node in quarantined and status not in ("busy", "claimed"):
+        if cpu_job:
+            pass                     # no GPU: what is wrong with the node's does not apply
+        elif node in quarantined and status not in ("busy", "claimed"):
             status = "quarantined"
         elif node in slow and status not in ("busy", "claimed", "probe_failed"):
             status = "slow"          # (a probe that failed says more than "slow")
@@ -515,7 +529,7 @@ show_table() {
             # tasks only, after every faster node. `hive health` for details.
             status_upper="SLOW ";   status_color="${YELLOW}"
             n_slow=$(( n_slow + 1 ))
-        elif [[ "$status" == "cpu" ]]; then
+        elif [[ "$status" == "cpu" || "$status" == "cpu_busy" ]]; then
             status_upper="CPU  ";   status_color="${CYAN}${BOLD}"
             n_cpu=$(( n_cpu + 1 ))
         elif [[ "$status" == "warning" ]]; then
@@ -550,7 +564,7 @@ show_table() {
         (( job_stale )) && node_text="${node}!"
 
         local task_text task_color
-        if [[ ( "$status" == "busy" || "$status" == "claimed" ) && -n "$task_cmd" ]]; then
+        if [[ ( "$status" == "busy" || "$status" == "claimed" || "$status" == "cpu_busy" ) && -n "$task_cmd" ]]; then
             task_text="$task_cmd"; task_color=""
         elif [[ "$task_cmd" == "[read "* ]]; then
             # a stale row of an idle-looking job: how old the reading is (feedback #27)

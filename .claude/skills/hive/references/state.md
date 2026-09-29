@@ -45,7 +45,7 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `array_id`, `array_index`, `array_max_running`; `max_running` (owner cap).
 - `fail_reason` (`timeout` | `dependency_failed`), `exit_code` (124 / 125 for those).
 - `gang_size`, `gang_hosts` (multi-node members; `array_id` / `array_index` = rank),
-  `preempt`, `preemptible`, `preempt_count`, `begin_ts`, `cpus`, `mem_mb`,
+  `preempt`, `preemptible`, `preempt_count`, `begin_ts`, `cpus`, `mem_mb`, `cpu_slots` (positions in the hold job's core list the task is bound to),
   `warn_before_secs`, `warned_ts`.
 - `gpu_slots`: positions of the cards it holds within the hold job (absent on tasks
   dispatched before GPU slots: those hold the whole hold job).
@@ -56,6 +56,8 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `status`: `idle | busy | warning | probe_failed | cpu` (`CLAIM` and `QUAR` in
   `hive nodes` are display-only overlays from `queue.json` / `node_health.json`).
 - `gpu`: `[{index, util, mem_used, mem_total}]` for every GPU the hold job owns.
+- `cpus`, `mem_mb`: what SLURM allocated to the hold job (`squeue -O tres-alloc`); `null` =
+  not known, then nothing is counted against it. `cpu_only`: allocated no GPU.
 - `time_left_secs`: remaining walltime measured at the DB's `updated` (`-1` unlimited,
   `null` unknown); subtract the DB age for a live value.
 - `carried_forward: true`: last-good reading reused after a transient probe miss.

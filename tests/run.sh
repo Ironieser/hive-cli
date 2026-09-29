@@ -47,14 +47,27 @@ if [[ -n "$jid" ]]; then
     [[ -e "$HIVE_DIR/mock_canary_purged" ]] && { echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; }
     cat "$HIVE_DIR/mock_canary_state" 2>/dev/null; exit 0; fi
   case ",$jid," in *",700,"*|*",9001,"*) echo "$jid";; esac; exit 0; fi
+# what SLURM allocated (`-O JobID,tres-alloc`, the pollers). $HIVE_DIR/mock_cpu_job adds
+# hold job 777, which has no GPU; mock_tres_fail = this form of squeue does not work
+if [[ "$*" == *"tres-alloc"* ]]; then
+  [[ -e "$HIVE_DIR/mock_tres_fail" ]] && exit 1
+  echo "700                 cpu=8,mem=128G,node=1,billing=8,gres/gpu=2"
+  echo "801                 cpu=2,mem=8G,node=1,billing=2"
+  [[ -e "$HIVE_DIR/mock_cpu_job" ]] && echo "777                 cpu=16,mem=1.50G,node=1,billing=16"
+  exit 0; fi
 fmt=""; for a in "$@"; do [[ "$a" == "%i|"* ]] && fmt="$a"; done
 if [[ "$fmt" == *"%j" ]]; then
   echo "700|nodeX|gpu|1:00:00|20:00:00|hold"
   echo "801|login1|normal|1:00:00|15-00:00:00|cursor_ssh_proxy"   # must be filtered out
+  [[ -e "$HIVE_DIR/mock_cpu_job" ]] && echo "777|nodeC|normal|1:00:00|20:00:00|odd|name"
 else echo "700|nodeX|gpu|1:00:00|20:00:00"; fi
 EOF
 cat > "$TMP/bin/srun" <<'EOF'
 #!/usr/bin/env bash
+# $HIVE_DIR/mock_srun_dead lists hold jobs that are gone: no step can be started there
+for x in "$@"; do [[ "$x" == --jobid=* ]] && grep -qx "${x#--jobid=}" "$HIVE_DIR/mock_srun_dead" 2>/dev/null \
+  && { echo "srun: error: Invalid job id specified" >&2; exit 1; }; done
+for x in "$@"; do [[ "$x" == --jobid=* ]] && export SLURM_JOB_ID="${x#--jobid=}"; done
 a=("$@"); for i in "${!a[@]}"; do [[ "${a[$i]}" == "bash" ]] && exec "${a[@]:$i}"; done; exit 0
 EOF
 # scontrol show node: booted long ago unless $HIVE_DIR/mock_boot holds another BootTime.
@@ -64,10 +77,16 @@ if [[ "$1 $2" == "show job" ]]; then
   case "$3" in
     5001) exc="evc[1-3]"; out="$HIVE_DIR/pool-logs/slurm-5001.out";;
     5002) exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-5002.out";;
+    69*)  exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-$3.out"; tres="cpu=8,mem=16G,node=1,billing=8";;   # …one without a GPU
+    68*)  exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-$3.out"; tres="cpu=4,mem=64G,node=1,billing=4,gres/gpu=1";;
+    67*)  exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-$3.out"; tres="cpu=4,mem=64G,node=1,billing=4"; per="gres/gpu:1";;   # GPUs not in this cluster's TRES
     6*)   exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-$3.out";;        # hold jobs of the autoscale tests
     *)    exc="(null)";   out="/somewhere/else/slurm-$3.out";;        # not a hold job
   esac
-  printf 'JobId=%s JobName=hold\n   ExcNodeList=%s\n   StdOut=%s\n' "$3" "$exc" "$out"; exit 0
+  printf 'JobId=%s JobName=hold\n   ExcNodeList=%s\n   StdOut=%s\n' "$3" "$exc" "$out"
+  [[ -n "${tres:-}" ]] && printf '   ReqTRES=%s\n   AllocTRES=%s\n' "$tres" "$tres"
+  [[ -n "${per:-}" ]] && printf '   TresPerNode=%s\n' "$per"
+  exit 0
 fi
 if [[ "$1" == "update" ]]; then echo "$*" >> "$HIVE_DIR/mock_scontrol_update.log"; exit 0; fi
 node="${@: -1}"
@@ -99,6 +118,8 @@ echo "$*" >> "$HIVE_DIR/mock_scancel.log"
 EOF
 cat > "$TMP/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
+# hold job 777 has no GPU
+[[ "${SLURM_JOB_ID:-}" == 777 ]] && { echo "No devices were found"; exit 6; }
 # compute-apps: no GPU processes in the mock cluster
 [[ "$*" == *"--query-compute-apps"* ]] && exit 0
 # A wedged driver: nvidia-smi never answers within the probe's deadline.
@@ -144,6 +165,8 @@ d = json.load(open(os.environ['HIVE_DIR'] + '/node_monitor.json'))
 j = d['jobs']['700']
 assert j['time_left_secs'] == 72000, j['time_left_secs']
 print("  [OK] time_left_secs=72000 parsed from squeue %L (20:00:00)")
+assert j.get('cpus') == 8 and j.get('mem_mb') == 131072 and j.get('cpu_only') is False, j
+print("  [OK] cpus=8, mem_mb=131072, cpu_only=false recorded from the SLURM allocation")
 # Phase-1 multi-GPU: the poller enumerates ALL the job's GPUs (not just --id=0) and the
 # job status is busy if ANY GPU is busy. The mock node has GPU0 idle + GPU1 busy.
 gpu = j.get('gpu', [])
@@ -154,6 +177,39 @@ print("  [OK] poller sees BOTH GPUs (idx 0,1); node busy because GPU1 is busy")
 assert '801' not in d['jobs'], sorted(d['jobs'])
 print("  [OK] hive-poll filters cursor_ssh_proxy like the daemon (was: no %j column, grep never matched)")
 PY
+echo "[poll] a hold job without a GPU, and SLURM not saying what was allocated"
+touch "$HIVE_DIR/mock_cpu_job"
+"$REPO/libexec/hive-poll" >/dev/null 2>&1 || true
+"$PY" - <<'PY' || fail=1
+import json, os
+d = json.load(open(os.environ['HIVE_DIR'] + '/node_monitor.json'))['jobs']
+c = d['777']
+assert (c['cpus'], c['mem_mb'], c['cpu_only']) == (16, 1536, True), c
+print("  [OK] hold job without a GPU: cpus=16, mem_mb=1536 (1.50G), cpu_only=true")
+assert c['node'] == 'nodeC' and c['time_left_secs'] == 72000, c
+print("  [OK] a job name with a | in it does not shift the columns")
+assert d['700']['cpu_only'] is False and '801' not in d
+print("  [OK] the GPU hold job is still one; the ssh proxy is still left out")
+PY
+touch "$HIVE_DIR/mock_tres_fail"
+"$REPO/libexec/hive-poll" >/dev/null 2>&1 || true
+"$PY" - <<'PY' || fail=1
+import json, os
+d = json.load(open(os.environ['HIVE_DIR'] + '/node_monitor.json'))['jobs']
+assert (d['777']['cpus'], d['777']['mem_mb'], d['777']['cpu_only']) == (16, 1536, True), d['777']
+print("  [OK] a poll that cannot read the allocation keeps what the last one knew")
+PY
+rm -f "$HIVE_DIR/node_monitor.json"
+"$REPO/libexec/hive-poll" >/dev/null 2>&1 || true
+"$PY" - <<'PY' || fail=1
+import json, os
+d = json.load(open(os.environ['HIVE_DIR'] + '/node_monitor.json'))['jobs']
+assert (d['777']['cpus'], d['777']['mem_mb'], d['777']['cpu_only']) == (None, None, None), d['777']
+assert (d['700']['cpus'], d['700']['cpu_only']) == (None, False), d['700']
+print("  [OK] never known -> null (never a limit, never 'no GPU'); a GPU the probe saw is a GPU")
+PY
+rm -f "$HIVE_DIR/mock_cpu_job" "$HIVE_DIR/mock_tres_fail"
+"$REPO/libexec/hive-poll" >/dev/null 2>&1 || true
 printf '700|nodeX|gpu|1:00:00|20:00:00|hold\n4242|nodeX|gpu|0:01|9:00|hive_canary\n' \
   | grep -vE "$(grep -o "grep -vE '[^']*'" "$REPO/libexec/hive-daemon" | sed "s/grep -vE '//;s/'$//")" | grep -q hive_canary \
   && { echo "  [FAIL] poller filter lets hive_canary into the pool"; fail=1; } \
@@ -229,6 +285,28 @@ _nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 if grep -q "(+1 more, 2/2 GPUs) #1 sw\[0\]: python train.py" <<<"$_nodes"; then
   echo "  [OK] a shared hold job shows how many tasks and cards, and the array index"
 else echo "  [FAIL] shared hold job display"; echo "$_nodes" | tail -8; fail=1; fi
+# A hold job without a GPU: CPUs taken / all, its tasks shown, never CLAIM or QUAR.
+"$PY" - <<'PY'
+import json, os, time
+H = os.environ['HIVE_DIR']
+now = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
+json.dump({"updated": now, "jobs": {"900": {"node": "nodeC", "partition": "normal", "job_elapsed": "1h",
+    "gpu": [], "processes": [], "status": "cpu", "cpus": 8, "mem_mb": 16384, "cpu_only": True,
+    "gpu_idle_since": None, "time_left_secs": 72000, "polled_at": now}}}, open(H + "/node_monitor.json", "w"))
+t = lambda i, **k: dict({"id": i, "name": "prep", "cmd": "python prep.py", "state": "running",
+    "slurm_jobid": "900", "node": "nodeC", "submitted_at": now, "started_at": now, "gpus": 0,
+    "gpu_slots": [], "log": H + f"/logs/task-{i}.log"}, **k)
+json.dump({"version": 1, "next_id": 3, "tasks": {"1": t(1, cpus=4, cpu_slots=[0, 1, 2, 3]),
+    "2": t(2, cpu_slots=[4])}}, open(H + "/queue.json", "w"))
+json.dump({"nodes": {"nodeC": {"state": "quarantined", "reason": "x", "since": time.time()}}},
+          open(H + "/node_health.json", "w"))
+PY
+_nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+if grep -q "CPU .*5/8 CPU" <<<"$_nodes" && grep -q "(+1 more) #1 prep: python prep.py" <<<"$_nodes" \
+   && ! grep -q "CLAIM\|QUAR " <<<"$_nodes"; then
+  echo "  [OK] a hold job without a GPU shows CPUs taken/all and its tasks, also on a quarantined node"
+else echo "  [FAIL] CPU hold job display"; echo "$_nodes" | tail -8; fail=1; fi
+rm -f "$HIVE_DIR/node_health.json"
 # GPU% / MEM over all cards; SLOW; how old a stale row is (feedback #27)
 "$PY" - <<'PY'
 import json, os, time
@@ -248,7 +326,7 @@ json.dump({"nodes": {"slown": {"state": "slow", "slow_init_secs": 184, "strikes"
           open(H + "/node_health.json", "w"))
 PY
 _nodes=$("$REPO/libexec/hive-nodes" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-if grep -E "^ +700 +two.* BUSY +90% +40G/160G x2 +20h0m " <<<"$_nodes" >/dev/null; then
+if grep -E "^ +700 +two.* BUSY +90% +40G/160G x2 +(20h0m|19h59m) " <<<"$_nodes" >/dev/null; then
   echo "  [OK] GPU% is the busiest card, MEM the sum over all cards"
 else echo "  [FAIL] multi-card columns"; echo "$_nodes" | tail -8; fail=1; fi
 if grep -E "^ +701 +slown.* SLOW " <<<"$_nodes" >/dev/null && grep -q "slow: 1" <<<"$_nodes"; then
