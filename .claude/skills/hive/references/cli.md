@@ -48,6 +48,7 @@ cancelled · `2` an id that never existed · `75` pending timeout. Test for `!= 
 
 ```bash
 hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [--exclude NODES] \
+            [--nodelist NODES] [--partition NAME] \
             [--timeout DUR] [--notify CMD] [--after ID,ID | --after-any ID,ID] \
             [--array SPEC] [--max-running N] [--nodes N [--same-node]] \
             [--preempt | --preemptible] \
@@ -77,6 +78,8 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--begin` | — | earliest start: a delay (`2h`), a date and time (`2026-10-01T08:00`) or a time of day (`08:00`, tomorrow if past). A bare number or a time in the past is an error. `waiting_for_begin` until then |
 | `--cpus` / `--mem` | all / none | CPUs and memory (MiB) of the task's step. hive does not know what a hold job has (usually 4 CPUs): asking for more makes SLURM refuse the step and the task fails. A task over its `--mem` is killed by SLURM |
 | `--warn-before` | — | send `SIGUSR1` this long before the node's walltime ends — once per run, to **every process of the command** (it may arrive twice). The program that should checkpoint must handle it: a process without a handler is ended by SIGUSR1. Shell scripts around it are taken care of. Not sent in a command's first 60 s; the task is not placed on a node that expires sooner than that. The notify hook gets `HIVE_TASK_EVENT=expiring` |
+| `--nodelist` | — | run ONLY on these nodes (`evc104,evc[102-103]`). The task waits (`waiting_for_node`) while none of them has a free hold job — also if the pool has no hold job there at all, which submit tells you |
+| `--partition` | — | run only on hold jobs of this SLURM partition (`hive nodes`, column PART) |
 | `--exclude` / `-x` | — | nodes the task must not run on (`evc22,evc[40-43]`); it waits (`node_excluded`) rather than use them. Broken nodes don't need this — hive quarantines them itself |
 | `--workdir` / `-w` | cwd | working directory on the node |
 | `--priority` / `-p` | 0 | higher dispatches first (`-p=-5` for negatives) |
@@ -104,7 +107,8 @@ python eval.py --model $MODEL --skip-existing
 
 Directives: `workdir`, `priority`, `name`, `owner`, `need_mb`, `gpus`, `est_runtime`, `exclude`,
 `timeout`, `notify`, `after`, `after_any`, `array`, `max_running`, `allow_slow`, `nodes`,
-`same_node`, `preempt`, `preemptible`, `begin`, `cpus`, `mem`, `warn_before`. They may be
+`same_node`, `preempt`, `preemptible`, `begin`, `cpus`, `mem`, `warn_before`, `nodelist`,
+`partition`. They may be
 spelled like the flags (`#HIVE warn-before=10m`); yes/no ones may stand alone
 (`#HIVE preemptible`). An unknown directive, or one without its value, is an error. Other `#` lines
 are comments; the rest is the command.
@@ -213,6 +217,7 @@ hive submit --notify 'curl -s -d "task $HIVE_TASK_NAME: $HIVE_TASK_STATE" https:
 | `preempted` / `preempting` | It was stopped for a task of higher priority and waits again / it has asked a `--preemptible` task to stop |
 | `waiting_for_gpu` | The hold jobs with enough cards have them taken by other hive tasks; it starts when one ends |
 | `held` | `hive hold` was used on it; `hive unhold ID` lets it go |
+| `waiting_for_node` | The nodes or partition it was restricted to (`--nodelist`, `--partition`) have no free hold job |
 | `node_excluded` | The only free nodes are in the task's `--exclude` list |
 | `insufficient_gpus` | No hold job owns `--gpus N` cards → add a `--gres=gpu:N` hold job or lower N |
 | `insufficient_walltime` | No node has est + 10 min left → `hive pool add --time …` or lower `--est-runtime` |

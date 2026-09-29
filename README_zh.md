@@ -180,6 +180,7 @@ hive submit --priority 9 --preempt "python urgent.py"          # 可以挤掉 --
 hive submit --preemptible --est-runtime 12h "python long.py"   # 同意被挤掉并重新排队
 hive submit --max-running 3 …   (或 export HIVE_MAX_RUNNING=3) # 该 owner 最多同时运行 3 个任务
 hive submit --exclude evc22 --no-slow "python x.py"            # 不上这些节点 / 不上慢节点
+hive submit --nodelist evc104 | --partition highgpu "…"        # 只在这些节点 / 这个分区上运行
 hive hold 3 | hive unhold 3 | hive priority 10 3               # 调整尚未启动的任务
 ```
 

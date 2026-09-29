@@ -271,6 +271,16 @@ def wake_scheduler():
         pass
 
 
+def pool_nodes():
+    """[(node, partition)] of the hold jobs in the node DB, or None if it cannot be read."""
+    try:
+        with open(os.path.join(HIVE_DIR, "node_monitor.json")) as f:
+            jobs = json.load(f).get("jobs", {})
+        return [(j.get("node"), j.get("partition")) for j in jobs.values() if isinstance(j, dict)]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+
+
 def parse_id_list(text):
     """Task ids from '12,13 14'. Raises ValueError on anything that is not an id."""
     ids = []
@@ -466,7 +476,7 @@ def task_elapsed(task):
 # ── .hive file parser ─────────────────────────────────────────────────────────
 
 DIRECTIVES = {"workdir", "priority", "name", "owner", "need_mb", "gpus", "est_runtime",
-              "exclude", "timeout", "notify", "after", "after_any", "array", "max_running",
+              "exclude", "nodelist", "partition", "timeout", "notify", "after", "after_any", "array", "max_running",
               "allow_slow", "begin", "cpus", "mem", "warn_before", "nodes", "preempt",
               "preemptible", "same_node"}
 BOOL_DIRECTIVES = {"allow_slow", "preempt", "preemptible", "same_node"}
@@ -548,6 +558,9 @@ def parse_hive_file(path):
         result["est_runtime"] = meta["est_runtime"]   # parsed/resolved in cmd_submit
     if "exclude" in meta:
         result["exclude"] = meta["exclude"]           # expanded in cmd_submit
+    for key in ("nodelist", "partition"):
+        if key in meta:
+            result[key] = meta[key]                   # checked in cmd_submit
     for key in ("after", "after_any", "array", "max_running", "allow_slow", "begin",
                 "cpus", "mem", "warn_before", "nodes", "preempt", "preemptible", "same_node"):
         if key in meta:
@@ -1016,6 +1029,40 @@ def _submit(args, out):
     else:
         notify = (spec.get("notify") or os.environ.get("HIVE_NOTIFY") or "").strip()
 
+    # Nodes this task may ONLY run on (--nodelist, like sbatch -w) and the partition of
+    # the hold job it wants. Both narrow the choice; a task that names nodes the pool
+    # does not have waits until it has them.
+    only_nodes = []
+    nl_raw = getattr(args, "nodelist", None) or spec.get("nodelist")
+    if nl_raw:
+        try:
+            only_nodes = hh.expand_nodes(nl_raw)
+        except ValueError as e:
+            print(f"{C_RED}error:{C_RESET} {e}", file=sys.stderr)
+            sys.exit(2)
+        both = [n for n in only_nodes if n in exclude_nodes]
+        if both:
+            print(f"{C_RED}error:{C_RESET} {', '.join(both)} is in --nodelist and in --exclude",
+                  file=sys.stderr)
+            sys.exit(2)
+        if gang and not same_node and len(only_nodes) < gang:
+            print(f"{C_RED}error:{C_RESET} --nodes {gang} needs {gang} different nodes, "
+                  f"--nodelist names {len(only_nodes)} (or add --same-node)", file=sys.stderr)
+            sys.exit(2)
+    partition = (getattr(args, "partition", None) or spec.get("partition") or "").strip() or None
+    if partition and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", partition):
+        print(f"{C_RED}error:{C_RESET} '{partition}' is not a partition name", file=sys.stderr)
+        sys.exit(2)
+    if only_nodes or partition:
+        pool = pool_nodes()
+        if pool is not None:
+            have = [n for n, p_ in pool if (not only_nodes or n in only_nodes)
+                    and (not partition or p_ == partition)]
+            if not have:
+                what = " / ".join(x for x in (",".join(only_nodes), partition and f"partition {partition}") if x)
+                print(f"{C_YELLOW}note:{C_RESET} the pool has no hold job on {what} right now — the task "
+                      f"waits (waiting_for_node) until it has one. `hive nodes` shows the pool.")
+
     # Runtime estimate (drives walltime-aware scheduling). Source priority:
     # CLI --est-runtime > #HIVE est_runtime=. Value 'auto' resolves from history.
     est_raw = None
@@ -1102,6 +1149,8 @@ def _submit(args, out):
                 "need_mb":      spec.get("need_mb", 0),
                 "gpus":         spec.get("gpus", DEFAULT_TASK_GPUS),
                 "exclude_nodes": exclude_nodes,
+                "only_nodes":    only_nodes,
+                "partition":     partition,
                 "timeout_secs":  timeout_secs,
                 "notify":        notify,
                 "depends_on":    after,
@@ -1188,6 +1237,9 @@ def _submit(args, out):
               f"(failed, exit 124)")
     if notify:
         print(f"  notify: runs on the scheduler's host when the task finishes or is requeued")
+    if only_nodes or partition:
+        print("  only on: " + " / ".join(x for x in (", ".join(only_nodes),
+                                                     partition and f"partition {partition}") if x))
     if exclude_nodes:
         print(f"  excluded nodes: {', '.join(exclude_nodes)}")
     if est_secs:
@@ -2122,6 +2174,11 @@ def build_parser():
                     help="Shell command run when the task finishes or is requeued, with "
                          "HIVE_TASK_ID/NAME/STATE/EXIT_CODE/NODE/LOG/... in its environment. "
                          "Runs on the SCHEDULER's host. Default: $HIVE_NOTIFY")
+    ps.add_argument("--nodelist", metavar="NODES",
+                    help="Run ONLY on these nodes (evc104,evc[102-103]). The task waits "
+                         "(waiting_for_node) while none of them has a free hold job")
+    ps.add_argument("--partition", metavar="NAME",
+                    help="Run only on hold jobs of this SLURM partition (see `hive nodes`)")
     ps.add_argument("--exclude", "-x", metavar="NODES",
                     help="Nodes this task must not run on (evc22,evc[40-43]). The task "
                          "waits (node_excluded) rather than use them")

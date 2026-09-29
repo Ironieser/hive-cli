@@ -59,7 +59,7 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--begin 2h\|08:00` | not before that time |
 | `--cpus N` `--mem MB` | CPU / memory limit of the task (hold jobs have few CPUs; tasks sharing one fight over them) |
 | `--warn-before 10m` | SIGUSR1 to every process of the command that long before its node expires; your program must handle it (to checkpoint) |
-| `--exclude NODES` | nodes this task must not run on (`evc22,evc[40-43]`) |
+| `--exclude NODES` / `--nodelist NODES` / `--partition P` | not on these nodes / only on these nodes / only in this partition |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |
 | `--priority N` | higher dispatches first |
 

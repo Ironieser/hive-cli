@@ -573,10 +573,19 @@ def abort_broken_gangs(tasks):
     return touched
 
 
+def allowed_here(task, info):
+    """`--nodelist` / `--partition`: may `task` run on hold job `info` at all?"""
+    only = task.get("only_nodes")
+    if only and info.get("node") not in only:
+        return False
+    part = task.get("partition")
+    return not part or info.get("partition") == part
+
+
 def fits_hold_job(task, info, db_updated):
     """Could `task` run on hold job `info` if it were free — the gates of find_slot that
     do not depend on what is running there now: cards, card size, walltime."""
-    if info is None:
+    if info is None or not allowed_here(task, info):
         return False
     cards = info.get("gpu") or []
     want = task_gpus(task)
@@ -2120,6 +2129,11 @@ def _cycle(probe_cache, final):
                     reason = "node_excluded"
                     i += 1
                     continue
+                # …and its opposite, `--nodelist` / `--partition`: only there.
+                if not allowed_here(task, info):
+                    reason = "waiting_for_node"
+                    i += 1
+                    continue
 
                 # A gang (multi-node task) takes every member to a node of its own.
                 if info.get("node") in avoid_nodes:
@@ -2401,11 +2415,13 @@ def _cycle(probe_cache, final):
             # job only its own cards, so no single process can see two of them, but
             # two processes, one in each hold job, can work as one training.
             same_ok = bool(first.get("gang_same_node"))
+            mine = [c for c in candidates if allowed_here(first, c[1])
+                    and c[1].get("node") not in (first.get("exclude_nodes") or ())]
             if same_ok:
-                room = sum(max(0, slot_count(c[1]) - len(used_slots.get(c[0], ()))) for c in candidates)
+                room = sum(max(0, slot_count(c[1]) - len(used_slots.get(c[0], ()))) for c in mine)
                 enough = room >= sum(max(1, task_gpus(m)) for m in members)
             else:
-                enough = len({c[1].get("node") for c in candidates}) >= len(members)
+                enough = len({c[1].get("node") for c in mine}) >= len(members)
             if not enough:
                 wait_all("waiting_for_gang")
                 return
