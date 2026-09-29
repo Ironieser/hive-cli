@@ -48,7 +48,7 @@ A node enters quarantine when creating a CUDA context on it fails — the pre-di
 verify probe does this every time, and `hive health check` does it on demand — or after
 two tasks died there within 3 min with a CUDA-init signature (`CUDA-capable device(s)
 is/are busy or unavailable`, `cudaErrorDevicesUnavailable`, `CUDA unknown error`,
-`CUDA unknown error`, …). Reasons this happens: another user's job holds
+`no CUDA-capable device is detected`, …). Reasons this happens: another user's job holds
 the card outside your cgroup, a wedged driver, a hold job that got no visible device.
 
 While quarantined the node receives no tasks. Every 10 min the scheduler creates a CUDA
