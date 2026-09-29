@@ -39,7 +39,8 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 - `requeue_count`, `checkpoint_warning`, `attempts`: re-dispatch history.
 - `gpus`, `need_mb`, `est_runtime_secs`, `est_source` (`user` | `history`): placement inputs.
 - `node`, `slurm_jobid`, `log`: where it ran and where its output is.
-- `timeout_secs`, `notify`, `exclude_nodes`, `allow_slow`, `held`: as submitted.
+- `timeout_secs`, `notify`, `exclude_nodes`, `only_nodes`, `partition`, `allow_slow`,
+  `held`: as submitted.
 - `depends_on` (ids), `depends_mode` (`ok` | `any`), `failed_dependency`.
 - `array_id`, `array_index`, `array_max_running`; `max_running` (owner cap).
 - `fail_reason` (`timeout` | `dependency_failed`), `exit_code` (124 / 125 for those).

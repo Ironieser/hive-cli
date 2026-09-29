@@ -96,6 +96,12 @@ column is updated as each lands. "Live" = tried on the real cluster, not only of
 | B6 | Preemption | done — `--preempt` / `--preemptible`, opt-in on both sides |
 | B7 | Fair share between owners | done — `"fair_share": true` |
 
+## D. Afterwards
+
+| # | Item | Status |
+|---|---|---|
+| D1 | Run only on named nodes / a partition (`--nodelist`, `--partition`) — the half of "choose or exclude nodes" that had been left out | done |
+
 ## C. Housekeeping
 
 | # | Item | Status |

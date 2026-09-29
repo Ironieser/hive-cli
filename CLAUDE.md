@@ -253,6 +253,9 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
 - **The scheduler wakes on `sched.wake` and on exit files** (`idle_wait`), at least
   `MIN_CYCLE_GAP` after the last cycle. CLI commands that change what may run call
   `wake_scheduler()`.
+- **`--nodelist` / `--partition` are task-level gates** (`allowed_here`, reason
+  `waiting_for_node`), checked before the probe and in `fits_hold_job`, so a preemptor
+  never stops a victim on a node it may not use.
 - **Walltime-aware placement is opt-in per task.** The poller records each hold-job's
   `time_left_secs` (`squeue %L`) — measured every cycle even on probe failure, so its
   basis is the DB's top-level `updated`, **not** per-job `polled_at` (which carry-forward

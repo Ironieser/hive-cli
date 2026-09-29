@@ -197,6 +197,7 @@ hive submit --priority 9 --preempt "python urgent.py"          # may stop a --pr
 hive submit --preemptible --est-runtime 12h "python long.py"   # agrees to be stopped and requeued
 hive submit --max-running 3 …   (or export HIVE_MAX_RUNNING=3) # at most 3 tasks of this owner at once
 hive submit --exclude evc22 --no-slow "python x.py"            # not on these nodes / not on slow ones
+hive submit --nodelist evc104 | --partition highgpu "…"        # only on these nodes / this partition
 hive hold 3 | hive unhold 3 | hive priority 10 3               # shape what has not started yet
 ```
 

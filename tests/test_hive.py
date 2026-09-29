@@ -1165,7 +1165,7 @@ def _nsR(**kw):
                 gpus=None, est_runtime=None, exclude=None, timeout=None, notify=None, after=None,
                 after_any=None, array=None, max_running=None, allow_slow=None, quiet=False,
                 begin=None, cpus=None, mem=None, warn_before=None, nodes=None,
-                preempt=None, preemptible=None, same_node=None)
+                preempt=None, preemptible=None, same_node=None, nodelist=None, partition=None)
     base.update(kw); return _apR.Namespace(**base)
 def _new():
     return max(rq().values(), key=lambda t: t["id"])
@@ -2228,6 +2228,61 @@ chk("...and why it is off", "off" in _o and "enabled" in _o)
 os.remove(_cfg); fresh(""); os.remove(_hold)
 try: os.remove(os.path.join(hs.HIVE_DIR, "hold.slurm"))
 except OSError: pass
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
+
+print("== --nodelist / --partition: run only there ==")
+reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close()
+_seenN = []
+hs.live_probe = lambda jid, **kw: (_seenN.append(jid), _ok())[1]
+json.dump({"version": 1, "next_id": 1100, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+wdb({"700": node("a", 72000), "701": dict(node("b", 72000), partition="highgpu"), "702": node("c", 72000)})
+_c, _o = _rc(hq.cmd_submit, _nsR(name="onb", nodelist="b,z[1-2]", cmd_or_file="sleep 1"))
+chk("--nodelist stored expanded", _new()["only_nodes"] == ["b", "z1", "z2"] and "only on: b" in _o)
+_rc(hq.cmd_submit, _nsR(name="hp", partition="highgpu", cmd_or_file="sleep 1"))
+_rc(hq.cmd_submit, _nsR(name="free", cmd_or_file="sleep 1"))
+hs.run_one_cycle(); time.sleep(0.4)
+q = rq()
+chk("the task runs on the named node although another is first in line", q["1100"].get("node") == "b")
+chk("the node it would not take was not even probed for it", _seenN[0] == "701")
+chk("--partition highgpu waits: its only hold job is taken",
+    q["1101"]["state"] == "pending" and q["1101"].get("pending_reason") == "waiting_for_node")
+chk("a task without either takes what is free", q["1102"].get("node") in ("a", "c"))
+_c, _o = _rc(hq.cmd_submit, _nsR(name="nowhere", nodelist="nosuch"))
+chk("naming a node the pool does not have: accepted, with a note", _c is None and "waits" in _o
+    and _new()["only_nodes"] == ["nosuch"])
+hs.run_one_cycle()
+chk("...and it waits (waiting_for_node) instead of failing", _new()["state"] == "pending"
+    and rq()[str(_new()["id"])].get("pending_reason") == "waiting_for_node")
+_busy3 = {k: node(n, 72000, st="busy") for k, n in (("700", "a"), ("701", "b"), ("702", "c"))}
+wdb(_busy3); hs.run_one_cycle()
+chk("...also when every hold job is busy (it used to read no_dispatchable_node)",
+    rq()[str(_new()["id"])].get("pending_reason") == "waiting_for_node")
+wdb({"700": node("a", 72000), "701": dict(node("b", 72000), partition="highgpu"), "702": node("c", 72000)})
+chk("refused: a node both in --nodelist and --exclude",
+    _rc(hq.cmd_submit, _nsR(nodelist="a,b", exclude="b"))[0] == 2)
+chk("refused: --nodes 3 with a --nodelist of two", _rc(hq.cmd_submit, _nsR(nodes=3, nodelist="a,b"))[0] == 2)
+chk("refused: nonsense as a partition", _rc(hq.cmd_submit, _nsR(partition="high gpu;x"))[0] == 2)
+_pf = hq.parse_hive_file(hive_file("#HIVE nodelist=evc[102-103]\n#HIVE partition=highgpu\necho x\n"))
+chk("#HIVE nodelist= / partition=", _pf.get("nodelist") == "evc[102-103]" and _pf.get("partition") == "highgpu")
+# a multi-node task within a nodelist; a preemptor that may only run elsewhere
+time.sleep(1.2); hs.run_one_cycle()
+json.dump({"version": 1, "next_id": 1110, "tasks": {}}, open(hs.QUEUE_FILE, "w"))
+_rc(hq.cmd_submit, _nsR(name="g", nodes=2, nodelist="b,c", cmd_or_file="sleep 1"))
+wdb({"700": node("a", 72000), "701": node("b", 72000), "702": node("c", 72000)})
+hs.run_one_cycle(); time.sleep(0.4)
+chk("a multi-node task stays inside its --nodelist",
+    sorted(rq()[k].get("node") for k in ("1110", "1111")) == ["b", "c"])
+hs.live_probe = _lpR
+vic = _running(1120, 0, preemptible=True, node="a", jid="700")
+chk("no victim on a node the preemptor may not use",
+    hs.pick_victim(dict(task(1121, name="p", priority=9), preempt=True, only_nodes=["b"]),
+                   {"1120": vic}, set(), set(), {"700": node("a", 72000, st="busy")}, utc()) is None)
+chk("...a victim on a node it may use",
+    hs.pick_victim(dict(task(1121, name="p", priority=9), preempt=True, only_nodes=["a"]),
+                   {"1120": vic}, set(), set(), {"700": node("a", 72000, st="busy")}, utc())["id"] == 1120)
+for _p in _victims:
+    _p.poll() is None and _p.kill()
+time.sleep(1.0); hs.run_one_cycle()
 reset_health(); reset_sched_state(); open(ev.EVENTS_FILE, "w").close(); wq({}); wdb({})
 
 print("== a dead scheduler is restarted by list / wait (feedback #18/#19) ==")
