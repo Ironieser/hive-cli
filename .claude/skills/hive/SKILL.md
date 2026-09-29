@@ -58,7 +58,7 @@ a banner in the log. A task whose *own command* crashes is `failed` and is not r
 | `--preemptible` / `--preempt` | a long low-priority task agrees to be stopped and requeued / an urgent one (give it `--priority` > 0) may stop such a task |
 | `--begin 2h\|08:00` | not before that time |
 | `--cpus N` `--mem MB` | CPUs (default 1; bound to cores of its own) and memory the task takes from its hold job; it waits (`waiting_for_cpu`) while they are taken |
-| `--gpus 0` | a CPU task: runs on a hold job without a GPU if the pool has one (many at once, by CPUs), else beside the tasks of a GPU hold job |
+| `--gpus 0` | a CPU task: runs ONLY on a hold job without a GPU (many at once, by CPUs), never on a GPU hold job. None in the pool → it waits (`no_cpu_hold_job`) |
 | `--warn-before 10m` | SIGUSR1 to every process of the command that long before its node expires; your program must handle it (to checkpoint) |
 | `--exclude NODES` / `--nodelist NODES` / `--partition P` | not on these nodes / only on these nodes / only in this partition |
 | `--workdir DIR` | cwd on the node (default: cwd at submit; must exist on the node) |

@@ -594,6 +594,8 @@ def fits_hold_job(task, info, db_updated):
         return False
     if want > 0 and is_cpu_hold_job(info):
         return False
+    if want <= 0 and not is_cpu_hold_job(info) and not cpu_tasks_on_gpu():
+        return False
     if task_cpus(task) > (_known(info, "cpus") or task_cpus(task)) \
             or task_mem(task) > (_known(info, "mem_mb") or task_mem(task)):
         return False
@@ -1035,6 +1037,13 @@ def is_cpu_hold_job(info):
         return False
     only = info.get("cpu_only")
     return only if isinstance(only, bool) else info.get("status") == "cpu"
+
+
+def cpu_tasks_on_gpu():
+    """May a task without a GPU run on a GPU hold job? No, unless pool_config.json says
+    `"cpu_tasks_on_gpu": true` (exactly): it takes the cores — and the memory — of a
+    node that was asked for its GPU. It waits for a hold job without one."""
+    return pool_setting("cpu_tasks_on_gpu", False) is True
 
 
 def alive_probe(slurm_jobid):
@@ -2236,16 +2245,23 @@ def _cycle(probe_cache, final):
             want_gpus = task_gpus(task)
             want_cpus, want_mem = task_cpus(task), task_mem(task)
             excluded = set(task.get("exclude_nodes") or ())
+            ride = want_gpus <= 0 and cpu_tasks_on_gpu()
+            no_cpu_job = "waiting_for_cpu" if any(
+                is_cpu_hold_job(i_) for i_ in jobs_db.values()) else "no_cpu_hold_job"
 
             def mine_left():
-                # hold jobs without a GPU are not part of the pool for a GPU task
-                return [c for c in candidates if want_gpus <= 0 or not is_cpu_hold_job(c[1])]
+                # hold jobs without a GPU are not part of the pool for a GPU task, nor
+                # GPU hold jobs for a task without one (unless the pool allows it)
+                return [c for c in candidates if is_cpu_hold_job(c[1]) == (want_gpus <= 0)
+                        or (want_gpus <= 0 and ride)]
             # Say what is actually wrong instead of the generic reason: the pool has no
             # hold job at all, its nodes are quarantined, or every candidate was
             # rejected earlier this cycle (the first task used to get the real reason
             # and every task behind it `no_dispatchable_node`).
             if not jobs_db:
                 reason = "pool_empty"
+            elif want_gpus <= 0 and not ride and not mine_left():
+                reason = no_cpu_job
             elif (task.get("only_nodes") or task.get("partition")) \
                     and not any(allowed_here(task, i_) for i_ in jobs_db.values()):
                 reason = "waiting_for_node"      # the pool has no hold job where it may run
@@ -2279,6 +2295,13 @@ def _cycle(probe_cache, final):
                 # recorded: for a task that wants a GPU it is not part of the pool.
                 cpu_only = is_cpu_hold_job(info)
                 if cpu_only and want_gpus > 0:
+                    i += 1
+                    continue
+                # …and a GPU hold job is for tasks with one: a task without takes the
+                # cores and the memory of a node that was asked for its GPU.
+                if want_gpus <= 0 and not cpu_only and not ride:
+                    if reason in ("no_dispatchable_node", "pool_empty"):
+                        reason = no_cpu_job
                     i += 1
                     continue
 
@@ -2643,7 +2666,8 @@ def _cycle(probe_cache, final):
 
         def hold_back(task, reason):
             nonlocal changed, starved
-            starved += 1
+            if reason != "no_cpu_hold_job":     # re-polling the pool does not add one
+                starved += 1
             if task.get("pending_reason") != reason:
                 task["pending_reason"] = reason
                 changed = True

@@ -65,6 +65,17 @@ def rq():
     return json.load(open(hs.QUEUE_FILE))["tasks"]
 
 
+def ride(on):
+    """pool_config.json "cpu_tasks_on_gpu": may a task without a GPU use a GPU hold job."""
+    p = os.path.join(hs.HIVE_DIR, "pool_config.json")
+    try:
+        c = json.load(open(p))
+    except (OSError, ValueError):
+        c = {}
+    c["cpu_tasks_on_gpu"] = on
+    json.dump(c, open(p, "w"))
+
+
 def node(name, left, st="idle"):
     return {"node": name, "partition": "gpu", "status": st,
             "gpu": [{"index": 0, "util": 0, "mem_used": 10, "mem_total": 81920}],
@@ -872,7 +883,9 @@ chk("only the cards the task can see are sampled (gpus=1 -> first line)",
     rq()["181"].get("gpu_peak_mb") == 10)
 os.environ.pop("MOCK_USAGE")
 t0 = dict(task(182, name="cpu"), cmd="sleep 0.3", gpus=0)
+ride(True)
 wq({"182": t0}); hs.run_one_cycle(); time.sleep(1.0); hs.run_one_cycle()
+ride(False)
 chk("gpus=0 task: nothing sampled, fields unset",
     rq()["182"]["state"] == "done" and "gpu_peak_mb" not in rq()["182"])
 wq({})
@@ -2620,6 +2633,7 @@ chk("fits_hold_job agrees (preemption)", not hs.fits_hold_job(ctask(1, g=1), cpu
     and hs.fits_hold_job(ctask(1), cpunode("c0"), utc())
     and not hs.fits_hold_job(ctask(1, cpus=64), cpunode("c0"), utc()))
 
+ride(True)       # the tests below: a pool that lets tasks without a GPU onto GPU hold jobs
 reset_sched_state(); _probed.clear()
 wdb({"700": gnode("g0"), "900": cpunode("c0", cpus=2)})
 wq({"2040": ctask(2040), "2041": dict(ctask(2041, g=1), cmd="sleep 3")})
@@ -2640,6 +2654,7 @@ chk("...and the GPU task, which asked for no CPUs, still gets the card",
     states(2054) == ["running"] and rq()["2054"]["gpu_slots"] == [0])
 time.sleep(3.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle()
 
+ride(False)
 reset_sched_state(); reset_health()
 hh_ = hh.load(); hh.quarantine(hh_, "c0", "CUDA probe failed", "verify"); hh.save(hh_)
 _dead = os.path.join(hs.HIVE_DIR, "mock_srun_dead")
@@ -2739,6 +2754,7 @@ chk("...and is when one can", states(2100) == ["running"])
 time.sleep(3.5); hs.run_one_cycle()
 
 # (2) overflow: the second task goes on to the GPU hold job in the same cycle
+ride(True)
 reset_sched_state()
 wdb({"900": cpunode("c0", cpus=1), "700": gnode("g0")})
 wq({"2110": ctask(2110), "2111": ctask(2111)})
@@ -2780,6 +2796,7 @@ time.sleep(3.5); hs.run_one_cycle()
 chk("...it starts when they are free", states(2132) == ["running"] and len(rq()["2132"]["cpu_slots"]) == 4)
 time.sleep(2.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle(); time.sleep(3.5); hs.run_one_cycle()
 
+ride(False)
 # (5) preemption must leave the preemptor its CPUs
 _db = {"700": gnode("g0", cpus=4, n=2)}
 def _rt(i, **kw):
@@ -2810,13 +2827,17 @@ time.sleep(1); hs.run_one_cycle()
 # (8) the submit note
 json.dump({"updated": utc(), "jobs": {"700": gnode("g0", cpus=4), "900": cpunode("c0", cpus=32, mem=None)}},
           open(hs.NODE_DB, "w"))
-chk("pool_sizes: what a task could use", hq.pool_sizes(1) == [(4, 64000)] and hq.pool_sizes(0) == [(4, 64000), (32, None)])
+chk("pool_sizes: what a task could use", hq.pool_sizes(1) == [(4, 64000)] and hq.pool_sizes(0) == [(32, None)])
+ride(True)
+chk("...with GPU hold jobs open to tasks without a GPU", hq.pool_sizes(0) == [(4, 64000), (32, None)])
+ride(False)
 _o = dict(gnode("g1")); _o.pop("cpus")
 json.dump({"updated": utc(), "jobs": {"700": gnode("g0", cpus=4), "701": _o}}, open(hs.NODE_DB, "w"))
 chk("...nothing is said when a hold job does not say how large it is", hq.pool_sizes(1) is None)
 
 print("== CPU tasks: red team, round 2 ==")
 # (1) stepping aside is for a GPU task that was refused the CPUs, and for nothing else
+ride(True)
 reset_sched_state(); reset_health()
 wdb({"700": gnode("g0", cpus=8)})
 wq({"2200": dict(ctask(2200, g=1, cpus=2), begin_ts=time.time() + 86400, priority=5),
@@ -2870,6 +2891,7 @@ hs.run_one_cycle()
 chk("...and runs on it the cycle after", states(2230) == ["running"])
 time.sleep(1); hs.run_one_cycle()
 
+ride(False)
 # (5) a binding to fewer cores than asked is said, not passed off as done
 _cores = sorted(os.sched_getaffinity(0))
 if _sp.run("command -v taskset", shell=True, capture_output=True).returncode == 0:
@@ -2892,6 +2914,38 @@ finally:
 _j = json.load(open(_nf))["jobs"]["700"]
 chk("dbpost: a poll without the allocation keeps the known one",
     (_j["cpus"], _j["mem_mb"], _j["cpu_only"]) == (4, 64000, False))
+
+print("== CPU tasks stay off GPU hold jobs ==")
+ride(False); reset_sched_state(); reset_health(); _polls = []
+_rr = hs.request_repoll
+hs.request_repoll = lambda why: _polls.append(why)
+wdb({"700": gnode("g0"), "701": gnode("g1")})
+wq({"2300": ctask(2300), "2301": dict(ctask(2301, g=1), cmd="sleep 2")})
+for _ in range(5):
+    hs.run_one_cycle()
+chk("no hold job without a GPU: a --gpus 0 task waits and says why, GPU hold jobs idle or not",
+    states(2300) == ["no_cpu_hold_job"] and rq()["2301"]["state"] in ("running", "done"))
+chk("...and nobody is asked to re-poll the pool for it", _polls == [])
+hs.request_repoll = _rr
+reset_sched_state()
+wdb({"700": gnode("g0"), "900": cpunode("c0", cpus=2)})
+wq({str(i): ctask(i) for i in (2310, 2311, 2312)})
+hs.run_one_cycle()
+chk("CPU hold job full: the next task waits for it (waiting_for_cpu), the idle GPU hold job is left alone",
+    states(2310, 2311, 2312) == ["running", "running", "waiting_for_cpu"])
+time.sleep(3.5); hs.run_one_cycle()
+chk("...and runs there when a CPU is free", rq()["2312"]["slurm_jobid"] == "900")
+time.sleep(3.5); hs.run_one_cycle()
+for _v in ("true", 1, "yes"):
+    ride(_v)
+    chk(f"cpu_tasks_on_gpu: {_v!r} is not true", hs.cpu_tasks_on_gpu() is False and hq.cpu_tasks_on_gpu() is False)
+ride(False)
+chk("fits_hold_job: a GPU hold job does not fit a task without a GPU",
+    not hs.fits_hold_job(ctask(1), gnode("g0"), utc()))
+json.dump({"updated": utc(), "jobs": {"700": gnode("g0")}}, open(hs.NODE_DB, "w"))
+_o = _capture(hq.cmd_submit, _ap.Namespace(cmd_or_file="true", workdir=None, priority=None, name="n0", owner=None,
+                                         need_mb=None, gpus=0, est_runtime=None, exclude=None))
+chk("submit says that the pool has no hold job without a GPU", "no_cpu_hold_job" in _o)
 
 print(f"\nPYTHON SUITE: {P['pass']} passed, {P['fail']} failed")
 sys.exit(1 if P["fail"] else 0)

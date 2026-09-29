@@ -5,6 +5,7 @@
   "health_canary": true,
   "prefer_partitions": [],
   "fair_share": false,
+  "cpu_tasks_on_gpu": false,
   "auto_prune_days": 14,
   "log_keep_days": 0,
   "autoscale": {

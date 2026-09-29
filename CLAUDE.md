@@ -269,7 +269,10 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   and quarantine the node) and is offered on a quarantined node too — but it is verified
   like any other, by `alive_probe` ("can a step start here"): its record may be of a
   hold job that has expired, and a task sent there was requeued until it was failed.
-  A `--gpus 0` task on a GPU hold job steps aside for a GPU task that was REFUSED that
+  **A `--gpus 0` task never goes to a GPU hold job** (`no_cpu_hold_job` when the pool
+  has no other, which does not count as starvation) unless pool_config.json says
+  `"cpu_tasks_on_gpu": true` — the owner's decision of 2026-09-29; do not bring the
+  overflow back as a default. Where it is allowed, such a task steps aside for a GPU task that was REFUSED that
   hold job for its CPUs earlier in the pass (`cpu_waiters`) — never for one that is merely
   pending (held, not due, waiting for a dependency: that was a deadlock) — and its
   outcome neither strikes a node nor clears strikes. No CPU is kept back for free cards:

@@ -62,7 +62,7 @@ hive submit [--name NAME] [--est-runtime DUR|auto] [--need-mb MiB] [--gpus N] [-
 | `--owner` / `-o` | `$HIVE_OWNER` | owner tag (agent or project name). Precedence: `--owner` > `#HIVE owner=` > `$HIVE_OWNER`. Shown as an OWNER column in `hive list --owner all` and as `[owner]` in the `hive nodes` TASK column |
 | `--est-runtime` | — | `2h`, `90m`, `1-12:00:00`, seconds, or `auto` (P90 of NAME's history). With an estimate the scheduler never places the task on a node whose remaining walltime < estimate + 10 min (`insufficient_walltime`). Without one the task is walltime-blind. |
 | `--need-mb` | 0 | minimum **free** GPU memory (MiB), or `auto` = P90 of the GPU peak this NAME reached in past runs + 10 %. Task waits (`waiting_for_mem`) until a card has it |
-| `--gpus` | 1 | GPUs the task gets. A hold job with N cards is N slots: it runs several tasks at once, each seeing only its own cards in `CUDA_VISIBLE_DEVICES` (so frameworks don't auto-`DataParallel` over cards you didn't ask for). `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`) of which 2 are free (`waiting_for_gpu`). `--gpus 0` is a CPU task: every GPU is hidden and none is taken. See [CPU tasks](#cpu-tasks). |
+| `--gpus` | 1 | GPUs the task gets. A hold job with N cards is N slots: it runs several tasks at once, each seeing only its own cards in `CUDA_VISIBLE_DEVICES` (so frameworks don't auto-`DataParallel` over cards you didn't ask for). `--gpus 2` only places on hold jobs with ≥ 2 GPUs (`insufficient_gpus`) of which 2 are free (`waiting_for_gpu`). `--gpus 0` is a CPU task: it runs on a hold job without a GPU. See [CPU tasks](#cpu-tasks). |
 | `--timeout` | — | hard limit on **run** time (`2h`, `90m`). Over it the task is killed and ends `failed`, exit code 124, `fail_reason: timeout`; not retried. Unlike `--est-runtime`, which only steers placement |
 | `--notify` | `$HIVE_NOTIFY` | shell command run when the task finishes (done / failed / cancelled / timeout) or is requeued after a node loss. See [Notification hook](#notification-hook) |
 | `--quiet` / `-q` | — | print only the new id on stdout (notes go to stderr): `ID=$(hive submit -q …)` |
@@ -182,9 +182,12 @@ like on two nodes. For one process with several cards, the hold job itself must 
 `hive submit --gpus 0 [--cpus N] [--mem MiB] "…"` is a task that needs no GPU
 (preprocessing, scoring, packing results).
 
-- **Where it runs.** On a hold job without a GPU if the pool has one — `hive nodes` shows
-  it as `CPU` with `taken/total CPU` — else beside the tasks of a GPU hold job (one that still
-  has a free card), sharing its cores with GPU tasks that did not say `--cpus`.
+- **Where it runs.** Only on a hold job without a GPU — `hive nodes` shows it as `CPU`
+  with `taken/total CPU`. Never on a GPU hold job: it would take the cores and the memory
+  of a node that was asked for its GPU. When the CPU hold jobs are full it waits
+  (`waiting_for_cpu`); when the pool has none it waits too (`no_cpu_hold_job`), and
+  submit says so. A pool can allow the old behaviour with `"cpu_tasks_on_gpu": true` in
+  `pool_config.json`.
 - **How many at once.** A CPU hold job runs as many tasks as it has CPUs for: each takes
   its `--cpus` (1 unless it says so) and is bound to that many cores of its own. A 32-CPU hold job runs 32
   one-CPU tasks, or 4 with `--cpus 8`; the rest wait (`waiting_for_cpu`).
@@ -194,7 +197,7 @@ like on two nodes. For one process with several cards, the hold job itself must 
   nor submits them.
 - Before a task is sent to a CPU hold job hive checks that a step can be started there
   (the hold job may have expired since the last poll).
-- On a GPU hold job a `--gpus 0` task steps aside (`waiting_for_cpu`) while a GPU task
+- With `"cpu_tasks_on_gpu": true`: on a GPU hold job a `--gpus 0` task steps aside (`waiting_for_cpu`) while a GPU task
   ahead of it in the queue waits for CPUs there.
 - `--cpus` on a GPU hold job gives the task cores of its own among the tasks that said
   `--cpus`; tasks that did not are not bound and may use those cores too.
@@ -241,6 +244,7 @@ hive submit --notify 'curl -s -d "task $HIVE_TASK_NAME: $HIVE_TASK_STATE" https:
 | `waiting_for_gang` | A multi-node task needs N nodes free at the same time |
 | `preempted` / `preempting` | It was stopped for a task of higher priority and waits again / it has asked a `--preemptible` task to stop |
 | `waiting_for_cpu` / `waiting_for_ram` | The hold jobs it could use have their CPUs / memory taken by other tasks (`--cpus`, `--mem`); it starts when one ends |
+| `no_cpu_hold_job` | A `--gpus 0` task, and the pool has no hold job without a GPU → `hive pool add <cpu preset>`; it is not run on a GPU hold job |
 | `insufficient_cpus` / `insufficient_ram` | No hold job HAS that many CPUs / that much memory → lower `--cpus` / `--mem` or add a larger hold job |
 | `waiting_for_gpu` | The hold jobs with enough cards have them taken by other hive tasks; it starts when one ends |
 | `held` | `hive hold` was used on it; `hive unhold ID` lets it go |
