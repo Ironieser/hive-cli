@@ -5,7 +5,7 @@
 | Task stuck PENDING | `hive list` → NODE column = `pending_reason` | see the table in [cli.md](cli.md#pending_reason-values) |
 | `no_dispatchable_node` but `hive nodes` shows IDLE | `hive queue daemon status` | `stopped` → `hive queue daemon start`; `running` → nodes are being live-verified and rejected (look at the reason on the next cycle) |
 | `pool_empty` | `hive nodes` shows no rows | every hold job expired; `hive pool add` — nothing dispatches until then |
-| `gpu_unresponsive` / `no_gpu_devices` | `hive health` | the node's GPU driver is wedged (SLURM keeps handing such GPUs out because nobody keeps them). hive quarantines the node after 2 strikes; its hold job still uses allocation → `hive pool release JOBID`, then `hive pool add` |
+| `gpu_unresponsive` / `no_gpu_devices` | `hive health` | the node's GPU driver is wedged (SLURM keeps handing such GPUs out because nobody keeps them). hive quarantines the node after 2 strikes. Its hold job still uses allocation: with `"release_broken_hold_jobs": true` in pool_config.json the scheduler cancels it after an hour of failed checks (`hive health` lists them); otherwise the user runs `hive pool release JOBID`. Then `hive pool add` |
 | Queue stuck and the reason is unclear | `grep "not dispatchable" ~/.hive/sched.log \| tail` | the scheduler logs why it passed over each hold job |
 | `insufficient_walltime` never clears | `hive nodes` LEFT column | `hive pool add --time …` or lower `--est-runtime`; this reason does not resolve by itself |
 | `waiting_for_mem` | `hive nodes` MEM column | lower `--need-mb` or add a bigger card |
@@ -55,6 +55,14 @@ While quarantined the node receives no tasks. Every 10 min the scheduler creates
 context through one of the node's idle hold jobs; two consecutive successes (after a
 1 h minimum) release it, a failure re-arms it, and "can't tell" (no python / libcuda)
 is ignored. `hive health` shows strikes, last check time and result.
+
+A hold job on a quarantined node takes no task but is charged until it expires. With
+`"release_broken_hold_jobs": true` in `~/.hive/pool_config.json` the scheduler cancels it
+by itself when the checks through that very job have failed three times in a row over at
+least an hour (a check that finds the card in use counts for nothing: `card_in_use`). It never cancels a hold job with a task on it, one without a GPU, or a job
+that was not submitted by `hive pool add`; at most four a day; and none while more GPU
+hold jobs are broken than working (that looks like a cluster or probe problem — a person
+should look). The node stays quarantined; `hive health` lists what was cancelled.
 
 ## Checkpoint loss on reclaim
 

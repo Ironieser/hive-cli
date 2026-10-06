@@ -3,6 +3,7 @@
   "default": "normal",
   "exclude": "",
   "health_canary": true,
+  "release_broken_hold_jobs": false,
   "prefer_partitions": [],
   "fair_share": false,
   "cpu_tasks_on_gpu": false,

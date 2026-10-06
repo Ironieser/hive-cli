@@ -140,7 +140,11 @@ queue.json               # task queue (hive-queue / hive-sched, flock on queue.l
 node_health.json         # self-maintained bad-node list (hive_health.py / `hive health`)
 { "nodes": { "evc43": { "state": "quarantined", "reason": "...", "source": "verify|auto|agent|manual",
              "since": <epoch>, "until": <epoch>, "strikes": 2, "ok_streak": 0,
-             "last_check": <epoch>, "last_result": "fail: cuCtxCreate=999", "history": [...] } } }
+             "last_check": <epoch>, "last_result": "fail: cuCtxCreate=999", "history": [...],
+             "hold_fails": { "<jobid>": {"n": 3, "first": <epoch>, "last": <epoch>} } } },
+  "released_jobs": [ {"jid": "863692", "node": "evc27", "t": <epoch>, "reason": "..."} ] }
+# hold_fails: failed periodic checks through each hold job, in a row; released_jobs: the
+# hold jobs the scheduler cancelled for a broken GPU (release_broken_hold_jobs).
 # keyed by PHYSICAL node; written under queue.lock by hive-sched (verify/strike/periodic
 # probe) and `hive health`; read by nodes/top (QUAR). See docs/status_model.md.
 
@@ -222,6 +226,13 @@ the tasks every pass. A running task without `gpu_slots` holds the whole hold jo
 A quarantined node takes no task and no new hold job; a slow one takes tasks that accept
 it, after every faster node. Without a hold job on the node the check falls back to
 reboot detection (`scontrol show node` BootTime) and a `hive_canary` batch job.
+
+A hold job on a quarantined node is still charged. With `"release_broken_hold_jobs": true`
+in pool_config.json the scheduler cancels it once ITS card has failed three periodic
+checks in a row over at least an hour (a check on a card that is in use is no verdict) —
+after asking SLURM that it is a running hold job
+on that node, never with a task on it, at most one per cycle and four per day, and not
+when more GPU hold jobs are broken than working. The node stays quarantined.
 
 **Files added by these features**
 

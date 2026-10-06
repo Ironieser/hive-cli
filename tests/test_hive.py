@@ -2947,5 +2947,373 @@ _o = _capture(hq.cmd_submit, _ap.Namespace(cmd_or_file="true", workdir=None, pri
                                          need_mb=None, gpus=0, est_runtime=None, exclude=None))
 chk("submit says that the pool has no hold job without a GPU", "no_cpu_hold_job" in _o)
 
+print("== hold jobs with a broken GPU are released (2026-10-01: two sat on dead cards for two days) ==")
+def relcfg(v):
+    p = os.path.join(hs.HIVE_DIR, "pool_config.json")
+    try: c = json.load(open(p))
+    except (OSError, ValueError): c = {}
+    c["release_broken_hold_jobs"] = v
+    json.dump(c, open(p, "w"))
+def evidence(n, jid, k=3, age=7200):
+    d = hh.load()
+    d["nodes"][n].setdefault("hold_fails", {})[jid] = {"n": k, "first": time.time() - age, "last": time.time()}
+    hh.save(d)
+def scancelled():
+    try: return open(os.path.join(hs.HIVE_DIR, "mock_scancel.log")).read().split()
+    except FileNotFoundError: return []
+def recheck(*nodes):
+    d = hh.load()
+    for n in nodes: d["nodes"][n]["last_check"] = 0
+    hh.save(d)
+def dead(n="evcZ", jobs=("6801",), good=("701",), **kw):
+    """`n` quarantined an hour ago, with hold jobs `jobs` on it; `good` on a healthy node."""
+    quarantine_old(n, **kw); hs._health_checked.clear(); hs._release_held = None
+    hs._release_refused.clear()
+    d = hh.load(); d["nodes"][n]["last_check"] = time.time(); hh.save(d)   # no check unless asked
+    db = {j: node(n, 72000, st="probe_failed") for j in jobs}
+    db.update({j: node("goodnode", 72000) for j in good})
+    wdb(db); wq({})
+    mock("mock_jobinfo", "".join(f"{j}|RUNNING|{n}\n" for j in jobs))
+    mock("mock_scancel.log")
+hhealth = SourceFileLoader("hhealth", os.path.join(LIB, "hive-health")).load_module()
+_rr2, _polls2 = hs.request_repoll, []
+hs.request_repoll = lambda why: _polls2.append(why)
+os.environ["HIVE_HEALTH_CANARY"] = "0"
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE fail cuCtxCreate=999'"
+open(ev.EVENTS_FILE, "w").close()
+
+# (1) the evidence is built by the periodic checks through the hold job itself
+relcfg(True); dead()
+for _ in range(3):
+    recheck("evcZ"); hs.run_one_cycle()
+chk("three failed checks through the hold job are counted against it",
+    hrec("evcZ").get("hold_fails", {}).get("6801", {}).get("n") == 3)
+chk("...and it is not cancelled before they span RELEASE_MIN_SECS", scancelled() == [])
+evidence("evcZ", "6801")
+hs.run_one_cycle()
+chk("an hour of failed checks -> the hold job is cancelled", scancelled() == ["6801"])
+_h = hh.load()
+chk("...recorded in node_health.json, the node stays quarantined, the evidence is used up",
+    [e["jid"] for e in _h.get("released_jobs", [])] == ["6801"]
+    and _h["nodes"]["evcZ"]["state"] == "quarantined" and "hold_fails" not in _h["nodes"]["evcZ"])
+chk("...and `hive health` lists it", "cancelled for a broken GPU, last 7 d: 1 — 6801 on evcZ" in _capture(hhealth.cmd_list, None))
+chk("...with a pool_release event and a re-poll request",
+    any(e["event"] == "pool_release" and e.get("job") == "6801" and e.get("node") == "evcZ"
+        for e in ev.iter_events()) and len(_polls2) == 1)
+recheck("evcZ"); hs.run_one_cycle(); hs.run_one_cycle()
+chk("the cancelled job, still in the node DB, is neither cancelled again nor probed through",
+    scancelled() == ["6801"] and hrec("evcZ")["last_result"] == "no_hold_job")
+
+# (2) off unless pool_config.json says exactly true
+for _v in (False, "true", 1, None):
+    relcfg(_v); dead(); evidence("evcZ", "6801")
+    hs.run_one_cycle()
+    chk(f"release_broken_hold_jobs: {_v!r} -> nothing is cancelled", scancelled() == [])
+relcfg(True)
+
+# (3) evidence that is not complete
+dead(); evidence("evcZ", "6801", k=2)
+hs.run_one_cycle()
+chk("two failed checks are not enough", scancelled() == [])
+dead(); evidence("evcZ", "6801", age=600)
+hs.run_one_cycle()
+chk("three failed checks within ten minutes are not enough", scancelled() == [])
+dead(); evidence("evcZ", "6801")
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE ok'"
+recheck("evcZ"); hs.run_one_cycle()
+chk("a healthy check through the hold job clears the evidence against it",
+    scancelled() == [] and "hold_fails" not in hrec("evcZ"))
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE fail cuCtxCreate=999'"
+dead(); evidence("evcZ", "6801", k=2); mock("mock_srun_dead", "6801\n")
+recheck("evcZ"); hs.run_one_cycle()
+chk("a check that could not run neither adds to the evidence nor clears it",
+    hrec("evcZ")["hold_fails"]["6801"]["n"] == 2 and scancelled() == [])
+recheck("evcZ"); mock("mock_srun_dead"); hs.run_one_cycle()
+chk("...and the next one that fails completes it", scancelled() == ["6801"])
+mock("mock_srun_dead")
+
+# (4) never a hold job somebody is using
+dead(); evidence("evcZ", "6801")
+wq({"3001": dict(task(3001, state="running", jid="6801", node="evcZ", st=loc()), gpu_slots=[0])})
+open(os.path.join(hs.HEARTBEAT_DIR, "3001"), "w").write("x")
+hs.run_one_cycle()
+chk("a hold job with a running task is not cancelled", scancelled() == [] and rq()["3001"]["state"] == "running")
+wq({})
+dead(); evidence("evcZ", "6801")
+_db = json.load(open(hs.NODE_DB)); _db["jobs"]["6801"]["status"] = "busy"; json.dump(_db, open(hs.NODE_DB, "w"))
+hs.run_one_cycle()
+chk("...nor one whose card the poller sees in use", scancelled() == [])
+
+# (5) SLURM has to agree
+dead(); evidence("evcZ", "6801"); mock("mock_jobinfo", "6801|PENDING|evcZ\n")
+hs.run_one_cycle()
+chk("SLURM says the job is not RUNNING -> not cancelled", scancelled() == [])
+dead(); evidence("evcZ", "6801"); mock("mock_jobinfo", "6801|RUNNING|evcOther\n")
+hs.run_one_cycle()
+chk("SLURM has it on another node -> not cancelled", scancelled() == [])
+dead(); evidence("evcZ", "6801"); mock("mock_jobinfo")
+hs.run_one_cycle()
+chk("SLURM does not say where it runs -> not cancelled", scancelled() == [])
+dead(); evidence("evcZ", "6801"); mock("mock_jobinfo", "6801||evcZ\n")
+hs.run_one_cycle()
+chk("SLURM names the node but no state -> not cancelled", scancelled() == [])
+dead(); evidence("evcZ", "6801"); mock("mock_jobinfo", "6801|RUNNING|\n")
+hs.run_one_cycle()
+chk("SLURM says RUNNING but not where -> not cancelled", scancelled() == [])
+dead(); evidence("evcZ", "6801"); mock("mock_jobname", "hive_canary")
+hs.run_one_cycle()
+chk("a job called hive_canary is not a hold job -> not cancelled", scancelled() == [])
+mock("mock_jobname")
+dead(jobs=("900",)); evidence("evcZ", "900")
+hs.run_one_cycle()
+chk("a job whose stdout is not under pool-logs/ is not a hold job -> never cancelled",
+    scancelled() == [] and not hh.load().get("released_jobs"))
+dead(jobs=()); wdb({"6901": cpunode("evcZ"), "701": node("goodnode", 72000)})
+mock("mock_jobinfo", "6901|RUNNING|evcZ\n"); mock("mock_scancel.log"); evidence("evcZ", "6901")
+hs.run_one_cycle()
+chk("a hold job without a GPU is never cancelled for the node's GPU", scancelled() == [])
+_db = json.load(open(hs.NODE_DB)); _db["jobs"]["6901"] = node("evcZ", 72000, st="probe_failed")
+json.dump(_db, open(hs.NODE_DB, "w")); hs.run_one_cycle()
+chk("...(the same job as a GPU hold job would be: the test is not vacuous)", scancelled() == ["6901"])
+dead(); evidence("evcZ", "6801")
+_db = json.load(open(hs.NODE_DB)); _db["jobs"]["6801"]["status"] = "warning"; json.dump(_db, open(hs.NODE_DB, "w"))
+hs.run_one_cycle()
+chk("a card inside the busy->idle grace window is still a card in use", scancelled() == [])
+
+# (6) limits
+dead(jobs=("6801", "6802"), good=("701",)); evidence("evcZ", "6801"); evidence("evcZ", "6802")
+hs.run_one_cycle()
+chk("more hold jobs broken than working -> none is cancelled", scancelled() == [])
+dead(jobs=("6801", "6802"), good=("701", "702")); evidence("evcZ", "6801"); evidence("evcZ", "6802")
+hs.run_one_cycle()
+chk("one hold job per cycle", len(scancelled()) == 1)
+hs.run_one_cycle()
+chk("...and the other in the next", sorted(scancelled()) == ["6801", "6802"])
+dead(); evidence("evcZ", "6801")
+_h = hh.load()
+_h["released_jobs"] = [{"jid": str(i), "node": "x", "t": time.time() - 3600} for i in range(hh.RELEASE_MAX_PER_DAY)]
+hh.save(_h)
+hs.run_one_cycle()
+chk("the daily limit holds", scancelled() == [])
+_h = hh.load(); _h["released_jobs"][0]["t"] = time.time() - 90000; hh.save(_h)
+hs.run_one_cycle()
+chk("...and counts the last 24 hours only", scancelled() == ["6801"])
+dead(); evidence("evcZ", "6801"); mock("mock_scancel_fail", "1")
+_n = sum(e["event"] == "pool_release" for e in ev.iter_events())
+hs.run_one_cycle(); hs.run_one_cycle()
+chk("a scancel that fails is tried once, counted, and not repeated every cycle",
+    scancelled() == ["6801"] and [e.get("failed") for e in hh.load()["released_jobs"]] == [True]
+    and sum(e["event"] == "pool_release" for e in ev.iter_events()) == _n)
+recheck("evcZ"); hs.run_one_cycle()
+chk("...and the job, which is still there, is still the one the node is checked through",
+    hrec("evcZ")["last_result"].startswith("fail: cuCtxCreate")
+    and hrec("evcZ")["hold_fails"]["6801"]["n"] == 1)
+mock("mock_scancel_fail")
+dead(); evidence("evcZ", "6801"); mock("mock_scancel_fail", "1")
+_real_js = hs.hh.job_state; hs.hh.job_state = lambda jid: ""
+hs.run_one_cycle(); hs.hh.job_state = _real_js; mock("mock_scancel_fail")
+chk("a scancel that reported failure while the job has left the queue was a scancel",
+    [e.get("failed") for e in hh.load()["released_jobs"]] == [None])
+
+# (7) a node with one dead card and one good one
+dead(jobs=("6801", "6802"), good=("701", "702"))
+_seen = []
+_hp = hs.health_probe
+hs.health_probe = lambda jid: (_seen.append(jid), ("fail", "no_gpu_devices") if jid == "6801" else ("ok", "secs=2"))[1]
+hs.health_probe = lambda jid: (_seen.append(jid), ("unknown", "probe_unverifiable"))[1]
+for _ in range(4):
+    recheck("evcZ"); hs.run_one_cycle()
+chk("the periodic checks take turns among the node's hold jobs", _seen == ["6801", "6802", "6801", "6802"])
+dead(jobs=("6802", "6801"), good=("701", "702")); _seen = []
+hs.health_probe = lambda jid: (_seen.append(jid), ("fail", "no_gpu_devices") if jid == "6801" else ("ok", "secs=2"))[1]
+_h = hh.load(); _h["nodes"]["evcZ"]["until"] = time.time() + 3600; hh.save(_h)     # still in its minimum hold
+for _ in range(5):
+    recheck("evcZ"); hs.run_one_cycle()
+chk("...until one fails: that one is checked again until the matter is settled",
+    _seen == ["6802", "6801", "6801", "6801", "6801"])
+chk("...and only the one that failed carries evidence",
+    list(hrec("evcZ")["hold_fails"]) == ["6801"] and hrec("evcZ")["hold_fails"]["6801"]["n"] == 4)
+evidence("evcZ", "6801")
+hs.run_one_cycle()
+chk("the hold job with the dead card is cancelled, the other is kept", scancelled() == ["6801"])
+_h = hh.load(); _h["nodes"]["evcZ"]["until"] = time.time() - 1; hh.save(_h)   # minimum hold over
+for _ in range(2):
+    recheck("evcZ"); hs.run_one_cycle()
+chk("...and the node comes back through it", hrec("evcZ")["state"] == "ok" and _seen[-2:] == ["6802", "6802"])
+hs.health_probe = _hp
+relcfg(False)
+dead(jobs=("6801", "6802"), good=("701", "702"))
+_seen = []
+hs.health_probe = lambda jid: (_seen.append(jid), ("fail", "no_gpu_devices"))[1]
+for _ in range(2):
+    recheck("evcZ"); hs.run_one_cycle()
+chk("switched off: the check goes through the first hold job, as before", _seen == ["6801", "6801"])
+hs.health_probe = _hp
+
+# (8) evidence does not outlive what it is about
+relcfg(True); dead(); evidence("evcZ", "6801"); evidence("evcZ", "5555")
+mock("mock_jobinfo")
+hs.run_one_cycle()
+chk("evidence about a hold job that left the pool is dropped", list(hrec("evcZ")["hold_fails"]) == ["6801"])
+_h = hh.load(); hh.release(_h, "evcZ", "test", "manual"); hh.save(_h)
+hs.run_one_cycle()
+chk("...and all of it when the node is released", "hold_fails" not in hrec("evcZ"))
+chk("release_due is false for a node that is not quarantined",
+    not hh.release_due({"nodes": {"n": {"state": "ok", "hold_fails": {"1": {"n": 9, "first": 0, "last": time.time()}}}}}, "n", "1"))
+
+# (9) red team, 2026-10-01
+# a card somebody uses fails cuMemAlloc and is not broken (was: cancelled, poller blind or down)
+dead(); os.environ["MOCK_LIVE_GPU"] = "97, 79000, 81920"
+chk("a failed CUDA probe on a card in use says so", hs.health_probe("6801")[0] == "fail"
+    and hh.CARD_IN_USE_DETAIL in hs.health_probe("6801")[1])
+for _ in range(4):
+    recheck("evcZ"); hs.run_one_cycle()
+chk("...it keeps the node quarantined as before, and builds no evidence against the hold job",
+    "hold_fails" not in hrec("evcZ") and hrec("evcZ")["until"] > time.time() + 3000)
+os.environ["MOCK_LIVE_GPU"] = "0, 79000, 81920"
+chk("...a full card at 0% is in use too", hh.CARD_IN_USE_DETAIL in hs.health_probe("6801")[1])
+os.environ["MOCK_LIVE_GPU"] = "50, 100, 81920"
+chk("...and so is a busy one with little memory", hh.CARD_IN_USE_DETAIL in hs.health_probe("6801")[1])
+os.environ["MOCK_LIVE_GPU"] = "97, 79000, 81920"
+evidence("evcZ", "6801", k=2); recheck("evcZ"); hs.run_one_cycle()
+chk("...and never completes evidence that was there", scancelled() == [] and hrec("evcZ")["hold_fails"]["6801"]["n"] == 2)
+os.environ.pop("MOCK_LIVE_GPU")
+dead(); evidence("evcZ", "6801")
+_h = hh.load(); _h["nodes"]["evcZ"]["hold_fails"]["6801"]["last"] = time.time() - hh.RELEASE_FRESH_SECS - 5; hh.save(_h)
+hs.run_one_cycle()
+chk("evidence whose last failed check is not recent waits for the next check", scancelled() == [])
+recheck("evcZ"); hs.run_one_cycle()
+chk("...which completes it", scancelled() == ["6801"])
+chk("a context that was only too slow to appear is not evidence of a broken card",
+    (hh.hold_check(_h, "evcZ", "42", "fail", hh.CUDA_SLOW_DETAIL), "42" not in _h["nodes"]["evcZ"].get("hold_fails", {}))[1])
+# the guard counted anything in the node DB as working
+dead(jobs=("6801", "6802"), good=()); evidence("evcZ", "6801"); evidence("evcZ", "6802")
+def guard_case(good, updated=None, broken_st="probe_failed"):
+    dead(jobs=("6801", "6802"), good=()); evidence("evcZ", "6801"); evidence("evcZ", "6802")
+    db = json.load(open(hs.NODE_DB))
+    for j in ("6801", "6802"): db["jobs"][j]["status"] = broken_st
+    db["jobs"].update(good)
+    if updated: db["updated"] = updated
+    json.dump(db, open(hs.NODE_DB, "w"))
+    hs.run_one_cycle()
+    return scancelled()
+chk("hold jobs whose probe failed do not count as working",
+    guard_case({j: node("goodnode", 72000, st="probe_failed") for j in ("701", "702")}) == [])
+chk("...nor ones whose state was carried forward",
+    guard_case({j: dict(node("goodnode", 72000), carried_forward=True) for j in ("701", "702")}) == [])
+_rr3 = hs.request_repoll; hs.request_repoll = lambda why: None
+chk("...nor anything in a node DB nobody has written for a while",
+    guard_case({j: node("goodnode", 72000) for j in ("701", "702")}, updated=utc(-hs.NODE_DB_STALE_SECS - 60)) == [])
+hs.request_repoll = _rr3
+chk("...and a hold job on a quarantined node is not working, whatever its status",
+    guard_case({}, broken_st="idle") == [])
+chk("(two that are known to work are enough for the two that are not)",
+    len(guard_case({j: node("goodnode", 72000) for j in ("701", "702")})) == 1)
+# a job that cannot be released stood in the way of every other, and SLURM was asked each cycle
+quarantine_old("evcZ"); hs._health_checked.clear(); hs._release_refused.clear()
+_h = hh.load(); _h["nodes"]["evcZ"]["last_check"] = time.time(); hh.save(_h)
+wdb({"900": node("evcZ", 72000, st="probe_failed"), "6801": node("evcZ", 72000, st="probe_failed"),
+     "701": node("goodnode", 72000), "702": node("goodnode", 72000)}); wq({})
+mock("mock_jobinfo", "900|RUNNING|evcZ\n6801|RUNNING|evcZ\n"); mock("mock_scancel.log")
+evidence("evcZ", "900"); evidence("evcZ", "6801")
+hs.run_one_cycle()
+chk("a job that is not a hold job is refused and left alone for a while",
+    scancelled() == [] and "900" in hs._release_refused)
+hs.run_one_cycle()
+chk("...and the next one that is due gets its turn", scancelled() == ["6801"])
+hs._release_refused.update({"900": time.time() - 1, "31337": time.time() + 99})
+hs.release_broken(hh.load(), json.load(open(hs.NODE_DB))["jobs"], {"evcZ"}, set(), set(), utc())
+chk("the refusal is forgotten when its time is up, or the job has left the pool",
+    hs._release_refused.get("900", 0) > time.time() + 3000 and "31337" not in hs._release_refused)
+hs._release_refused.clear()
+# a slow node that fails is quarantined by that very check: the evidence must survive it
+dead(); _h = hh.load(); _h["nodes"]["evcZ"].update(state="slow"); hh.save(_h)
+hs.health_probe = lambda jid: ("fail", "no_gpu_devices")
+recheck("evcZ"); hs.run_one_cycle()
+chk("a slow node failing its check: quarantined, and that check counts against the hold job",
+    hrec("evcZ")["state"] == "quarantined" and hrec("evcZ").get("hold_fails", {}).get("6801", {}).get("n") == 1
+    and hrec("evcZ")["hold_fails"]["6801"]["first"] >= hrec("evcZ")["since"])
+dead(); evidence("evcZ", "6801")
+hs.health_probe = lambda jid: ("ok", "secs=200")
+recheck("evcZ"); hs.run_one_cycle()
+chk("a context created slowly is a working card: the evidence is cleared", "hold_fails" not in hrec("evcZ"))
+hs.health_probe = _hp
+dead(); evidence("evcZ", "6801")
+_h = hh.load(); hh.hold_check(_h, "evcZ", "6801", "ok"); hh.save(_h)       # what `hive health check` does
+hs.run_one_cycle()
+chk("a healthy `hive health check` through the hold job clears the evidence", scancelled() == [])
+for _v in (5, True, 0.5, "x"):
+    dead(); evidence("evcZ", "6801"); _h = hh.load(); _h["released_jobs"] = _v; hh.save(_h)
+    try: hs.run_one_cycle(); _ok = scancelled() == []
+    except Exception: _ok = False
+    chk(f"released_jobs = {_v!r} in a hand-edited file: no exception, nothing cancelled", _ok)
+# evidence from before a release must not count after the node is quarantined again
+dead(); evidence("evcZ", "6801")
+_h = hh.load(); hh.release(_h, "evcZ", "by hand", "manual")
+chk("releasing a node clears the evidence against its hold jobs", "hold_fails" not in _h["nodes"]["evcZ"])
+_h["nodes"]["evcZ"]["hold_fails"] = {"6801": {"n": 5, "first": time.time() - 7200, "last": time.time()}}
+hh.quarantine(_h, "evcZ", "again", "verify")
+chk("...and so does a new quarantine", "hold_fails" not in _h["nodes"]["evcZ"])
+_h["nodes"]["evcZ"]["hold_fails"] = {"6801": {"n": 5, "first": time.time() - 7200, "last": time.time()}}
+chk("...and evidence older than the quarantine never counts", not hh.release_due(_h, "evcZ", "6801"))
+# a probe that was under way through a hold job hive cancelled meanwhile
+dead(jobs=("6801", "6802"), good=("701", "702")); evidence("evcZ", "6801")
+hs.run_one_cycle()
+_h = hh.load(); _h["nodes"]["evcZ"].update(ok_streak=1, until=time.time() - 1); hh.save(_h)
+hs._health_inflight["evcZ"] = {"jid": "6801", "result": [("fail", "no_gpu_devices")]}
+hs.run_one_cycle()
+chk("its late verdict is not applied to the node", scancelled() == ["6801"]
+    and hrec("evcZ")["ok_streak"] == 1 and "hold_fails" not in hrec("evcZ") and hrec("evcZ")["until"] < time.time())
+# rotation next to a card that is in use
+dead(jobs=("6801", "6802"), good=("701", "702"))
+_db = json.load(open(hs.NODE_DB)); _db["jobs"]["6801"]["status"] = "busy"; json.dump(_db, open(hs.NODE_DB, "w"))
+_seen = []
+hs.health_probe = lambda jid: (_seen.append(jid), ("ok", "secs=2"))[1]
+for _ in range(2):
+    recheck("evcZ"); hs.run_one_cycle()
+chk("a hold job whose card is in use does not take turns: the node is released through the other",
+    _seen == ["6802", "6802"] and hrec("evcZ")["state"] == "ok")
+hs.health_probe = _hp
+# records that cannot be read
+for _bad_n in (float("inf"), float("nan"), "x", None, []):
+    _d = {"nodes": {"n": {"state": "quarantined", "since": 0,
+                          "hold_fails": {"1": {"n": _bad_n, "first": 0, "last": time.time()}}}}}
+    chk(f"hold_fails n={_bad_n!r}: no release, no exception",
+        not hh.release_due(_d, "n", "1") and hh.hold_check(_d, "n", "1", "fail") is None)
+chk("released_jobs entries that cannot be read count towards the daily limit",
+    hh.releases_today({"released_jobs": [{"t": float("nan")}, {"t": "x"}, {}, 7]}) == 4
+    and hh.releases_today({"released_jobs": {"a": 1}}) == hh.RELEASE_MAX_PER_DAY
+    and hh.releases_today({"released_jobs": [{"t": time.time() - 90000}]}) == 0)
+# a running task whose hold job is recorded as a number
+dead(); evidence("evcZ", "6801")
+chk("a running task is seen whatever the type of its hold job id",
+    hs.release_broken(hh.load(), json.load(open(hs.NODE_DB))["jobs"], {"evcZ"}, {6801}, set(), utc()) is False
+    and scancelled() == []
+    and hs.release_broken(hh.load(), json.load(open(hs.NODE_DB))["jobs"], {"evcZ"}, set(), set(), utc()) is True
+    and scancelled() == ["6801"])
+# died between recording and scancel: the entry says so
+dead(); evidence("evcZ", "6801"); mock("mock_scancel_fail", "1")
+hs.run_one_cycle(); mock("mock_scancel_fail")
+chk("an unconfirmed scancel is not listed as a cancelled hold job",
+    hh.load()["released_jobs"][-1].get("failed") is True
+    and "cancelled for a broken GPU" not in _capture(hhealth.cmd_list, None))
+# the background path, which is the one that runs for real
+dead(); hs.HEALTH_ASYNC = True
+for _ in range(3):
+    recheck("evcZ"); hs.run_one_cycle()
+    for _w in range(100):
+        if hs._health_inflight.get("evcZ", {}).get("result"): break
+        time.sleep(0.1)
+    hs.run_one_cycle()
+chk("background probes: three checks, three counts", hrec("evcZ").get("hold_fails", {}).get("6801", {}).get("n") == 3)
+evidence("evcZ", "6801"); hs.run_one_cycle()
+chk("...and the release", scancelled() == ["6801"])
+hs.HEALTH_ASYNC = False; hs._health_inflight.clear(); hs._release_refused.clear()
+os.environ["HIVE_CUDA_PROBE_CMD"] = "echo 'CUDA_PROBE ok'"
+os.environ.pop("HIVE_HEALTH_CANARY")
+hs.request_repoll = _rr2
+relcfg(False); mock("mock_jobinfo"); mock("mock_scancel.log")
+reset_health(); reset_sched_state()
+
 print(f"\nPYTHON SUITE: {P['pass']} passed, {P['fail']} failed")
 sys.exit(1 if P["fail"] else 0)

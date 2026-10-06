@@ -492,6 +492,76 @@ def sync_excludes_async(quarantined):
     _excl_thread.start()
 
 
+_health_checked = {}        # hold job → epoch of the last periodic check through it
+RELEASED_HIDE_SECS = 3600   # a hold job hive cancelled is ignored in the node DB this long
+RELEASE_RETRY_SECS = 3600   # a hold job SLURM would not let go is not asked about before this
+_release_refused = {}       # hold job → epoch until which it is left alone
+_release_held = None        # what last stopped a release, so it is logged once
+
+
+def release_broken(health, jobs_db, quarantined, busy_jids, gone_jids, db_updated=None):
+    """Cancel ONE hold job whose own GPU has failed every periodic check for an hour
+    (hh.release_due) — `"release_broken_hold_jobs": true` in pool_config.json. Such a
+    job takes no task and is charged until its walltime ends. Final pass only, under
+    queue.lock: nothing can be dispatched to it in between. Returns True if the health
+    list changed."""
+    global _release_held
+    now = time.time()
+    busy = {str(j) for j in busy_jids}
+    for jid in [j for j, until in _release_refused.items() if until < now or j not in jobs_db]:
+        del _release_refused[jid]
+    gpu_jobs = {j: i for j, i in jobs_db.items()
+                if not is_cpu_hold_job(i) and j not in gone_jids}
+    broken = [j for j, i in gpu_jobs.items() if i.get("node") in quarantined]
+    # Working = a hold job elsewhere whose card answered the last poll, or that runs a
+    # task. One the poller could not read is not known to work, and a node DB nobody
+    # has written for a while knows nothing.
+    db_age = _age_seconds(db_updated)
+    db_fresh = db_age is not None and db_age <= NODE_DB_STALE_SECS
+    working = [j for j, i in gpu_jobs.items() if i.get("node") not in quarantined
+               and (j in busy or (db_fresh and i.get("status") in ("idle", "busy", "warning")
+                                  and not i.get("carried_forward")))]
+    due = [j for j in broken
+           if j not in busy and j not in _release_refused
+           # the poller sees the card in use: somebody works there, whatever the probe says
+           and gpu_jobs[j].get("status") not in ("busy", "warning")
+           and hh.release_due(health, gpu_jobs[j].get("node"), j, now)]
+    if not due:
+        _release_held = None
+        return False
+    jid = due[0]
+    node_name = gpu_jobs[jid].get("node")
+    attempts = list(hh.released_jobs(health))
+    # More hold jobs out than in is a fault of the cluster, or of the probe — not the
+    # moment to give the pool back.
+    if len(broken) > len(working):
+        why = (f"{len(broken)} GPU hold job(s) are on quarantined nodes and only {len(working)} "
+               f"are known to work — none is cancelled automatically")
+        ok = False
+    elif hh.releases_today(health, now) >= hh.RELEASE_MAX_PER_DAY:
+        why = f"{hh.RELEASE_MAX_PER_DAY} hold jobs released in the last 24 h (the limit)"
+        ok = False
+    else:
+        ok, why = hh.release_hold_job(health, node_name, jid, now)
+        if not ok:
+            # Asked SLURM (under queue.lock) and was refused: not again every cycle, and
+            # the next one that is due gets its turn.
+            _release_refused[jid] = now + RELEASE_RETRY_SECS
+    if not ok:
+        if _release_held != (jid, why):
+            logging.warning("Hold job %s on %s has a broken GPU but is NOT released: %s",
+                            jid, node_name, why)
+        _release_held = (jid, why)
+        return hh.released_jobs(health) != attempts              # an attempt was recorded
+    _release_held = None
+    reason = health["nodes"][node_name].get("reason")
+    logging.warning("Released hold job %s on %s (scancel): its GPU failed %d checks in a row "
+                    "— %s. The node stays quarantined.", jid, node_name, hh.RELEASE_FAILS, reason)
+    ev.record("pool_release", job=jid, node=node_name, source="auto", reason=reason)
+    request_repoll(f"hold job {jid} released")
+    return True
+
+
 def health_probe(slurm_jobid):
     """(verdict, detail) for the periodic check of a quarantined node — the same
     guarded probe as verify-before-dispatch, so a wedged driver reads `fail` here too
@@ -502,6 +572,13 @@ def health_probe(slurm_jobid):
         return "fail", p["fault"]
     if not p["ok"]:
         return "unknown", "probe_unverifiable"
+    # A context that cannot be created on a card somebody is using does not show the
+    # card to be broken: a full one fails cuMemAlloc. (Not a task of ours — the check
+    # never goes through a hold job that runs one — but a step started by hand, or a
+    # leftover.) For the NODE it stays the failure it always was; the detail keeps it
+    # from counting against the hold job (hh.hold_check).
+    if p.get("cuda") == "fail" and ((p.get("util") or 0) >= 5 or (p.get("mem_used") or 0) >= 500):
+        return "fail", f"{hh.CARD_IN_USE_DETAIL}: {p.get('cuda_detail') or ''}".rstrip(": ")
     return p.get("cuda") or "unknown", p.get("cuda_detail") or ""
 
 
@@ -2041,6 +2118,9 @@ def _cycle(probe_cache, final):
 
         def apply_check(node_name, jid, verdict, detail):
             nonlocal health_changed
+            _health_checked[jid] = time.time()
+            if verdict == "ok":
+                hh.hold_check(health, node_name, jid, verdict)    # see release_broken()
             secs = hh.cuda_secs(detail) if verdict == "ok" else None
             slow_ok = hh.may_become_slow(health["nodes"].get(node_name, {}))
             if secs is not None and secs > hh.CUDA_INIT_DEADLINE and not slow_ok:
@@ -2072,6 +2152,10 @@ def _cycle(probe_cache, final):
                 return
             outcome = hh.record_check(health, node_name, verdict, detail)
             health_changed = True
+            if verdict != "ok":
+                # After the node's state is settled: evidence counts from the
+                # quarantine on, and a slow node that fails is quarantined right here.
+                hh.hold_check(health, node_name, jid, verdict, detail)
             if outcome == "quarantined":
                 slow.discard(node_name)
                 quarantined.add(node_name)
@@ -2084,16 +2168,43 @@ def _cycle(probe_cache, final):
                 quarantined.discard(node_name)
                 ev.record("release", node=node_name, source="auto", detail=detail)
 
+        releasing = hh.release_enabled()
+        gone_jids = {str(e.get("jid")) for e in hh.released_jobs(health, RELEASED_HIDE_SECS)
+                     if not e.get("failed")}
+        for jid in [j for j in _health_checked if j not in jobs_db]:
+            del _health_checked[jid]
+
         for node_name, jid, verdict, detail in finished_health_probes():
-            if node_name in health.get("nodes", {}):
+            # A probe that was under way through a hold job hive has cancelled since
+            # says nothing about the node.
+            if node_name in health.get("nodes", {}) and jid not in gone_jids:
                 apply_check(node_name, jid, verdict, detail)
 
         for node_name, rec in list(health.get("nodes", {}).items()):
             if node_name in _health_inflight or not hh.due_for_check(rec, now):
                 continue
-            jid = next((j for j, i in jobs_db.items()
-                        if i.get("node") == node_name and j not in running_jobids
-                        and not is_cpu_hold_job(i)), None)
+            # A hold job hive has cancelled stays in the node DB until the next poll.
+            through = [j for j, i in jobs_db.items()
+                       if i.get("node") == node_name and j not in running_jobids
+                       and not is_cpu_hold_job(i) and j not in gone_jids]
+            # With release_broken_hold_jobs the node's hold jobs take turns: each one
+            # is judged by its own card (hh.release_due).
+            if releasing and rec.get("state") == "quarantined":
+                # One whose card the poller sees in use comes last: its check tells
+                # nothing, and must not keep the others from releasing the node. One
+                # whose last check FAILED comes first, until it is cancelled or
+                # answers: with seven hold jobs on a node its turn came once an hour,
+                # the others released the node in between, and it was never cancelled.
+                fails = rec.get("hold_fails") if isinstance(rec.get("hold_fails"), dict) else {}
+
+                def failed_last(j):
+                    try:
+                        return _health_checked.get(j, 0) <= float(fails[j]["last"]) + 5
+                    except (KeyError, TypeError, ValueError):
+                        return False
+                through.sort(key=lambda j: (jobs_db[j].get("status") in ("busy", "warning"),
+                                            not failed_last(j), _health_checked.get(j, 0)))
+            jid = through[0] if through else None
             if jid is None and rec.get("state") == "slow":
                 continue      # its hold jobs are all running tasks: that is health enough
             if jid is None:
@@ -2835,6 +2946,11 @@ def _cycle(probe_cache, final):
                     pass
 
         if final:
+            if releasing and release_broken(health, jobs_db, quarantined, running_jobids,
+                                            gone_jids, db_updated):
+                health_changed = True
+            if jobs_db and hh.forget_hold_jobs(health, set(jobs_db)):
+                health_changed = True
             autoscale_async(jobs_db, db_updated, quarantined | slow)
 
         if health_changed:

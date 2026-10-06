@@ -243,6 +243,12 @@ cannot. With `"active_within": "48h"` it only acts while hive is in use (a task 
 in that time, or still pending or running). `hive pool autoscale` shows what it would do. Other keys: `"prefer_partitions"`,
 `"fair_share"`, `"exclude"`, `"auto_prune_days"` (default 14), `"log_keep_days"`.
 
+A hold job on a quarantined node takes no task and is still charged. With
+`"release_broken_hold_jobs": true` the scheduler cancels it once its own GPU has failed
+three health checks in a row over at least an hour. SLURM is asked first, a hold job with
+a task on it is never touched, at most four are cancelled per day, and none while more
+GPU hold jobs are broken than working. `hive health` lists what was cancelled.
+
 ### Keeping the queue tidy
 
 ```bash

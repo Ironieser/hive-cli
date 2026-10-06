@@ -608,6 +608,193 @@ def sync_pending_excludes(nodes):
     return done
 
 
+# ── Hold jobs whose own GPU is broken ───────────────────────────────────────
+# A hold job on a quarantined node takes no task and is charged for its whole
+# walltime: 863692 (evc27) and 863695 (evc24) sat two days at "No devices were found"
+# (2026-10-01) until somebody looked. With `"release_broken_hold_jobs": true` in
+# pool_config.json the scheduler cancels such a hold job itself.
+#
+# It gives allocation back with nobody watching — on highgpu a new hold job waits days
+# — so, like autoscale, it does nothing whenever it is not sure:
+#
+#   * The evidence is the hold job's OWN: RELEASE_FAILS periodic checks through THIS
+#     job that came back `fail`, in a row, the first at least RELEASE_MIN_SECS ago and
+#     the last no more than RELEASE_FRESH_SECS ago, all since the node was quarantined.
+#     A probe that could not run is not evidence, nor is one on a card that is in use
+#     (a full card fails cuMemAlloc and is not broken) or one that was merely slow; a
+#     healthy one starts the count over, and so does the node's release.
+#     (A node can have one dead card and one good one: the checks take turns among its
+#     hold jobs, the dead one goes, the node is released through the other.)
+#   * SLURM is asked first: the job must be RUNNING on that node and be a hold job
+#     (stdout under pool-logs/). The user's other jobs are never touched.
+#   * RELEASE_MAX_PER_DAY, written to node_health.json BEFORE the scancel.
+#   * The caller (hive-sched) holds queue.lock and has checked that no task runs there.
+RELEASE_FAILS       = 3
+RELEASE_MIN_SECS    = 3600
+RELEASE_FRESH_SECS  = 900     # the latest failed check must be this recent
+CARD_IN_USE_DETAIL  = "card_in_use"   # detail of a check that failed on a card somebody uses
+RELEASE_MAX_PER_DAY = 4
+RELEASED_KEEP       = 50      # entries of "released_jobs" kept in node_health.json
+
+
+def release_enabled():
+    """Only the JSON value true switches it on, as for autoscale."""
+    try:
+        with open(os.path.join(HIVE_DIR, "pool_config.json")) as f:
+            return json.load(f).get("release_broken_hold_jobs") is True
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return False
+
+
+def hold_check(data, node, jid, verdict, detail="", now=None):
+    """Count a periodic check through hold job `jid` towards (or against) the evidence
+    that its GPU is broken. verdict as in record_check: `fail` counts — unless the
+    context was only too slow to appear, which is not broken — `ok`, however slow,
+    clears, anything else says nothing."""
+    now = now if now is not None else time.time()
+    if verdict == "fail" and (CUDA_SLOW_DETAIL in str(detail) or CARD_IN_USE_DETAIL in str(detail)):
+        return
+    rec = _rec(data, node)
+    fails = rec.setdefault("hold_fails", {})
+    if not isinstance(fails, dict):
+        fails = rec["hold_fails"] = {}
+    jid = str(jid)
+    if verdict == "fail":
+        cur = fails.get(jid) if isinstance(fails.get(jid), dict) else {}
+        try:
+            n, first = int(cur.get("n") or 0), float(cur.get("first") or now)
+        except (TypeError, ValueError, OverflowError):
+            n, first = 0, now               # a record that cannot be read counts for nothing
+        fails[jid] = {"n": n + 1, "first": first, "last": now}
+    elif verdict == "ok":
+        fails.pop(jid, None)
+    if not fails:
+        rec.pop("hold_fails", None)
+
+
+def forget_hold_jobs(data, known):
+    """Drop the evidence about hold jobs that are no longer in the pool, and all of it
+    for a node that is not quarantined any more. Returns True if anything changed."""
+    changed = False
+    for rec in data.get("nodes", {}).values():
+        fails = rec.get("hold_fails")
+        if fails is None:
+            continue
+        keep = {j: v for j, v in fails.items() if j in known} \
+            if isinstance(fails, dict) and rec.get("state") == "quarantined" else {}
+        if keep != fails:
+            changed = True
+            if keep:
+                rec["hold_fails"] = keep
+            else:
+                rec.pop("hold_fails", None)
+    return changed
+
+
+def release_due(data, node, jid, now=None):
+    """Is the evidence against hold job `jid` on `node` complete?"""
+    now = now if now is not None else time.time()
+    rec = data.get("nodes", {}).get(node) or {}
+    if rec.get("state") != "quarantined" or not isinstance(rec.get("hold_fails"), dict):
+        return False
+    f = rec["hold_fails"].get(str(jid))
+    try:
+        n, first, last = int(f["n"]), float(f["first"]), float(f["last"])
+        # Nothing from before this quarantine counts, and the last failed check has to
+        # be the latest news about the card, not something an hour old.
+        return n >= RELEASE_FAILS and now - first >= RELEASE_MIN_SECS \
+            and first >= float(rec.get("since") or 0) and 0 <= now - last <= RELEASE_FRESH_SECS
+    except (TypeError, KeyError, ValueError, OverflowError):
+        return False
+
+
+def released_jobs(data, within=None, now=None):
+    """[{jid, node, t, reason}] of the hold jobs hive cancelled, oldest first; with
+    `within`, only those of the last `within` seconds. An entry with `failed` is a
+    scancel that SLURM refused, or that was never confirmed: the job may still be there."""
+    now = now if now is not None else time.time()
+    out = []
+    listed = data.get("released_jobs")
+    for e in listed if isinstance(listed, list) else []:
+        try:
+            t = float(e["t"])
+        except (TypeError, KeyError, ValueError):
+            continue
+        if within is None or now - t < within:
+            out.append(e)
+    return out
+
+
+def releases_today(data, now=None):
+    """Entries of "released_jobs" that count towards RELEASE_MAX_PER_DAY: every one
+    that is not provably older than 24 h. An entry that cannot be read counts."""
+    now = now if now is not None else time.time()
+    listed = data.get("released_jobs")
+    if listed is None:
+        return 0
+    if not isinstance(listed, list):
+        return RELEASE_MAX_PER_DAY              # a list that cannot be read: the limit is reached
+    n = 0
+    for e in listed:
+        try:
+            old = now - float(e["t"]) >= 86400
+        except (TypeError, KeyError, ValueError):
+            old = False
+        n += 0 if old else 1
+    return n
+
+
+def release_hold_job(data, node, jid, now=None):
+    """Cancel hold job `jid`, whose GPU on `node` is broken (the caller has checked
+    release_due and that no task runs there). Returns (cancelled, why not). Saves
+    `data` — the caller holds queue.lock."""
+    now = now if now is not None else time.time()
+    jid = str(jid)
+    if not jid.isdigit():
+        return False, "not a job id"
+    if releases_today(data, now) >= RELEASE_MAX_PER_DAY:
+        return False, f"{RELEASE_MAX_PER_DAY} hold jobs released in the last 24 h (the limit)"
+    info = _slurm(["scontrol", "show", "job", jid])
+    if not info:
+        return False, "SLURM could not be asked about the job"
+    # Field by field, anchored at the start of a line, as in pending_hold_jobs().
+    state = re.search(r"^\s*JobState=(\S+)", info, flags=re.M)
+    where = re.search(r"^\s*NodeList=(\S+)", info, flags=re.M)
+    out_m = re.search(r"^\s*StdOut=(\S+)", info, flags=re.M)
+    name = re.search(r"^JobId=\S+ JobName=(.*)$", info, flags=re.M)
+    if not out_m or not out_m.group(1).startswith(POOL_LOG_DIR + os.sep) \
+            or (name and name.group(1).strip() == CANARY_NAME):
+        return False, "not a hold job of the pool"
+    if not state or state.group(1) != "RUNNING":
+        return False, f"SLURM state is {state.group(1) if state else 'unknown'}, not RUNNING"
+    if not where or where.group(1) != node:
+        return False, f"SLURM has it on {where.group(1) if where else 'an unknown node'}, not {node}"
+    rec = _rec(data, node)
+    reason = str(rec.get("reason") or rec.get("last_result") or "GPU probes failed")
+    kept = (data.get("released_jobs") if isinstance(data.get("released_jobs"), list) else [])
+    # `failed` until SLURM has taken the scancel: if we die in between, the entry
+    # counts towards the limit and nobody takes the job for gone.
+    data["released_jobs"] = (kept + [{"jid": jid, "node": node, "t": round(now, 1),
+                                      "reason": reason, "failed": True}])[-RELEASED_KEEP:]
+    if isinstance(rec.get("hold_fails"), dict):
+        rec["hold_fails"].pop(jid, None)
+        if not rec["hold_fails"]:
+            rec.pop("hold_fails", None)
+    _hist(rec, "hold_job_released", job=jid, reason=reason)
+    try:
+        save(data)                     # BEFORE the scancel: what cannot be recorded is not done
+    except OSError as e:
+        data["released_jobs"].pop()
+        return False, f"node_health.json cannot be written ({e})"
+    if _slurm(["scancel", jid]) is None and job_state(jid) not in ("", "CANCELLED", "COMPLETING"):
+        # (A scancel that timed out may have been taken: then the job is gone, or going.)
+        # Still counted towards the limit; the evidence starts over, so the next try
+        # is an hour away and not next cycle.
+        return False, "scancel failed (it counts towards today's limit all the same)"
+    data["released_jobs"][-1].pop("failed", None)        # saved by the caller
+    return True, ""
+
+
 # ── Node lists (`hive pool add --exclude`, `hive submit --exclude`) ──────────
 EXPAND_NODES_MAX = 4096     # names one list may expand to
 
@@ -813,6 +1000,7 @@ def quarantine(data, node, reason, source, reporter=None):
         rec["reporter"] = reporter
     if fresh:
         rec["since"] = now
+        rec.pop("hold_fails", None)         # evidence against its hold jobs starts here
     _hist(rec, "quarantine", reason=reason, source=source)
     return fresh
 
@@ -822,6 +1010,7 @@ def release(data, node, reason, source):
     was = rec.get("state") == "quarantined"
     rec.update({"state": "ok", "strikes": 0, "ok_streak": 0, "released_at": time.time(),
                 "release_reason": reason})
+    rec.pop("hold_fails", None)
     _hist(rec, "release", reason=reason, source=source)
     return was
 

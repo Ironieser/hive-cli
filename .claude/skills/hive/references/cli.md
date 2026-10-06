@@ -369,7 +369,9 @@ Other keys of `pool_config.json`: `"prefer_partitions": ["highgpu"]` (tried firs
 `"fair_share": true` (equal priority: the owner who used fewer GPU-hours in the last 24 h
 goes first), `"exclude"`, `"auto_prune_days"` (finished tasks leave the queue after this
 many days, default 14, 0 = never; their history and `auto` values stay),
-`"log_keep_days"` (task logs are deleted after this many days; default: never).
+`"log_keep_days"` (task logs are deleted after this many days; default: never),
+`"release_broken_hold_jobs": true` (the scheduler cancels a hold job whose own GPU has
+failed every check for an hour — see [troubleshooting.md](troubleshooting.md); off by default).
 
  Hold jobs still waiting in the SLURM queue get
 nodes quarantined later added to their exclude list automatically. Excluded nodes come back by themselves: see
