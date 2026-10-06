@@ -46,6 +46,9 @@ if [[ -n "$jid" ]]; then
     # a purged job makes the real squeue fail like this
     [[ -e "$HIVE_DIR/mock_canary_purged" ]] && { echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; }
     cat "$HIVE_DIR/mock_canary_state" 2>/dev/null; exit 0; fi
+  # jobs listed in $HIVE_DIR/mock_jobinfo ("jid|STATE|NODE") are in the queue, in that state
+  st="$(awk -F'|' -v j="$jid" '$1 == j {print $2}' "$HIVE_DIR/mock_jobinfo" 2>/dev/null)"
+  [[ -n "$st" ]] && { echo "$st"; exit 0; }
   case ",$jid," in *",700,"*|*",9001,"*) echo "$jid";; esac; exit 0; fi
 # what SLURM allocated (`-O JobID,tres-alloc`, the pollers). $HIVE_DIR/mock_cpu_job adds
 # hold job 777, which has no GPU; mock_tres_fail = this form of squeue does not work
@@ -83,7 +86,11 @@ if [[ "$1 $2" == "show job" ]]; then
     6*)   exc="(null)";   out="$HIVE_DIR/pool-logs/slurm-$3.out";;        # hold jobs of the autoscale tests
     *)    exc="(null)";   out="/somewhere/else/slurm-$3.out";;        # not a hold job
   esac
-  printf 'JobId=%s JobName=hold\n   ExcNodeList=%s\n   StdOut=%s\n' "$3" "$exc" "$out"
+  printf 'JobId=%s JobName=%s\n   ExcNodeList=%s\n   StdOut=%s\n' "$3" "$(cat "$HIVE_DIR/mock_jobname" 2>/dev/null || echo hold)" "$exc" "$out"
+  # where the job runs, for the ones listed in $HIVE_DIR/mock_jobinfo ("jid|STATE|NODE")
+  while IFS='|' read -r j st nd; do
+    [[ "$j" == "$3" ]] && printf '   JobState=%s Reason=None\n   ReqNodeList=(null) ExcNodeList=%s\n   NodeList=%s\n' "$st" "$exc" "$nd"
+  done < "$HIVE_DIR/mock_jobinfo" 2>/dev/null
   [[ -n "${tres:-}" ]] && printf '   ReqTRES=%s\n   AllocTRES=%s\n' "$tres" "$tres"
   [[ -n "${per:-}" ]] && printf '   TresPerNode=%s\n' "$per"
   exit 0
@@ -115,6 +122,8 @@ EOF
 cat > "$TMP/bin/scancel" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$HIVE_DIR/mock_scancel.log"
+[[ -e "$HIVE_DIR/mock_scancel_fail" ]] && exit 1
+exit 0
 EOF
 cat > "$TMP/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash

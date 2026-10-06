@@ -97,7 +97,7 @@ The NODE column of `hive list` says why. The common ones:
 | `no_dispatchable_node` | every hold job is busy → `hive nodes`; wait or `hive pool add` |
 | `waiting_for_mem` / `insufficient_gpus` / `insufficient_cpus` / `insufficient_ram` / `insufficient_walltime` | your task's requirement isn't met by any node → lower it or `hive pool add …` |
 | `gpu_dirty` / `node_busy_on_verify` | a card looked free but isn't (co-tenant / zombie) → wait |
-| `gpu_unresponsive` / `cuda_unavailable_on_verify` / `node_quarantined` | the node's GPU is broken; hive quarantines it → `hive health`, then `hive pool add` for a replacement |
+| `gpu_unresponsive` / `cuda_unavailable_on_verify` / `node_quarantined` | the node's GPU is broken; hive quarantines it → `hive health` (it also lists hold jobs hive cancelled for a dead GPU, if `release_broken_hold_jobs` is on), then `hive pool add` for a replacement |
 | `infra_failure_redispatch` | node reclaimed mid-run; re-running elsewhere (progress lost unless checkpointed) |
 
 Full table and node STATUS legend (`BUSY/CLAIM/IDLE/WARN/PFAIL/QUAR/CPU`):

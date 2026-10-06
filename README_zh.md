@@ -211,6 +211,12 @@ CUDA context，两步各有时限：
 节点上没有 hold job 时，靠两种方式恢复：SLURM 报告该节点已重启，或者一个小的
 `hive_canary` 作业在上面探测通过。
 
+被隔离节点上的 hold job 接不了任务，却仍在计费。在 `~/.hive/pool_config.json` 中写入
+`"release_broken_hold_jobs": true` 后，只要某个 hold job 自己的 GPU 连续三次健康检查失败
+且持续至少一小时，调度器就会自动取消它。取消前会先向 SLURM 核实；上面有任务的 hold job
+不会被取消；每天最多取消 4 个；坏的 GPU hold job 比好的还多时一个都不取消。
+`hive health` 会列出被取消的作业。
+
 ### 节点池自动补充
 
 ```json

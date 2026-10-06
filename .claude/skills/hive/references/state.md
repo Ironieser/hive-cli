@@ -8,7 +8,7 @@ When you need structured data, the files under `~/.hive/` are plain JSON:
 | `queue.json` | `hive submit` / scheduler | every task (`tasks: {id: {...}}`) |
 | `node_monitor.json` | node poller | one record per hold job (`jobs: {jobid: {...}}`) + `updated` |
 | `node_health.json` | scheduler / `hive health` | per-node quarantine state |
-| `events.jsonl` | submit / scheduler | append-only lifecycle log (submit, dispatch, finish, requeue, cancel, quarantine, release) |
+| `events.jsonl` | submit / scheduler | append-only lifecycle log (submit, dispatch, finish, requeue, cancel, quarantine, release, pool_release) |
 | `logs/task-<id>.log` | the task | stdout + stderr with hive header/footer |
 
 ```python
@@ -69,4 +69,6 @@ quarantined = {n for n, r in hl.items() if r.get("state") == "quarantined"}
 
 `state` (`quarantined | slow | ok`), `slow_init_secs`, `reason`, `source` (`verify | auto | agent | manual`),
 `strikes`, `ok_streak`, `since`, `until` (minimum hold), `last_check`, `last_result`,
-`history` (last 20 events).
+`history` (last 20 events), `hold_fails` (`{jobid: {n, first, last}}`: failed periodic checks
+through each hold job, in a row). Top level, next to `nodes`: `released_jobs` — hold jobs
+the scheduler cancelled for a broken GPU (`jid`, `node`, `t`, `reason`; `failed` if SLURM refused).

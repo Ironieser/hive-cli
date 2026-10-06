@@ -92,6 +92,14 @@ def cmd_list(args):
     print(f"  {C_DIM}{len(q)} quarantined · re-probed every {hh.HEALTH_CHECK_SECS // 60} min by "
           f"the scheduler · released after {hh.HEALTH_OK_STREAK} healthy probes · "
           f"file: {hh.HEALTH_FILE}{C_RESET}")
+    # Hold jobs the scheduler cancelled because their own GPU was broken.
+    gone = [e for e in hh.released_jobs(data, 7 * 86400) if not e.get("failed")]
+    if gone:
+        shown = ", ".join(f"{e.get('jid')} on {e.get('node')} ({_ago(e.get('t'))})" for e in gone[-5:])
+        print(f"  {C_DIM}hold jobs cancelled for a broken GPU, last 7 d: {len(gone)} — {shown}{C_RESET}")
+    elif q and not hh.release_enabled():
+        print(f"  {C_DIM}hold jobs on these nodes are charged until they expire; "
+              f'"release_broken_hold_jobs": true in pool_config.json cancels them{C_RESET}')
 
 
 def cmd_report(args):
@@ -148,6 +156,8 @@ def cmd_check(args):
     with QueueLock():
         data = hh.load()
         outcome = hh.record_check(data, node, verdict, detail)
+        if verdict == "ok":
+            hh.hold_check(data, node, jid, verdict)     # healthy: no case against the hold job
         if verdict == "fail" and data["nodes"][node].get("state") != "quarantined":
             hh.quarantine(data, node, f"CUDA probe failed: {detail}", "verify")
             outcome = "quarantined"

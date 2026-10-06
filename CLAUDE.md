@@ -212,6 +212,22 @@ left in the install dir and excludes `feedback/inbox/` from its `rsync --delete`
   (background thread) adds the new nodes to `ExcNodeList` of the user's PENDING hold
   jobs via `scontrol update`. A hold job is recognised by its stdout being under
   `pool-logs/`; jobs submitted any other way are never modified. Add-only.
+- **A hold job whose own GPU is broken is cancelled by the scheduler — opt-in, and only
+  on evidence.** `"release_broken_hold_jobs": true` (exactly) in pool_config.json;
+  `release_broken()` in `hive-sched`, the rules in `hive_health.py`. Evidence is per HOLD
+  JOB, not per node: `RELEASE_FAILS` periodic checks through that job came back `fail`
+  in a row over `RELEASE_MIN_SECS`, the last one recent (`hold_fails` in the node's
+  record; a probe that could not run is no evidence, nor one on a card in use —
+  `health_probe` reports that as `unknown card_in_use`, a full card fails cuMemAlloc —
+  nor a context that was only slow; a healthy one clears it, and so does the node's
+  release), so the checks take turns among a node's hold jobs. It gives allocation back with nobody watching, so it fails closed
+  like autoscale: SLURM must say RUNNING, on that node, stdout under `pool-logs/`; never
+  a job with a running task or a card the poller sees in use; never when more GPU hold
+  jobs are broken than KNOWN to work (a card the last poll could not read does not
+  count); a job SLURM would not let go is left alone for `RELEASE_RETRY_SECS`; one per cycle, `RELEASE_MAX_PER_DAY`, recorded in
+  `released_jobs` BEFORE the scancel; final pass only. `hive pool release` keeps its
+  human-only gate — this is the one other way a hold job is cancelled, do not add a third.
+  Two hold jobs sat two days on dead cards (evc24/evc27, 2026-10-01) before this.
 - **`slow` is a third node state, between ok and quarantined.** A node whose CUDA
   context is created, but in more than `CUDA_INIT_DEADLINE`, is `slow`
   (`hh.mark_slow`): it takes only tasks for which `hh.task_accepts_slow()` holds
